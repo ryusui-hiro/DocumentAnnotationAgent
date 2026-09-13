@@ -95,7 +95,7 @@ async function copyApiSources(runtimeDirectory) {
   });
   const sourceDirectory = join(runtimeDirectory, 'src');
   await mkdir(sourceDirectory, { recursive: true });
-  for (const name of ['taskPlan.ts', 'types.ts']) await cp(join(ROOT, 'src', name), join(sourceDirectory, name));
+  for (const name of ['annotationStatus.ts', 'taskPlan.ts', 'types.ts']) await cp(join(ROOT, 'src', name), join(sourceDirectory, name));
   await cp(join(ROOT, 'scripts', 'desktop-api-launcher.mjs'), join(runtimeDirectory, 'desktop-api-launcher.mjs'));
   await mkdir(join(runtimeDirectory, 'public'), { recursive: true });
   await cp(join(ROOT, 'public', 'demo-specification.pdf'), join(runtimeDirectory, 'public', 'demo-specification.pdf'));

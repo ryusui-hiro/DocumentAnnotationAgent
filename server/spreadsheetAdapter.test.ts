@@ -38,6 +38,48 @@ test('opens workbook outline, inspects sheets, and reads bounded cell ranges', a
   assert.deepEqual(adapter.search('Mina')[0]?.location, { kind: 'sheet', sheetName: 'Customers', range: 'A3' });
 });
 
+test('separates automatic application from human review outcomes in canonical workbook records', async () => {
+  const source = await createSourceWorkbook();
+  const adapter = await SpreadsheetDocumentAdapter.fromBuffer('customers.xlsx', source);
+  const automatic = adapter.writeCell('Customers', 'D2', 'LOW', 'Automatically applied low-risk value.', undefined, false, 'auto-cell');
+  const pending = adapter.writeCell('Customers', 'D3', 'HIGH', 'Needs human confirmation.', undefined, true, 'pending-cell');
+  const rejected = adapter.writeCell('Customers', 'D4', 'HIGH', 'Unsupported result.', undefined, true, 'rejected-cell');
+  adapter.rejectChange(rejected.id);
+
+  const automaticRecord = adapter.listAnnotations().find((annotation) => annotation.id === automatic.id);
+  const pendingBefore = adapter.listAnnotations().find((annotation) => annotation.id === pending.id);
+  const rejectedRecord = adapter.listAnnotations().find((annotation) => annotation.id === rejected.id);
+  assert.equal(automaticRecord?.status, 'auto');
+  assert.equal(automaticRecord?.approved, true, 'approved remains the operational flag that the cell value is applied');
+  assert.equal(pendingBefore?.status, 'needs_review');
+  assert.equal(rejectedRecord?.status, 'rejected');
+
+  adapter.approveChange(pending.id);
+  assert.equal(adapter.listAnnotations().find((annotation) => annotation.id === pending.id)?.status, 'approved');
+
+  const corrected = adapter.annotate({
+    id: 'corrected-cell', documentId: '', target: { kind: 'sheet', sheet: 'Customers', cellRange: 'D5' },
+    label: 'Workbook cell update', evidence: '[["MEDIUM"]]', explanation: 'Human changed the proposed value.',
+    reviewPriority: 'medium', status: 'corrected', operation: 'write_cell', values: [['MEDIUM']], reason: 'Human changed the proposed value.', requiresReview: false,
+  });
+  assert.equal(corrected.status, 'corrected');
+});
+
+test('canonical spreadsheet status overrides stale operational and review flags', async () => {
+  const adapter = await SpreadsheetDocumentAdapter.fromBuffer('customers.xlsx', await createSourceWorkbook());
+  const imported = adapter.annotate({
+    id: 'canonical-auto', documentId: '', target: { kind: 'sheet', sheet: 'Customers', cellRange: 'D6' },
+    label: 'Workbook cell update', evidence: '["AUTO"]', explanation: 'Automatically applied.',
+    reviewPriority: 'high', status: 'auto', note: 'Automatically applied.', reason: 'Automatically applied.',
+    operation: 'write_cell', values: [['AUTO']], requiresReview: true, approved: false, rejected: true,
+  });
+  assert.equal(imported.status, 'auto');
+  assert.equal(imported.requiresReview, false);
+  assert.equal(imported.approved, true, 'the automatic cell write stays operationally applied');
+  assert.equal(imported.rejected, false);
+  assert.deepEqual(adapter.readRange('Customers', 'D6').rows[0]?.[0], { address: 'D6', value: 'AUTO' });
+});
+
 test('supports a table header row beyond the initial preview sample', async () => {
   const workbook = new ExcelJS.Workbook();
   const sheet = workbook.addWorksheet('Details');

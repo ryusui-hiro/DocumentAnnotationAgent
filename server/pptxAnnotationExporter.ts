@@ -2,6 +2,7 @@ import JSZip from 'jszip';
 import { DOMParser, XMLSerializer } from '@xmldom/xmldom';
 import { posix } from 'node:path';
 import type { Annotation } from '../src/types';
+import { annotationReviewStatus } from '../src/annotationStatus';
 
 const presentationNamespace = 'http://schemas.openxmlformats.org/presentationml/2006/main';
 const drawingNamespace = 'http://schemas.openxmlformats.org/drawingml/2006/main';
@@ -216,11 +217,7 @@ function annotationSemanticTags(items: Array<{ annotation: Annotation }>): PptxS
     evidence: xmlSafe(annotation.excerpt ?? '').slice(0, 1000),
     explanation: xmlSafe(annotation.reason || annotation.note).slice(0, 1000),
     reviewPriority: annotation.reviewPriority ?? (annotation.requiresReview ? 'high' : 'medium'),
-    status: annotation.reviewOutcome ?? (annotation.reviewedByHuman
-      ? annotation.source === 'ai' ? 'approved' : 'corrected'
-      : annotation.requiresReview || annotation.reviewPriority === 'high'
-        ? 'needs_review'
-        : annotation.source === 'manual' ? 'approved' : 'auto'),
+    status: annotationReviewStatus(annotation),
     source: annotation.source,
   }));
   const priorities = findings.map((finding) => finding.reviewPriority);

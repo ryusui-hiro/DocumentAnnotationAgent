@@ -4,6 +4,7 @@ import { z } from 'zod';
 import type OpenAI from 'openai';
 import sharp from 'sharp';
 import type { DocumentAnnotationOperation, DocumentAnnotationRecord, NormalizedTextBox, PreparedDocumentExport, TextAnchor } from '../src/types';
+import { annotationReviewStatus } from '../src/annotationStatus';
 import { createDocumentReaderAgent, documentReaderOutputSchema } from './documentReader';
 import { documentExportStore } from './documentExportStore';
 import { SpreadsheetDocumentAdapter, type SpreadsheetCellChange, type SpreadsheetValue } from './spreadsheetAdapter';
@@ -367,7 +368,7 @@ function documentRecordFromCandidate(candidate: Candidate, documentId: string, s
   const target = sourceFormat.toLowerCase() === 'pptx'
     ? { kind: 'slide' as const, slide: candidate.pageNumber, boundingBox, ...(candidate.fragments?.length ? { fragments: candidate.fragments } : {}), ...(candidate.textAnchor ? { textAnchor: candidate.textAnchor } : {}) }
     : { kind: 'page' as const, page: candidate.pageNumber, boundingBox, ...(candidate.fragments?.length ? { fragments: candidate.fragments } : {}), ...(candidate.textAnchor ? { textAnchor: candidate.textAnchor } : {}) };
-  const status = candidate.reviewOutcome ?? (candidate.reviewedByHuman ? 'approved' : candidate.requiresReview ? 'needs_review' : 'auto');
+  const status = annotationReviewStatus(candidate);
   return {
     id: candidate.id, documentId, ...(sourceHash ? { sourceHash } : {}), target, label: candidate.label,
     evidence: candidate.excerpt ?? '', explanation: [candidate.reason, candidate.note].filter(Boolean).join('\n'),
@@ -1681,7 +1682,7 @@ export async function resumeDocumentAgentRun(args: { runId: string; approvalId: 
     if (resolvedChange) {
       const appliedChange = args.approved ? pending.spreadsheet?.getChanges().find((change) => change.id === args.approvalId) : undefined;
       const nextChange = appliedChange ?? (args.approved
-        ? { ...resolvedChange, requiresReview: false, approved: true }
+        ? { ...resolvedChange, requiresReview: false, approved: true, reviewOutcome: 'approved' as const }
         : { ...resolvedChange, rejected: true });
       const changeIndex = pending.spreadsheetChanges.findIndex((change) => change.id === args.approvalId);
       pending.spreadsheetChanges[changeIndex] = nextChange;

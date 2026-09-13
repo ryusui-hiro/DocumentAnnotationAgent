@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { normalizeDocumentAnnotationRecords, readStoredDocumentAnnotationRecords, resolveCandidateReview, restoreDocumentAnnotationRecords } from './documentAnnotations';
+import { normalizeDocumentAnnotationRecords, readStoredDocumentAnnotationRecords, resolveCandidateReview, restoreDocumentAnnotationRecords, spreadsheetChangeStatusLabel } from './documentAnnotations';
 
 test('normalizes visual and spreadsheet annotations into a shared target and review schema', () => {
   const records = normalizeDocumentAnnotationRecords({
@@ -24,12 +24,13 @@ test('normalizes visual and spreadsheet annotations into a shared target and rev
     }],
   });
 
-  assert.deepEqual(records.map((record) => record.status), ['auto', 'needs_review', 'approved']);
+  assert.deepEqual(records.map((record) => record.status), ['auto', 'needs_review', 'auto']);
   assert.deepEqual(records[0]?.target, { kind: 'page', page: 2, boundingBox: { x: 0.1, y: 0.2, width: 0.3, height: 0.1 } });
   assert.equal(records[1]?.reviewPriority, 'high');
   assert.equal(records[0]?.reviewPriority, 'medium');
   assert.equal(records[2]?.reviewPriority, 'medium');
   assert.deepEqual(records[2]?.target, { kind: 'sheet', sheet: 'Customers', cellRange: 'F2' });
+  assert.equal(spreadsheetChangeStatusLabel({ id: 'sheet-cell', operation: 'write_cell', sheetName: 'Customers', range: 'F2', values: [['HIGH']], reason: '', requiresReview: false, approved: true }), '適用済み');
   assert.equal(records.every((record) => record.documentId === 'doc-1'), true);
 });
 
@@ -78,7 +79,7 @@ test('canonical records restore visual review states and spreadsheet changes wit
     }],
     spreadsheetChanges: [{
       id: 'cell-change', operation: 'write_cell', sheetName: 'Customers', range: 'F2', values: [['HIGH']],
-      reason: 'The account has repeated support escalations.', reviewPriority: 'high', requiresReview: false, approved: true,
+      reason: 'The account has repeated support escalations.', reviewPriority: 'high', requiresReview: false, approved: true, reviewOutcome: 'approved',
     }],
   });
   const restored = restoreDocumentAnnotationRecords(records);
@@ -90,8 +91,36 @@ test('canonical records restore visual review states and spreadsheet changes wit
   assert.deepEqual(restored.spreadsheetChanges[0], {
     id: 'cell-change', operation: 'write_cell', sheetName: 'Customers', range: 'F2',
     values: [['HIGH']], reason: 'The account has repeated support escalations.',
-    reviewPriority: 'high', requiresReview: false, approved: true,
+    reviewPriority: 'high', requiresReview: false, approved: true, reviewOutcome: 'approved',
   });
+});
+
+test('round-trips all five spreadsheet review states without treating applied writes as human-approved', () => {
+  const spreadsheetChanges = [
+    { id: 'auto', operation: 'write_cell' as const, sheetName: 'Customers', range: 'A1', values: [['AUTO']], reason: '', requiresReview: false, approved: true },
+    { id: 'needs-review', operation: 'write_cell' as const, sheetName: 'Customers', range: 'A2', values: [['REVIEW']], reason: '', requiresReview: true },
+    { id: 'approved', operation: 'write_cell' as const, sheetName: 'Customers', range: 'A3', values: [['APPROVED']], reason: '', requiresReview: false, approved: true, reviewOutcome: 'approved' as const },
+    { id: 'corrected', operation: 'write_cell' as const, sheetName: 'Customers', range: 'A4', values: [['CORRECTED']], reason: '', requiresReview: false, approved: true, reviewOutcome: 'corrected' as const },
+    { id: 'rejected', operation: 'write_cell' as const, sheetName: 'Customers', range: 'A5', values: [['REJECTED']], reason: '', requiresReview: false, rejected: true },
+  ];
+  const records = normalizeDocumentAnnotationRecords({
+    documentId: 'spreadsheet-review-states', fileType: 'XLSX', annotations: [], candidates: [], rejectedCandidates: [], spreadsheetChanges,
+  });
+  assert.deepEqual(records.map((record) => record.status), ['auto', 'needs_review', 'approved', 'corrected', 'rejected']);
+
+  const restored = restoreDocumentAnnotationRecords(records);
+  assert.equal(restored.spreadsheetChanges[0]?.approved, true, 'automatic writes stay applied for native workbook export');
+  assert.equal(restored.spreadsheetChanges[0]?.reviewOutcome, undefined, 'automatic application is not a human approval');
+  const roundTripped = normalizeDocumentAnnotationRecords({ documentId: 'spreadsheet-review-states', fileType: 'XLSX', ...restored });
+  assert.deepEqual(roundTripped.map((record) => record.status), ['auto', 'needs_review', 'approved', 'corrected', 'rejected']);
+
+  const contradictoryPending = restoreDocumentAnnotationRecords([{ ...records[1]!, requiresReview: false, approved: true, rejected: true }]);
+  assert.deepEqual(contradictoryPending.spreadsheetChanges[0], {
+    id: 'needs-review', operation: 'write_cell', sheetName: 'Customers', range: 'A2', values: [['REVIEW']],
+    reason: '', reviewPriority: 'high', requiresReview: true,
+  }, 'the canonical state wins over stale operational flags');
+  const reconciledPending = normalizeDocumentAnnotationRecords({ documentId: 'spreadsheet-review-states', fileType: 'XLSX', ...contradictoryPending });
+  assert.equal(reconciledPending[0]?.status, 'needs_review');
 });
 
 test('maps presentation page regions to slide targets and rejected items to rejected status', () => {
@@ -175,10 +204,29 @@ test('keeps unchanged approval, correction, and human-created annotation statuse
   assert.deepEqual(restored.annotations.map((annotation) => annotation.reviewOutcome), ['approved', 'corrected', 'approved', 'approved']);
 });
 
+test('uses the same review fallback for legacy visual records and renders workbook application separately from human approval', () => {
+  const records = normalizeDocumentAnnotationRecords({
+    documentId: 'legacy-review-states', fileType: 'PDF',
+    annotations: [
+      { id: 'legacy-correction', pageNumber: 1, x: 0.1, y: 0.1, width: 0.3, height: 0.1, label: 'HIGH', note: 'Changed by a person.', color: '#178b87', source: 'manual', reviewedByHuman: true },
+      { id: 'high-priority', pageNumber: 1, x: 0.1, y: 0.3, width: 0.3, height: 0.1, label: 'REVIEW', note: 'Escalated priority.', color: '#178b87', source: 'ai', reviewPriority: 'high' },
+    ],
+    candidates: [], rejectedCandidates: [], spreadsheetChanges: [],
+  });
+  assert.deepEqual(records.map((record) => record.status), ['corrected', 'needs_review']);
+
+  const change = { id: 'sheet-change', operation: 'write_cell' as const, sheetName: 'Customers', range: 'F2', values: [['HIGH']], reason: '', requiresReview: false };
+  assert.equal(spreadsheetChangeStatusLabel({ ...change, approved: true }), '適用済み');
+  assert.equal(spreadsheetChangeStatusLabel({ ...change, approved: true, reviewOutcome: 'approved' }), '承認済み');
+  assert.equal(spreadsheetChangeStatusLabel({ ...change, requiresReview: true }), '承認待ち');
+  assert.equal(spreadsheetChangeStatusLabel({ ...change, rejected: true }), '却下');
+  assert.equal(spreadsheetChangeStatusLabel({ ...change, approved: true, reviewOutcome: 'corrected' }), '修正済み');
+});
+
 test('rebinds saved workspace annotations to a live session and tolerates malformed local state', () => {
   const saved = normalizeDocumentAnnotationRecords({
     documentId: 'expired-session', fileType: 'XLSX', annotations: [], candidates: [], rejectedCandidates: [],
-    spreadsheetChanges: [{ id: 'saved-cell', operation: 'write_cell', sheetName: 'Customers', range: 'F2', values: [['HIGH']], reason: 'Evidence in the row supports the classification.', requiresReview: false, approved: true }],
+    spreadsheetChanges: [{ id: 'saved-cell', operation: 'write_cell', sheetName: 'Customers', range: 'F2', values: [['HIGH']], reason: 'Evidence in the row supports the classification.', requiresReview: false, approved: true, reviewOutcome: 'approved' }],
   });
   const rebound = readStoredDocumentAnnotationRecords(JSON.stringify({ version: 3, documentAnnotations: saved }), 'new-session', 'XLSX');
   assert.equal(rebound[0]?.documentId, 'new-session');

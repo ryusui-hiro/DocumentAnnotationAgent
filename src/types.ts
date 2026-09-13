@@ -175,6 +175,7 @@ export interface SpreadsheetCellChange {
   requiresReview: boolean;
   approved?: boolean;
   rejected?: boolean;
+  reviewOutcome?: 'approved' | 'corrected';
   approvalRunId?: string;
   approvalId?: string;
 }

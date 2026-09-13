@@ -98,6 +98,7 @@ export interface SpreadsheetCellChange {
   requiresReview: boolean;
   approved?: boolean;
   rejected?: boolean;
+  reviewOutcome?: 'approved' | 'corrected';
 }
 
 function fail(message: string, status = 400): Error & { status: number } {
@@ -207,9 +208,10 @@ export class SpreadsheetDocumentAdapter implements DocumentAdapter, SpreadsheetI
     const values = annotation.values?.map((row) => row.map(normalizeValue)) ?? [];
     const reason = (annotation.reason || annotation.explanation).slice(0, 500);
     const status = annotation.status;
-    const requiresReview = Boolean(annotation.requiresReview) || status === 'needs_review';
-    const rejected = Boolean(annotation.rejected) || status === 'rejected';
+    const requiresReview = status === 'needs_review';
+    const rejected = status === 'rejected';
     const approved = !requiresReview && !rejected;
+    const reviewOutcome = status === 'approved' || status === 'corrected' ? status : undefined;
     let change: SpreadsheetCellChange;
     if (annotation.operation === 'write_range') {
       const startText = annotation.target.cellRange.split(':')[0]!;
@@ -222,6 +224,7 @@ export class SpreadsheetDocumentAdapter implements DocumentAdapter, SpreadsheetI
         operation: 'write_range', sheetName: worksheet.name, range: `${cellAddress(start.row, start.column)}:${end}`, values, reason,
         confidence: annotation.confidence, reviewPriority: annotation.reviewPriority, requiresReview,
         ...(approved ? { approved: true } : {}),
+        ...(reviewOutcome ? { reviewOutcome } : {}),
       }, annotation.id);
       if (approved) this.applyChange(change);
     } else {
@@ -233,6 +236,7 @@ export class SpreadsheetDocumentAdapter implements DocumentAdapter, SpreadsheetI
         operation: annotation.operation, sheetName: worksheet.name, range: cellAddress(cell.row, cell.column), values: [[value]], reason,
         confidence: annotation.confidence, reviewPriority: annotation.reviewPriority, requiresReview,
         ...(approved ? { approved: true } : {}),
+        ...(reviewOutcome ? { reviewOutcome } : {}),
       }, annotation.id);
       if (approved) this.applyChange(change);
     }
@@ -419,9 +423,9 @@ export class SpreadsheetDocumentAdapter implements DocumentAdapter, SpreadsheetI
     const change = this.changes.get(changeId);
     if (!change) throw fail('Spreadsheet change not found.', 404);
     if (change.rejected) throw fail('A rejected spreadsheet change cannot be approved.', 409);
-    if (change.approved) return change;
-    this.applyChange(change);
-    const approved = { ...change, requiresReview: false, approved: true };
+    if (change.reviewOutcome && !change.requiresReview) return change;
+    if (!change.approved) this.applyChange(change);
+    const approved = { ...change, requiresReview: false, approved: true, reviewOutcome: 'approved' as const };
     this.changes.set(changeId, approved);
     this.annotations.set(changeId, this.annotationFromChange(approved));
     return approved;
@@ -456,7 +460,7 @@ export class SpreadsheetDocumentAdapter implements DocumentAdapter, SpreadsheetI
   }
 
   private annotationFromChange(change: SpreadsheetCellChange): DocumentAnnotationRecord {
-    const status = change.rejected ? 'rejected' : change.requiresReview ? 'needs_review' : change.approved ? 'approved' : 'auto';
+    const status = change.rejected ? 'rejected' : change.requiresReview ? 'needs_review' : change.reviewOutcome ?? 'auto';
     const label = change.operation === 'create_column' ? `Create column: ${String(change.values[0]?.[0] ?? '')}` : 'Workbook cell update';
     return {
       id: change.id,

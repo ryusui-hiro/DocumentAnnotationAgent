@@ -40,7 +40,8 @@ import { consumeAgentStream, type LiveToolActivity } from './agentStream';
 import { readAgentRunHistory, resolveHumanReviewStatus, upsertAgentRunHistory, writeAgentRunHistory } from './runHistory';
 import { localTaskPlan, parseTaskPlan, taskPlanAsInstructions, taskPlanSignature, type AnnotationTaskPlan, type TaskPlanSource } from './taskPlan';
 import { findInconsistentRepeatedExcerpts, restoreAnnotationConsistencyIssues, type AnnotationConsistencyIssue } from './consistency';
-import { normalizeDocumentAnnotationRecords, readStoredDocumentAnnotationRecords, resolveCandidateReview, restoreDocumentAnnotationRecords } from './documentAnnotations';
+import { normalizeDocumentAnnotationRecords, readStoredDocumentAnnotationRecords, resolveCandidateReview, restoreDocumentAnnotationRecords, spreadsheetChangeStatusLabel } from './documentAnnotations';
+import { annotationReviewStatus } from './annotationStatus';
 import { mergePreparedDocumentExports, restorePreparedDocumentExports } from './preparedExports';
 import { createHumanDecisionRecord, readHumanDecisionRecords, recordHumanDecision, type HumanDecisionScope } from './humanDecisionScope';
 import { isSupportedWorkspaceFile, loadWorkspaceProject, maxWorkspaceDocuments, saveWorkspaceProject, shouldIgnoreWorkspaceDirectory } from './workspace';
@@ -954,10 +955,7 @@ function App() {
       excerpt: (annotation.excerpt ?? '').slice(0, 1000),
       explanation: [annotation.reason, annotation.note].filter(Boolean).join('\n').slice(0, 1000),
       reviewPriority: annotation.reviewPriority ?? (annotation.requiresReview ? 'high' as const : 'medium' as const),
-      status: annotation.reviewOutcome ?? (annotation.reviewedByHuman
-        ? annotation.source === 'ai' ? 'approved' as const : 'corrected' as const
-        : annotation.requiresReview || annotation.reviewPriority === 'high' ? 'needs_review' as const
-          : annotation.source === 'manual' ? 'approved' as const : 'auto' as const),
+      status: annotationReviewStatus(annotation),
     }));
     const issues = findInconsistentRepeatedExcerpts(uniqueAnnotations);
     if (!summaries.length) return { issues, usage: undefined as TokenUsage | undefined, modelFindingCount: 0 };
@@ -3155,8 +3153,8 @@ function App() {
                     const currentApproval = Boolean(agentContinuation?.approvalId === change.id && change.requiresReview);
                     const operationLabel = change.operation === 'create_column' ? '列を追加' : change.operation === 'write_cell' ? 'セルを更新' : '範囲を更新';
                     const proposedValues = change.values.slice(0, 3).map((row) => row.slice(0, 5).map((value) => value === null ? '空' : String(value)).join(' · ')).join(' / ');
-                    return <article className={`workbook-change${change.requiresReview ? ' is-pending' : change.rejected ? ' is-rejected' : ' is-approved'}`} key={change.id}>
-                      <div><strong>{change.sheetName}!{change.range}</strong><span>{change.rejected ? '却下' : change.requiresReview ? '承認待ち' : change.approved ? '承認済み' : '適用済み'}</span></div>
+                    return <article className={`workbook-change${change.requiresReview ? ' is-pending' : change.rejected ? ' is-rejected' : change.reviewOutcome === 'approved' ? ' is-approved' : ' is-applied'}`} key={change.id}>
+                      <div><strong>{change.sheetName}!{change.range}</strong><span>{spreadsheetChangeStatusLabel(change)}</span></div>
                       <p>{operationLabel}: {proposedValues}</p><small>{change.reason}</small>
                       {currentApproval && <div className="workbook-change-actions"><button className="candidate-add" type="button" disabled={working} onClick={() => decideSpreadsheetChange(change, true)}><Check size={13} /> 承認して続行</button><button className="candidate-reject" type="button" disabled={working} onClick={() => decideSpreadsheetChange(change, false)}>却下</button></div>}
                     </article>;

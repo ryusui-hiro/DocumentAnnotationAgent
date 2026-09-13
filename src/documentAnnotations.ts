@@ -1,4 +1,5 @@
 import type { Annotation, AnnotationCandidate, AnnotationReviewPriority, DocumentAnnotationRecord, NormalizedTextBox, SpreadsheetCellChange, TextAnchor } from './types';
+import { annotationReviewStatus } from './annotationStatus';
 
 function visualTarget(annotation: Annotation, fileType: string): DocumentAnnotationRecord['target'] {
   const boundingBox = { x: annotation.x, y: annotation.y, width: annotation.width, height: annotation.height };
@@ -10,11 +11,7 @@ function visualTarget(annotation: Annotation, fileType: string): DocumentAnnotat
 }
 
 function visualStatus(annotation: Annotation): DocumentAnnotationRecord['status'] {
-  if (annotation.reviewOutcome) return annotation.reviewOutcome;
-  if (annotation.reviewedByHuman) return annotation.source === 'ai' ? 'approved' : 'corrected';
-  if (annotation.requiresReview || annotation.reviewPriority === 'high') return 'needs_review';
-  if (annotation.source === 'manual') return 'approved';
-  return 'auto';
+  return annotationReviewStatus(annotation);
 }
 
 function visualRecord(documentId: string, fileType: string, sourceHash: string | undefined, annotation: Annotation & Pick<Partial<AnnotationCandidate>, 'approvalRunId' | 'approvalId'>, status = visualStatus(annotation)): DocumentAnnotationRecord {
@@ -55,7 +52,7 @@ export function normalizeDocumentAnnotationRecords(args: {
     ...args.candidates.map((candidate) => visualRecord(args.documentId, args.fileType, args.sourceHash, candidate, 'needs_review')),
     ...args.rejectedCandidates.map((candidate) => visualRecord(args.documentId, args.fileType, args.sourceHash, candidate, 'rejected')),
     ...args.spreadsheetChanges.map((change): DocumentAnnotationRecord => {
-      const status = change.rejected ? 'rejected' : change.approved ? 'approved' : change.requiresReview ? 'needs_review' : 'auto';
+      const status = change.rejected ? 'rejected' : change.requiresReview ? 'needs_review' : change.reviewOutcome ?? 'auto';
       return {
         id: change.id,
         documentId: args.documentId,
@@ -118,6 +115,14 @@ function readTextAnchor(value: unknown): TextAnchor | undefined {
 const reviewPriorities = new Set(['low', 'medium', 'high']);
 const annotationStatuses = new Set(['auto', 'needs_review', 'approved', 'corrected', 'rejected']);
 
+export function spreadsheetChangeStatusLabel(change: SpreadsheetCellChange): string {
+  if (change.rejected) return '却下';
+  if (change.requiresReview) return '承認待ち';
+  if (change.reviewOutcome === 'approved') return '承認済み';
+  if (change.reviewOutcome === 'corrected') return '修正済み';
+  return change.approved ? '適用済み' : '未適用';
+}
+
 /** Restores UI-facing arrays from the canonical document annotation records. */
 export function restoreDocumentAnnotationRecords(value: unknown) {
   const annotations: Annotation[] = [];
@@ -129,7 +134,8 @@ export function restoreDocumentAnnotationRecords(value: unknown) {
   for (const raw of value) {
     if (!isRecord(raw) || typeof raw.id !== 'string' || typeof raw.label !== 'string' || !isRecord(raw.target)) continue;
     const target = raw.target;
-    const status = annotationStatuses.has(String(raw.status)) ? raw.status as DocumentAnnotationRecord['status'] : 'auto';
+    const hasCanonicalStatus = annotationStatuses.has(String(raw.status));
+    const status = hasCanonicalStatus ? raw.status as DocumentAnnotationRecord['status'] : 'auto';
     const reviewPriority = reviewPriorities.has(String(raw.reviewPriority)) ? raw.reviewPriority as AnnotationReviewPriority : status === 'needs_review' ? 'high' : 'medium';
     const confidence = typeof raw.confidence === 'number' && Number.isFinite(raw.confidence) ? Math.min(1, Math.max(0, raw.confidence)) : undefined;
 
@@ -147,7 +153,7 @@ export function restoreDocumentAnnotationRecords(value: unknown) {
       const width = Math.min(1 - x, boundedNumber(target.boundingBox.width, 0.02, 0.015, 1));
       const height = Math.min(1 - y, boundedNumber(target.boundingBox.height, 0.02, 0.01, 1));
       const source = raw.source === 'manual' ? 'manual' : 'ai';
-      const requiresReview = Boolean(raw.requiresReview) || status === 'needs_review';
+      const requiresReview = hasCanonicalStatus ? status === 'needs_review' : Boolean(raw.requiresReview);
       const annotation: AnnotationCandidate = {
         id: raw.id.slice(0, 100), pageNumber, x, y, width, height,
         label: raw.label.slice(0, 60),
@@ -161,7 +167,7 @@ export function restoreDocumentAnnotationRecords(value: unknown) {
         excerpt: typeof raw.excerpt === 'string' ? raw.excerpt.slice(0, 1000) : typeof raw.evidence === 'string' ? raw.evidence.slice(0, 1000) : '',
         ...(fragments.length ? { fragments } : {}),
         ...(textAnchor ? { textAnchor } : {}),
-        reviewedByHuman: Boolean(raw.reviewedByHuman) || status === 'approved' || status === 'corrected',
+        reviewedByHuman: hasCanonicalStatus ? status === 'approved' || status === 'corrected' : Boolean(raw.reviewedByHuman),
         ...(status === 'approved' || status === 'corrected' ? { reviewOutcome: status } : {}),
         ...(typeof raw.approvalRunId === 'string' ? { approvalRunId: raw.approvalRunId.slice(0, 100) } : {}),
         ...(typeof raw.approvalId === 'string' ? { approvalId: raw.approvalId.slice(0, 200) } : {}),
@@ -179,9 +185,10 @@ export function restoreDocumentAnnotationRecords(value: unknown) {
         sheetName: target.sheet.slice(0, 120), range: typeof target.cellRange === 'string' ? target.cellRange.slice(0, 30) : '',
         values, reason: typeof raw.reason === 'string' ? raw.reason.slice(0, 500) : typeof raw.explanation === 'string' ? raw.explanation.slice(0, 500) : '',
         ...(confidence !== undefined ? { confidence } : {}), reviewPriority,
-        requiresReview: Boolean(raw.requiresReview) || status === 'needs_review',
-        ...(Boolean(raw.approved) || status === 'approved' || status === 'auto' ? { approved: true } : {}),
-        ...(Boolean(raw.rejected) || status === 'rejected' ? { rejected: true } : {}),
+        requiresReview: hasCanonicalStatus ? status === 'needs_review' : Boolean(raw.requiresReview),
+        ...((hasCanonicalStatus ? ['auto', 'approved', 'corrected'].includes(status) : Boolean(raw.approved)) ? { approved: true } : {}),
+        ...((hasCanonicalStatus ? status === 'rejected' : Boolean(raw.rejected)) ? { rejected: true } : {}),
+        ...(status === 'approved' || status === 'corrected' ? { reviewOutcome: status } : {}),
         ...(typeof raw.approvalRunId === 'string' ? { approvalRunId: raw.approvalRunId.slice(0, 100) } : {}),
         ...(typeof raw.approvalId === 'string' ? { approvalId: raw.approvalId.slice(0, 200) } : {}),
       });
