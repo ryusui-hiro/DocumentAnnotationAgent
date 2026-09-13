@@ -36,6 +36,7 @@ test('requests a strict task plan schema and validates the returned plan', async
   const captured = capture.request;
   assert.ok(captured);
   assert.equal(captured.store, false);
+  assert.match(String(captured.instructions), /one concise, complete instruction/);
   const text = captured.text as { format?: { type?: string; strict?: boolean; schema?: unknown } } | undefined;
   assert.equal(text?.format?.type, 'json_schema');
   assert.equal(text?.format?.strict, true);

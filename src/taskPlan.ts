@@ -39,8 +39,8 @@ export const taskPlanJsonSchema = {
   additionalProperties: false,
   required: ['title', 'objective', 'labels', 'actions', 'uncertaintyPolicy', 'workflow'],
   properties: {
-    title: { type: 'string' },
-    objective: { type: 'string' },
+    title: { type: 'string', minLength: 1, maxLength: 120 },
+    objective: { type: 'string', minLength: 1, maxLength: 500 },
     labels: {
       type: 'array',
       minItems: 1,
@@ -49,12 +49,15 @@ export const taskPlanJsonSchema = {
         type: 'object',
         additionalProperties: false,
         required: ['name', 'description'],
-        properties: { name: { type: 'string' }, description: { type: 'string' } },
+        properties: {
+          name: { type: 'string', minLength: 1, maxLength: 60 },
+          description: { type: 'string', minLength: 1, maxLength: 240 },
+        },
       },
     },
-    actions: { type: 'array', minItems: 1, maxItems: 4, items: { type: 'string' } },
-    uncertaintyPolicy: { type: 'string' },
-    workflow: { type: 'array', minItems: 2, maxItems: 6, items: { type: 'string' } },
+    actions: { type: 'array', minItems: 1, maxItems: 4, items: { type: 'string', minLength: 1, maxLength: 80 } },
+    uncertaintyPolicy: { type: 'string', minLength: 1, maxLength: 400 },
+    workflow: { type: 'array', minItems: 2, maxItems: 6, items: { type: 'string', minLength: 1, maxLength: 120 } },
   },
 } as const;
 
