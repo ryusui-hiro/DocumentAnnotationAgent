@@ -837,7 +837,7 @@ app.post('/api/ai/annotate', async (request, response, next) => {
   };
   try {
     const { settings, model, effort } = readAIRequest(body);
-    const { instruction, taskPlan, guidelines, correction, humanDecisions, pageText, imageDataUrl, pageNumber, totalPages, agentMode, requireToolApproval, documentId, documentScope, exportScope } = body as {
+    const { instruction, taskPlan, guidelines, correction, humanDecisions, pageText, imageDataUrl, pageNumber, totalPages, agentMode, requireToolApproval, selectedAnnotationId, documentId, documentScope, exportScope } = body as {
       instruction?: string;
       taskPlan?: string;
       guidelines?: string;
@@ -849,6 +849,7 @@ app.post('/api/ai/annotate', async (request, response, next) => {
       totalPages?: number;
       agentMode?: string;
       requireToolApproval?: boolean;
+      selectedAnnotationId?: string;
       documentId?: string;
       documentScope?: string;
       exportScope?: string;
@@ -885,6 +886,10 @@ app.post('/api/ai/annotate', async (request, response, next) => {
     const selectedMode = (agentMode ?? 'assist') as typeof validAgentModes[number];
     if (requireToolApproval !== undefined && typeof requireToolApproval !== 'boolean') {
       response.status(400).json({ error: 'Tool approval setting is invalid.' });
+      return;
+    }
+    if (selectedAnnotationId !== undefined && (typeof selectedAnnotationId !== 'string' || selectedAnnotationId.length > 100)) {
+      response.status(400).json({ error: 'Selected annotation ID is invalid.' });
       return;
     }
     if (documentScope !== undefined && !['current', 'all'].includes(documentScope)) {
@@ -1058,6 +1063,7 @@ app.post('/api/ai/annotate', async (request, response, next) => {
       totalPages: boundedTotalPages,
       requestedScope: exportScope === 'all' ? 'all' : 'current',
       existingAnnotations: existingAnnotationsResult.data as ExistingAnnotation[],
+      ...(selectedAnnotationId ? { selectedAnnotationId } : {}),
       allowNavigation: documentScope === 'all',
       ...(streamActive ? { onToolEvent: (event) => emit('activity', event) } : {}),
       mode: selectedMode,

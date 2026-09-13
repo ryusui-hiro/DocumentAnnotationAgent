@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
-import { ScriptedModel, assistantMessage, functionCall, modelResponse } from '@openai/agents/testing';
+import { ScriptedModel, assistantMessage, functionCall, modelResponder, modelResponse } from '@openai/agents/testing';
 import ExcelJS from 'exceljs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -175,6 +175,82 @@ test('select_text and annotate_text map a unique positioned phrase to a read-onl
   assert.equal(result.annotations[0]?.requiresReview, true);
   assert.deepEqual(adapter.listAnnotations(), [], 'Observe findings must not enter the document annotation adapter');
   assert.deepEqual(result.toolEvents.slice(-2).map((event) => event.toolName), ['select_text', 'annotate_text']);
+});
+
+test('get_selected_region returns the viewer-selected annotation location to the Agent', async () => {
+  const selected = { id: 'viewer-region', pageNumber: 2, x: 0.2, y: 0.3, width: 0.25, height: 0.05, label: 'HIGH RISK', note: 'Manual reviewer selection.', excerpt: 'Either party may terminate.', reviewPriority: 'high' as const, status: 'active' as const };
+  const model = new ScriptedModel([
+    modelResponse([functionCall('get_document_outline', {}, { callId: 'selected-outline' })]),
+    modelResponse([functionCall('inspect_page', {}, { callId: 'selected-inspect' })]),
+    modelResponse([functionCall('get_selected_region', {}, { callId: 'selected-region-read' })]),
+    modelResponder((call) => {
+      const outputItem = Array.isArray(call.request.input)
+        ? call.request.input.find((item) => item.type === 'function_call_result' && item.name === 'get_selected_region')
+        : undefined;
+      assert.ok(outputItem, 'the selected-region tool result is returned to the model');
+      const rawOutput = 'output' in outputItem ? outputItem.output : undefined;
+      const outputText = typeof rawOutput === 'string' ? rawOutput
+        : rawOutput && !Array.isArray(rawOutput) && typeof rawOutput === 'object' && 'text' in rawOutput ? String(rawOutput.text)
+          : '';
+      assert.deepEqual(JSON.parse(outputText), {
+        selected: true,
+        source: 'viewer_annotation',
+        annotationId: 'viewer-region',
+        pageNumber: 2,
+        boundingBox: { x: 0.2, y: 0.3, width: 0.25, height: 0.05 },
+        label: 'HIGH RISK',
+        note: 'Manual reviewer selection.',
+        excerpt: 'Either party may terminate.',
+        reviewPriority: 'high',
+        status: 'active',
+      });
+      return [assistantMessage('The selected high-risk region is on page 2.')];
+    }),
+  ]);
+  const result = await runDocumentAgent({
+    model: 'gpt-6-astra', reasoningEffort: 'low', instruction: 'Review the selected clause.',
+    guidelines: '', correction: '', humanDecisions: '', pageText: 'Current page text.',
+    imageDataUrl: 'data:image/png;base64,AA==', pageNumber: 2, totalPages: 2, mode: 'observe',
+    existingAnnotations: [selected], selectedAnnotationId: selected.id,
+  }, model);
+
+  model.assertComplete();
+  assert.equal(result.status, 'complete');
+  assert.equal(result.annotations.length, 0, 'reading a selected region stays read-only');
+  assert.equal(result.toolEvents.find((event) => event.toolName === 'get_selected_region')?.pageNumber, 2);
+});
+
+test('get_selected_region returns the unique text region selected by select_text', async () => {
+  const model = new ScriptedModel([
+    modelResponse([functionCall('get_document_outline', {}, { callId: 'text-region-outline' })]),
+    modelResponse([functionCall('inspect_page', {}, { callId: 'text-region-inspect' })]),
+    modelResponse([functionCall('select_text', { text: '12 N-m' }, { callId: 'text-region-select' })]),
+    modelResponse([functionCall('get_selected_region', {}, { callId: 'text-region-read' })]),
+    modelResponder((call) => {
+      const output = Array.isArray(call.request.input)
+        ? call.request.input.find((item) => item.type === 'function_call_result' && item.name === 'get_selected_region')
+        : undefined;
+      assert.ok(output);
+      const rawOutput = 'output' in output ? output.output : undefined;
+      const outputText = typeof rawOutput === 'string' ? rawOutput
+        : rawOutput && !Array.isArray(rawOutput) && typeof rawOutput === 'object' && 'text' in rawOutput ? String(rawOutput.text)
+          : '';
+      const selected = JSON.parse(outputText) as { selected: boolean; source: string; excerpt: string };
+      assert.equal(selected.selected, true);
+      assert.equal(selected.source, 'positioned_text');
+      assert.equal(selected.excerpt, '12 N-m');
+      return [assistantMessage('The unique selected text region is ready for annotation.')];
+    }),
+  ]);
+  const result = await runDocumentAgent({
+    model: 'gpt-6-astra', reasoningEffort: 'low', instruction: 'Inspect this selected phrase.',
+    guidelines: '', correction: '', humanDecisions: '', pageText: '[x=0.100, y=0.200, w=0.300, h=0.030] Torque: 12 N-m.',
+    imageDataUrl: 'data:image/png;base64,AA==', pageNumber: 1, totalPages: 1, mode: 'observe',
+  }, model);
+
+  model.assertComplete();
+  assert.equal(result.status, 'complete');
+  assert.equal(result.toolEvents.filter((event) => event.toolName === 'get_selected_region').length, 1);
 });
 
 test('annotate_text applies a unique text match on a page opened through document navigation', async () => {

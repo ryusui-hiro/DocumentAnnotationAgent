@@ -43,7 +43,7 @@ npm start
 - 将自然语言指令整理为可见的 Annotation Task，包含标签、操作、不确定时的处理方式和流程；连接 OpenAI、Azure、兼容 OpenAI 的 API 或 Codex App Server 时使用结构化输出，并把计划传给逐页 Agent。未连接时会标记为本地草稿。
 - 可导入可提取文本的 PDF / Office 文档作为指南来源，并将文本加入可编辑的指南栏。
 - 可选择 Observe、Suggest、Assist 或 Autopilot。实时活动流会显示任务规划、页面导航、SVG 文本 / 布局检查、搜索、注释、审核和导出操作。
-- 服务端使用 OpenAI Agents SDK 编排文档工具：读取大纲、检查页面、列出现有注释、搜索提取文本、添加区域注释及请求人工审核。`select_text` 会将带位置的文本映射到归一化页面坐标，`annotate_text` 根据唯一匹配创建有文本证据的区域注释；缺少匹配或存在重复匹配时不会自动确认。在 Assist / Autopilot 中，Agent 提议更新或删除现有注释时会暂停等待批准，并恢复同一个运行。现有注释和待审核项会以有界摘要传入，帮助 Agent 避免重复。Codex App Server 继续使用结构化输出适配器。
+- 服务端使用 OpenAI Agents SDK 编排文档工具：读取大纲、检查页面、读取当前选择区域、列出现有注释、搜索提取文本、添加区域注释及请求人工审核。`select_text` 会将带位置的文本映射到归一化页面坐标，`get_selected_region` 会将查看器中的选择传给 Agent，`annotate_text` 根据唯一匹配创建有文本证据的区域注释；缺少匹配或存在重复匹配时不会自动确认。在 Assist / Autopilot 中，Agent 提议更新或删除现有注释时会暂停等待批准，并恢复同一个运行。现有注释和待审核项会以有界摘要传入，帮助 Agent 避免重复。Codex App Server 继续使用结构化输出适配器。
 - 仅当用户在任务中明确要求文件输出时，Agents SDK 运行才会在完成指定范围检查后调用 `export_annotations`，通过 Adapter 准备原格式、JSON 或 CSV 文件并显示下载操作。产物加密保存 30 分钟；存在未解决审核时不会输出原格式副本。Codex App Server 使用与服务商无关的 UI 导出操作。
 - PDF / Office 页面预览和 XLSX 工作簿实现共享的服务端 `DocumentAdapter` 大纲、检查与搜索契约。`search_document` 可跨全文检索，并返回页面或工作表单元格位置。
 - 同一 Adapter 保存 Agent 工具生成的类型化注释，并通过 `POST /api/documents/:documentId/export` 统一导出 JSON、CSV、PDF、DOCX、PPTX 和 XLSX。会话单独保留上传源字节；原文件不会被覆盖，导出会生成新文件。

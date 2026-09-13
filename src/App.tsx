@@ -2059,6 +2059,12 @@ function App() {
             addAgentActivity('Searching', 'search_document → demo fixture only; no model search was performed.', 'complete', targetPage);
           } else {
             const searchId = addAgentActivity('Searching', 'search_document → checking extracted text, positions, and visual layout for task targets.', 'active', targetPage);
+            const existingAnnotationsForRequest = [...annotationSnapshot.values()].slice(-500);
+            const selectedAnnotationSummary = selectedId ? annotationSnapshot.get(selectedId) : undefined;
+            if (selectedAnnotationSummary && !existingAnnotationsForRequest.some((item) => item.id === selectedAnnotationSummary.id)) {
+              existingAnnotationsForRequest.unshift(selectedAnnotationSummary);
+              if (existingAnnotationsForRequest.length > 500) existingAnnotationsForRequest.pop();
+            }
             const { ok, status, payload: result, streamedActivityCount } = await postAgentRequest('/api/ai/annotate', {
                 instruction: taskInstruction.trim(),
                 taskPlan: structuredTaskPlan,
@@ -2075,7 +2081,8 @@ function App() {
                 totalPages: documentData.pageCount,
                 agentMode: selectedMode,
                 requireToolApproval: !workspaceBatchActiveRef.current,
-                existingAnnotations: [...annotationSnapshot.values()].slice(-500),
+                selectedAnnotationId: selectedAnnotationSummary?.id,
+                existingAnnotations: existingAnnotationsForRequest,
                 documentAnnotations: normalizeDocumentAnnotationRecords({ documentId: documentData.documentId, sourceHash: documentData.sourceHash, fileType: documentData.fileType, ...documentAnnotationView }),
                 settings: { ...settings, apiKey },
               }, settings.apiServerUrl, (toolEvent) => {
