@@ -253,6 +253,46 @@ test('get_selected_region returns the unique text region selected by select_text
   assert.equal(result.toolEvents.filter((event) => event.toolName === 'get_selected_region').length, 1);
 });
 
+test('scroll_document moves a bounded viewport and returns the cropped page image', async () => {
+  const adapter = new PagedDocumentAdapter('scroll.pdf', {
+    sourceFormat: 'PDF', pageCount: 1,
+    pages: [{
+      number: 1, widthPoints: 120, heightPoints: 160, warningCount: 0, warnings: [],
+      svg: '<svg xmlns="http://www.w3.org/2000/svg" width="120" height="160" viewBox="0 0 120 160"><rect width="120" height="160" fill="white"/><text x="8" y="20" font-size="10">Top of the page</text><text x="8" y="150" font-size="10">Bottom of the page</text></svg>',
+    }],
+  } as unknown as PreviewReport, 'scroll-document');
+  const model = new ScriptedModel([
+    modelResponse([functionCall('get_document_outline', {}, { callId: 'scroll-outline' })]),
+    modelResponse([functionCall('inspect_page', {}, { callId: 'scroll-inspect' })]),
+    modelResponse([functionCall('scroll_document', { direction: 'down', amount: 0.2 }, { callId: 'scroll-down' })]),
+    modelResponder((call) => {
+      const resultItem = Array.isArray(call.request.input)
+        ? call.request.input.find((item) => item.type === 'function_call_result' && item.name === 'scroll_document')
+        : undefined;
+      assert.ok(resultItem, 'the scroll result is returned to the model');
+      const rawOutput = 'output' in resultItem ? resultItem.output : undefined;
+      assert.ok(Array.isArray(rawOutput), 'the scroll result contains text and image content');
+      const textOutput = rawOutput.find((item) => typeof item === 'object' && item.type === 'input_text');
+      const imageOutput = rawOutput.find((item) => typeof item === 'object' && item.type === 'input_image');
+      assert.ok(textOutput && 'text' in textOutput && typeof textOutput.text === 'string');
+      assert.ok(imageOutput && 'image' in imageOutput && typeof imageOutput.image === 'string');
+      const state = JSON.parse(textOutput.text) as { moved: boolean; reachedBoundary: boolean; pageNumber: number; viewport: { y: number } };
+      assert.deepEqual(state, { pageNumber: 1, direction: 'down', moved: true, reachedBoundary: false, viewport: { x: 0, y: 0.2, width: 0.68, height: 0.68 } });
+      return [assistantMessage('The lower part of page 1 is now visible.')];
+    }),
+  ]);
+  const result = await runDocumentAgent({
+    model: 'gpt-6-astra', reasoningEffort: 'low', instruction: 'Inspect the full page for key details.',
+    guidelines: '', correction: '', humanDecisions: '', pageText: 'Top of the page. Bottom of the page.',
+    imageDataUrl: 'data:image/png;base64,AA==', pageNumber: 1, totalPages: 1, mode: 'observe',
+    documentAdapters: [adapter],
+  }, model);
+
+  model.assertComplete();
+  assert.equal(result.status, 'complete');
+  assert.match(result.toolEvents.find((event) => event.toolName === 'scroll_document')?.detail ?? '', /Scrolled down on page 1/);
+});
+
 test('annotate_text applies a unique text match on a page opened through document navigation', async () => {
   const adapter = new PagedDocumentAdapter('manual.pdf', {
     sourceFormat: 'PDF', pageCount: 2,

@@ -370,6 +370,7 @@ function App() {
     ? observationFindings
     : [];
   const [agentStatus, setAgentStatus] = useState<AgentRunStatus>('ready');
+  const [agentViewport, setAgentViewport] = useState<NormalizedTextBox | null>(null);
   const [agentActivity, setAgentActivity] = useState<AgentActivityEvent[]>([]);
   const [agentRunHistory, setAgentRunHistory] = useState<AgentRunHistory[]>([]);
   const [agentContinuation, setAgentContinuation] = useState<AgentContinuation | null>(null);
@@ -407,6 +408,7 @@ function App() {
   const activeFileTypeRef = useRef<string | null>(documentData?.fileType ?? null);
   const taskPlanRef = useRef(taskPlan);
   const pageFrameRef = useRef<HTMLDivElement>(null);
+  const pageScrollAreaRef = useRef<HTMLDivElement>(null);
   const pageImageRef = useRef<HTMLImageElement>(null);
   const candidateSectionRef = useRef<HTMLDivElement>(null);
   const activityPanelRef = useRef<HTMLElement>(null);
@@ -720,6 +722,32 @@ function App() {
       activeAgentRunRef.current = { ...activeAgentRunRef.current, events };
       persistRunHistoryEntry(activeAgentRunRef.current);
     }
+  };
+
+  const syncViewerToToolEvent = (event: LiveToolActivity) => {
+    if (event.toolName === 'navigate_page' && event.pageNumber !== undefined) {
+      setAgentViewport(null);
+      setPageNumber(event.pageNumber);
+      window.requestAnimationFrame(() => pageScrollAreaRef.current?.scrollTo({ left: 0, top: 0 }));
+      return;
+    }
+    if (event.toolName !== 'scroll_document' || !event.viewport) return;
+    const viewport = event.viewport;
+    if (event.pageNumber !== undefined) setPageNumber(event.pageNumber);
+    setAgentViewport(viewport);
+    window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+      const area = pageScrollAreaRef.current;
+      if (!area) return;
+      const horizontalRange = Math.max(0, 1 - viewport.width);
+      const verticalRange = Math.max(0, 1 - viewport.height);
+      area.scrollLeft = horizontalRange ? Math.round((area.scrollWidth - area.clientWidth) * viewport.x / horizontalRange) : 0;
+      area.scrollTop = verticalRange ? Math.round((area.scrollHeight - area.clientHeight) * viewport.y / verticalRange) : 0;
+    }));
+  };
+
+  const clearAgentViewport = () => {
+    setAgentViewport(null);
+    window.requestAnimationFrame(() => pageScrollAreaRef.current?.scrollTo({ left: 0, top: 0 }));
   };
 
   const mergeAnnotationOperations = (value: unknown) => {
@@ -1187,6 +1215,7 @@ function App() {
       if (next.fileType.toLowerCase() === 'xlsx') void refreshWorkbookSummary(next.documentId).catch((error) => setMessage(error instanceof Error ? error.message : 'Excelブックを読み込めませんでした。'));
       restoreRunHistory(next.fileName, next.sourceHash);
       setPageNumber(1);
+      clearAgentViewport();
       const restoredWorkspace = await restoreDocumentWorkspace(next.fileName, next.pageCount, true, next.sourceHash);
       setAiMode(null);
       setMessage(restoredWorkspace.sourceChanged
@@ -1389,6 +1418,7 @@ function App() {
       setDocumentData(next);
       if (next.fileType.toLowerCase() === 'xlsx') await refreshWorkbookSummary(next.documentId);
       setPageNumber(1);
+      clearAgentViewport();
       const restoredWorkspace = await restoreDocumentWorkspace(next.fileName, next.pageCount, restoreTask, next.sourceHash);
       restoreRunHistory(next.fileName, next.sourceHash);
       setAiMode(null);
@@ -2039,10 +2069,11 @@ function App() {
         if (useAgentNavigation && navigationUsed && agentVisitedPages.has(targetPage)) continue;
         const navigateThisCall = useAgentNavigation && !navigationUsed;
         let pageTextBlockCount: number | undefined;
-        let pageToolEvents: Array<{ toolName: string; phase: AgentActivityPhase; detail: string; status: 'active' | 'complete' | 'waiting' | 'error'; pageNumber?: number; textBlockCount?: number; warningCount?: number }> = [];
+        let pageToolEvents: Array<{ toolName: string; phase: AgentActivityPhase; detail: string; status: 'active' | 'complete' | 'waiting' | 'error'; pageNumber?: number; textBlockCount?: number; warningCount?: number; viewport?: NormalizedTextBox }> = [];
         setScanProgress({ current: useAgentNavigation ? Math.max(1, completedPages) : index + 1, total: runTotalPages, scope: effectiveScope });
         const navigationId = addAgentActivity('Navigating', `navigate_page({ page: ${targetPage} }) → opening page ${targetPage} of ${documentData.pageCount}.`, 'active', targetPage);
         setPageNumber(targetPage);
+        clearAgentViewport();
         try {
           let workbookApprovalRunId: string | undefined;
           let workbookApprovalId: string | undefined;
@@ -2086,7 +2117,7 @@ function App() {
                 documentAnnotations: normalizeDocumentAnnotationRecords({ documentId: documentData.documentId, sourceHash: documentData.sourceHash, fileType: documentData.fileType, ...documentAnnotationView }),
                 settings: { ...settings, apiKey },
               }, settings.apiServerUrl, (toolEvent) => {
-                if (toolEvent.toolName === 'navigate_page' && toolEvent.pageNumber !== undefined) setPageNumber(toolEvent.pageNumber);
+                syncViewerToToolEvent(toolEvent);
                 addAgentActivity(toolEvent.phase, `${toolEvent.toolName} → ${toolEvent.detail}`, toolEvent.status, toolEvent.pageNumber ?? targetPage);
               });
             if (!ok) {
@@ -2111,7 +2142,7 @@ function App() {
               if (streamedActivityCount === 0) {
                 for (const toolEvent of toolEvents) {
                   const eventPage = toolEvent.pageNumber ?? targetPage;
-                  if (toolEvent.toolName === 'navigate_page') setPageNumber(eventPage);
+                  syncViewerToToolEvent(toolEvent);
                   addAgentActivity(toolEvent.phase, `${toolEvent.toolName} → ${toolEvent.detail}`, toolEvent.status, eventPage);
                 }
               }
@@ -2481,7 +2512,7 @@ function App() {
         ...(documentData?.sourceHash ? { sourceHash: documentData.sourceHash } : {}),
         settings: { ...settings, apiKey },
       }, settings.apiServerUrl, (toolEvent) => {
-        if (toolEvent.toolName === 'navigate_page' && toolEvent.pageNumber !== undefined) setPageNumber(toolEvent.pageNumber);
+        syncViewerToToolEvent(toolEvent);
         addAgentActivity(toolEvent.phase, `${toolEvent.toolName} → ${toolEvent.detail}`, toolEvent.status, toolEvent.pageNumber);
       });
       if (!ok) throw new Error(result.error ?? 'Agent Runを再開できませんでした。');
@@ -2501,9 +2532,9 @@ function App() {
       }
       if (result.usage) recordUsage(result.provider as ProviderId, String(result.model ?? settings.model), result.usage as TokenUsage, Math.max(1, Number(result.usage.requests ?? 0)));
       if (streamedActivityCount === 0) {
-        const events = (Array.isArray(result.toolEvents) ? result.toolEvents : []) as Array<{ toolName: string; phase: AgentActivityPhase; detail: string; status: 'active' | 'complete' | 'waiting'; pageNumber?: number }>;
+        const events = (Array.isArray(result.toolEvents) ? result.toolEvents : []) as Array<{ toolName: string; phase: AgentActivityPhase; detail: string; status: 'active' | 'complete' | 'waiting' | 'error'; pageNumber?: number; viewport?: NormalizedTextBox }>;
         for (const event of events) {
-          if (event.toolName === 'navigate_page' && event.pageNumber !== undefined) setPageNumber(event.pageNumber);
+          syncViewerToToolEvent(event);
           addAgentActivity(event.phase, `${event.toolName} → ${event.detail}`, event.status, event.pageNumber);
         }
       }
@@ -2803,6 +2834,7 @@ function App() {
   const goToPage = (nextPage: number) => {
     if (!documentData) return;
     setPageNumber(clamp(nextPage, 1, documentData.pageCount));
+    clearAgentViewport();
     setSelectedId(null);
     setDraft(null);
   };
@@ -2825,7 +2857,7 @@ function App() {
     });
   };
 
-  const pageStyle = currentPage ? ({ '--page-ratio': `${currentPage.width} / ${currentPage.height}`, '--zoom': zoom / 100 } as CSSProperties) : undefined;
+  const pageStyle = currentPage ? ({ '--page-ratio': `${currentPage.width} / ${currentPage.height}`, '--zoom': agentViewport ? 1 / agentViewport.width : zoom / 100 } as CSSProperties) : undefined;
   const envProviderMatches = (settings.provider === 'azure-openai' && health?.provider === 'azure') ||
     (settings.provider === 'openai-api' && health?.provider === 'openai');
   const apiConfiguredForSession = (settings.provider === 'openai-compatible' && Boolean(settings.endpoint.trim())) ||
@@ -2924,9 +2956,9 @@ function App() {
               <span>ページ <strong>{pageNumber}</strong> / {documentData?.pageCount ?? '—'}</span>
               <button type="button" aria-label="次のページ" disabled={!documentData || pageNumber >= documentData.pageCount} onClick={() => goToPage(pageNumber + 1)}><ArrowRight size={15} /></button>
               <span className="control-divider" />
-              <button type="button" aria-label="ズームアウト" onClick={() => setZoom((value) => Math.max(70, value - 10))}><ZoomOut size={15} /></button>
-              <span className="zoom-readout">{zoom}%</span>
-              <button type="button" aria-label="ズームイン" onClick={() => setZoom((value) => Math.min(130, value + 10))}><ZoomIn size={15} /></button>
+              <button type="button" aria-label="ズームアウト" onClick={() => { clearAgentViewport(); setZoom((value) => Math.max(70, value - 10)); }}><ZoomOut size={15} /></button>
+              <span className="zoom-readout">{agentViewport ? `${Math.round(100 / agentViewport.width)}%` : `${zoom}%`}</span>
+              <button type="button" aria-label="ズームイン" onClick={() => { clearAgentViewport(); setZoom((value) => Math.min(130, value + 10)); }}><ZoomIn size={15} /></button>
               <span className="control-divider" />
               <button className="toolbar-help" type="button" title="使い方" aria-label="使い方" onClick={() => { setGuideTab('workflow'); setShowGuide(true); }}><CircleHelp size={16} /></button>
             </div>
@@ -2936,7 +2968,7 @@ function App() {
 
           <section className="canvas-zone" aria-label="文書ページ">
             <div className="canvas-hint"><span><MousePointer2 size={14} /> 領域を選択するか、ツールを選んでドラッグ</span><span>{currentAnnotations.length} 件の注釈</span></div>
-            <div className="page-scroll-area">
+            <div ref={pageScrollAreaRef} className={`page-scroll-area${agentViewport ? ' is-agent-viewport' : ''}`}>
               {loadingDemo ? (
                 <div className="loading-state"><LoaderCircle className="spin" size={26} /><span>サンプル文書を準備しています</span></div>
               ) : previewLoading ? (
@@ -2944,7 +2976,7 @@ function App() {
               ) : previewError ? (
                 <div className="empty-state"><div className="empty-icon"><FileText size={26} /></div><h2>ページを開けません</h2><p>{previewError}</p><button className="button button-primary" type="button" onClick={() => void reopenDocument()}>{documentData?.demo ? 'サンプルを開き直す' : '文書を再選択'}</button></div>
               ) : currentPage && previewUrl ? (
-                <div className="page-frame-wrap" style={pageStyle}>
+                <div className={`page-frame-wrap${agentViewport ? ' is-agent-viewport' : ''}`} style={pageStyle}>
                   <div className="page-frame" ref={pageFrameRef}>
                     <img ref={pageImageRef} className="document-page-image" src={previewUrl} alt={`${documentData?.fileName ?? '文書'} の ${pageNumber} ページ`} draggable={false} />
                     <div

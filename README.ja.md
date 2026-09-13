@@ -42,7 +42,7 @@ npm start
 - 自然文からラベル、操作、曖昧時の対応、作業手順を持つAnnotation Taskを構成し表示。OpenAI / Azure / OpenAI互換API / Codex App Server接続時は構造化出力で計画し、各ページのAgentへ渡す。未接続時はローカル下書きと明示。
 - テキストを抽出できるPDF / Office文書をガイドラインとして読み込み、編集可能なガイドライン欄へ追加。
 - Observe / Suggest / Assist / Autopilotを選択。計画、ページ移動、SVGのテキスト・レイアウト確認、検索、注釈、レビュー、出力の作業ログを表示。
-- OpenAI Agents SDKのサーバー側オーケストレーターが、文書アウトライン、ページ確認、選択領域確認、既存注釈一覧、抽出テキスト検索、領域注釈、人の確認要求をToolとして実行。`select_text`は位置付きテキストを正規化ページ座標へ対応付け、`get_selected_region`はビューアーで選択中の領域をAgentへ渡し、`annotate_text`は一意な一致からテキスト根拠付きの領域候補を作成。該当なし・複数一致は確定しません。Assist / Autopilotで既存注釈の変更・削除を提案すると承認までRunを一時停止し、同じRunを再開。既存・確認待ち注釈は重複防止のため上限付き要約として渡す。Codex App Serverは構造化出力アダプターを継続使用。
+- OpenAI Agents SDKのサーバー側オーケストレーターが、文書アウトライン、ページ確認、選択領域確認、既存注釈一覧、抽出テキスト検索、領域注釈、人の確認要求をToolとして実行。`scroll_document`は拡大したページ画像を返し、ビューアーも同じ位置へスクロール。`select_text`は位置付きテキストを正規化ページ座標へ対応付け、`get_selected_region`はビューアーで選択中の領域をAgentへ渡し、`annotate_text`は一意な一致からテキスト根拠付きの領域候補を作成。該当なし・複数一致は確定しません。Assist / Autopilotで既存注釈の変更・削除を提案すると承認までRunを一時停止し、同じRunを再開。既存・確認待ち注釈は重複防止のため上限付き要約として渡す。Codex App Serverは構造化出力アダプターを継続使用。
 - ユーザーが指示文でファイル出力を明示した場合、Agents SDK実行は対象範囲の確認後に`export_annotations`を呼び、元形式・JSON・CSVをAdapter経由で準備してダウンロード操作を表示。成果物は暗号化して30分保持し、未解決レビューがある間は元形式を出力しません。Codex App Serverではプロバイダー共通の画面上の書き出し操作を使います。
 - PDF / OfficeのページプレビューとXLSXブックは、アウトライン・確認・検索を共通化するサーバー側`DocumentAdapter`を実装。`search_document`は文書全体を検索し、ページまたはシート・セル位置を返す。
 - 同じAdapterがAgentツールの型付き注釈を保持し、JSON、CSV、PDF、DOCX、PPTX、XLSXの書き出しを`POST /api/documents/:documentId/export`にまとめます。アップロード元のバイト列はセッションで別に保持し、書き出しは新しいファイルを作ります。

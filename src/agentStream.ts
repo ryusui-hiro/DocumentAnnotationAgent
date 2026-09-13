@@ -1,6 +1,6 @@
-import type { AgentActivityPhase } from './types';
+import type { AgentActivityPhase, NormalizedTextBox } from './types';
 
-export type LiveToolActivity = { toolName: string; phase: AgentActivityPhase; detail: string; status: 'active' | 'complete' | 'waiting'; pageNumber?: number };
+export type LiveToolActivity = { toolName: string; phase: AgentActivityPhase; detail: string; status: 'active' | 'complete' | 'waiting' | 'error'; pageNumber?: number; viewport?: NormalizedTextBox };
 
 export async function consumeAgentStream<T>(response: Response, onActivity: (event: LiveToolActivity) => void): Promise<{ payload: T; streamedActivityCount: number }> {
   if (!response.headers.get('content-type')?.includes('text/event-stream') || !response.body) {
