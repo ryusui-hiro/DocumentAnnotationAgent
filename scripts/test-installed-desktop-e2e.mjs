@@ -293,6 +293,19 @@ const readJsonAnchorHookScript = `
   pending.then((text) => done({ text }), (error) => done({ error: String(error) }));
 `;
 
+const installBrowserDiagnosticsScript = `
+  const errors = [];
+  const originalConsoleError = console.error.bind(console);
+  console.error = (...values) => {
+    errors.push(values.map((value) => value instanceof Error ? value.message : String(value)).join(' '));
+    originalConsoleError(...values);
+  };
+  window.addEventListener('error', (event) => errors.push(event.error?.message ?? event.message ?? 'window error'));
+  window.addEventListener('unhandledrejection', (event) => errors.push(String(event.reason?.message ?? event.reason ?? 'unhandled rejection')));
+  window.__installedDesktopE2eErrors = errors;
+  return true;
+`;
+
 async function runScenario(scenario, fixture, index, total, apiBaseUrl) {
   await executeScript(installEmptyWorkspaceScript, [fixture]);
   await sessionCommand('POST', '/refresh', {}, 30_000);
@@ -303,6 +316,7 @@ async function runScenario(scenario, fixture, index, total, apiBaseUrl) {
       && document.querySelector('.document-page-image').complete
       && document.querySelector('.document-page-image').naturalWidth > 0;
   `);
+  await executeScript(installBrowserDiagnosticsScript);
   await executeScript(installJsonAnchorHookScript);
 
   assert.equal(await executeScript(`return document.querySelector('.agent-mode-grid button[aria-pressed="true"]')?.textContent.includes('Assist') ?? false;`), true, 'Assist mode must be selected.');
@@ -434,6 +448,13 @@ async function runScenario(scenario, fixture, index, total, apiBaseUrl) {
     const rejected = exported.documentAnnotations.find((record) => record.id === exported.humanRejected[0].id);
     assert.equal(rejected.status, 'rejected');
   }
+
+  const browserErrors = await executeScript(`return window.__installedDesktopE2eErrors ?? [];`);
+  assert.deepEqual(browserErrors, [], `The packaged renderer reported errors during the ${scenario.action} flow: ${browserErrors.join(' | ')}`);
+  const finalResources = await executeScript(`return performance.getEntriesByType('resource').map((entry) => entry.name);`);
+  const finalRemoteUrls = finalResources.filter((url) => /^https?:\/\//i.test(url) && !url.startsWith(`${apiBaseUrl}/`));
+  assert.deepEqual(finalRemoteUrls, [], `The ${scenario.action} flow requested non-local HTTP resources.`);
+  assert.deepEqual(finalResources.filter((url) => /\/api\/(?:ai|codex)\//i.test(url)), [], `The ${scenario.action} flow attempted a provider endpoint.`);
 
   console.log(`Packaged single-page ${scenario.action} flow ${index + 1}/${total} passed; JSON review statuses verified.`);
 }
