@@ -120,6 +120,21 @@ function normalizeValue(value: unknown): SpreadsheetValue {
   return String(value).slice(0, 2000);
 }
 
+function excelDisplayWidth(value: string) {
+  let width = 0;
+  for (const character of value) {
+    const codePoint = character.codePointAt(0)!;
+    const fullWidth = (codePoint >= 0x1100 && codePoint <= 0x115f) || codePoint === 0x2329 || codePoint === 0x232a ||
+      (codePoint >= 0x2e80 && codePoint <= 0xa4cf) || (codePoint >= 0xac00 && codePoint <= 0xd7a3) ||
+      (codePoint >= 0xf900 && codePoint <= 0xfaff) || (codePoint >= 0xfe10 && codePoint <= 0xfe19) ||
+      (codePoint >= 0xfe30 && codePoint <= 0xfe6f) || (codePoint >= 0xff00 && codePoint <= 0xff60) ||
+      (codePoint >= 0xffe0 && codePoint <= 0xffe6) || (codePoint >= 0x1f300 && codePoint <= 0x1faff) ||
+      (codePoint >= 0x20000 && codePoint <= 0x3fffd);
+    width += fullWidth ? 2 : 1;
+  }
+  return width;
+}
+
 function parseCellAddress(address: string) {
   const match = address.trim().toUpperCase().match(/^\$?([A-Z]{1,3})\$?([1-9]\d{0,6})$/);
   if (!match) throw fail(`Invalid Excel cell address: ${address}`);
@@ -354,11 +369,18 @@ export class SpreadsheetDocumentAdapter implements DocumentAdapter, SpreadsheetI
     const worksheet = this.getWorksheet(sheetName);
     if (!Number.isInteger(headerRow) || headerRow < 1 || headerRow > maxWorkbookRows) throw fail('Header row is outside the supported worksheet range.');
     const row = worksheet.getRow(headerRow);
-    let column = Math.max(1, worksheet.columnCount) + 1;
-    for (let index = 1; index <= Math.min(maxWorkbookColumns, worksheet.columnCount + 1); index += 1) {
-      if (normalizeValue(row.getCell(index).value) === null) { column = index; break; }
+    const reservedColumns = new Set([...this.changes.values()]
+      .filter((change) => change.operation === 'create_column' && change.sheetName === sheetName && change.requiresReview && !change.approved && !change.rejected)
+      .map((change) => parseCellAddress(change.range))
+      .filter((cell) => cell.row === headerRow)
+      .map((cell) => cell.column));
+    const maxReservedColumn = reservedColumns.size ? Math.max(...reservedColumns) : 0;
+    const searchEnd = Math.min(maxWorkbookColumns, Math.max(worksheet.columnCount, maxReservedColumn) + 1);
+    let column = 0;
+    for (let index = 1; index <= searchEnd; index += 1) {
+      if (normalizeValue(row.getCell(index).value) === null && !reservedColumns.has(index)) { column = index; break; }
     }
-    if (column > maxWorkbookColumns) throw fail('The worksheet has no available column.');
+    if (column === 0) throw fail('The worksheet has no available column.');
     return cellAddress(headerRow, column);
   }
 
@@ -459,13 +481,14 @@ export class SpreadsheetDocumentAdapter implements DocumentAdapter, SpreadsheetI
       const header = String(change.values[0]?.[0] ?? '');
       headerCell.value = header;
       const column = worksheet.getColumn(cell.column);
-      const minWidth = Math.max(12, Array.from(header).length + 2);
+      const displayWidth = excelDisplayWidth(header);
+      const minWidth = Math.max(12, displayWidth + 2);
       const width = Math.min(40, Math.max(typeof column.width === 'number' ? column.width : 8.43, minWidth));
       if (typeof column.width !== 'number' || column.width < width) column.width = width;
       if (minWidth > 40) {
         headerCell.alignment = { ...headerCell.alignment, wrapText: true, vertical: 'middle' };
         const headerRow = worksheet.getRow(cell.row);
-        headerRow.height = Math.max(headerRow.height ?? 15, Math.min(90, Math.ceil(Array.from(header).length / 38) * 15));
+        headerRow.height = Math.max(headerRow.height ?? 15, Math.min(90, Math.ceil(displayWidth / 38) * 15));
       }
       return;
     }

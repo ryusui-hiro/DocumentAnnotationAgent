@@ -48,6 +48,30 @@ test('supports a table header row beyond the initial preview sample', async () =
   assert.equal(adapter.readRange('Details', 'B21').rows[0]?.[0]?.value, 'Review');
 });
 
+test('reserves pending columns and sizes Japanese headers by their rendered width', async () => {
+  const workbook = new ExcelJS.Workbook();
+  workbook.addWorksheet('Review').addRow(['ID', 'Value']);
+  const adapter = await SpreadsheetDocumentAdapter.fromBuffer('review.xlsx', Buffer.from(await workbook.xlsx.writeBuffer()));
+  const first = adapter.createColumn('Review', 'Risk', 1, 'First review column.', { requiresReview: true, id: 'risk-column' });
+  const japanese = adapter.createColumn('Review', '日本語レビュー', 1, 'Japanese review column.', { requiresReview: true, id: 'japanese-column' });
+  const longHeader = adapter.createColumn('Review', '日本語'.repeat(25), 1, 'Long Japanese header.', { requiresReview: true, id: 'long-japanese-column' });
+
+  assert.equal(first.range, 'C1');
+  assert.equal(japanese.range, 'D1');
+  assert.equal(longHeader.range, 'E1');
+  assert.equal(adapter.readRange('Review', 'C1:E1').rows[0]?.map((cell) => cell.value).join(','), ',,');
+
+  adapter.approveChange(first.id);
+  adapter.approveChange(japanese.id);
+  adapter.approveChange(longHeader.id);
+  const sheet = adapter.workbook.getWorksheet('Review');
+  assert.equal(adapter.readRange('Review', 'C1:E1').rows[0]?.map((cell) => cell.value).join(','), `Risk,${'日本語レビュー'},${'日本語'.repeat(25)}`);
+  assert.ok((sheet?.getColumn(4).width ?? 0) >= 16, 'full-width Japanese characters need about two Excel width units each');
+  assert.equal(sheet?.getColumn(5).width, 40);
+  assert.equal(sheet?.getCell('E1').alignment?.wrapText, true);
+  assert.ok((sheet?.getRow(1).height ?? 0) >= 60, 'row height should account for wrapped full-width text');
+});
+
 test('stages cell and column edits at the selected table header row, applies only approved changes, and exports a separate workbook', async () => {
   const source = await createSourceWorkbook(true);
   const untouchedSource = Buffer.from(source);
