@@ -326,17 +326,24 @@ async function runScenario(scenario, fixture, index, total, apiBaseUrl) {
     return performance.timeOrigin > Number(arguments[0]);
   `, [previousTimeOrigin], 30_000);
 
-  await waitForScript('the packaged demo page to render', `
-    return document.querySelector('#ai-prompt')
-      && document.querySelector('.document-page-image')
-      && document.querySelector('.document-page-image').complete
-      && document.querySelector('.document-page-image').naturalWidth > 0;
-  `);
+  await waitForScript('the packaged page and workspace restore to finish', `
+    const image = document.querySelector('.document-page-image');
+    const runButton = document.querySelector('.page-run-button');
+    return Boolean(document.querySelector('#ai-prompt') && image && image.complete && image.naturalWidth > 0 && runButton && !runButton.disabled);
+  `, [], 45_000);
   await executeScript(installBrowserDiagnosticsScript);
   await executeScript(installJsonAnchorHookScript);
 
   assert.equal(await executeScript(`return document.querySelector('.agent-mode-grid button[aria-pressed="true"]')?.textContent.includes('Assist') ?? false;`), true, 'Assist mode must be selected.');
-  assert.equal(await executeScript(`return document.querySelectorAll('.candidate-section .candidate-card').length;`), 0, 'The test workspace should start empty.');
+  const storedWorkspace = await executeScript(`
+    const fixture = arguments[0];
+    const baseKey = 'annotation-studio:annotations:' + fixture.fileName;
+    const versionKey = baseKey + ':source:' + fixture.sourceHash;
+    return JSON.parse(localStorage.getItem(versionKey) || 'null');
+  `, [fixture]);
+  assert.equal(storedWorkspace?.documentAnnotations?.length, 0, 'The versioned test workspace should start with no annotation records.');
+  const initialCards = await executeScript(`return Array.from(document.querySelectorAll('.candidate-section .candidate-card')).map((card) => card.querySelector('.candidate-label')?.textContent.trim() ?? 'unknown');`);
+  assert.deepEqual(initialCards, [], `The test workspace should start empty, but the UI restored: ${initialCards.join(', ')}.`);
 
   await executeScript(`
     const setValue = (selector, value) => {
