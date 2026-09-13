@@ -61,6 +61,12 @@ jobs:
             bundle: deb
           - platform: windows-2022
             bundle: nsis
+          - platform: ubuntu-24.04-arm
+            bundle: deb
+          - platform: windows-11-vs2026-arm
+            bundle: nsis
+          - platform: macos-15-intel
+            bundle: dmg
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -109,3 +115,30 @@ jobs:
           $installer = Get-ChildItem -Path src-tauri/target/release/bundle/nsis -Filter '*.exe' -File | Select-Object -First 1
           if (-not $installer) { throw 'Tauri did not produce an NSIS installer.' }
           Write-Host "Verified $($installer.FullName)"
+
+      - name: Verify macOS disk image
+        if: runner.os == 'macOS'
+        run: test -n "$(find src-tauri/target/release/bundle/dmg -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+
+  browser-e2e:
+    name: provider-free browser E2E
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Chromium headless shell
+        run: npx playwright-cli install-browser chromium --with-deps --only-shell
+
+      - name: Run provider-free browser workflow
+        run: npm run test:browser-e2e

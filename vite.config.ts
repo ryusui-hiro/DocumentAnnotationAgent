@@ -10,7 +10,7 @@ export default defineConfig({
     port: 5173,
     strictPort: true,
     proxy: {
-      '/api': 'http://127.0.0.1:3001',
+      '/api': process.env.ANNOTATION_STUDIO_API_TARGET || 'http://127.0.0.1:3001',
     },
     watch: {
       ignored: ['**/src-tauri/**'],
