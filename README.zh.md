@@ -46,6 +46,7 @@ npm start
 - 服务端使用 OpenAI Agents SDK 编排文档工具；`open_document`只打开用户已选择并绑定到本次运行的会话，不接受路径或 URL；`get_document_info`返回该会话的有界元数据，`get_document_outline`返回页面或工作表结构。随后可检查页面、读取当前选择区域、列出现有注释、搜索提取文本、添加区域注释及请求人工审核。仅分析当前页时，会保留用户可见的页面范围并明确告知 Agent 是否选中了注释；整份文档仍按既定页面计划执行。`scroll_document` 返回放大后的页面裁剪图，并将查看器同步到相同位置；`select_text` 会将带位置的文本映射到归一化页面坐标，`get_selected_region` 会将查看器中的选择传给 Agent，`annotate_text` 根据唯一匹配创建有文本证据的区域注释。缺少匹配或存在重复匹配时不会自动确认。在 Assist / Autopilot 中，Agent 提议更新或删除现有注释时会暂停等待批准，并恢复同一个运行。现有注释和待审核项会以有界摘要传入，帮助 Agent 避免重复。Codex App Server 继续使用结构化输出适配器。
 - 仅当用户在任务中明确要求文件输出时，Agents SDK 运行才会在完成指定范围检查后调用 `export_annotations`，通过 Adapter 准备原格式、JSON 或 CSV 文件并显示下载操作。产物加密保存 30 分钟；存在未解决审核时不会输出原格式副本。Codex App Server 使用与服务商无关的 UI 导出操作。
 - PDF / Office 页面预览和 XLSX 工作簿通过共享的服务端 `DocumentAdapter` 契约打开已绑定会话、读取大纲、检查与搜索。`search_document` 可跨全文检索，并返回页面或工作表单元格位置。
+- PDF 检查还会提供有界的样式式标题候选和按基线对齐的文本行提示，供 Agent 对照页面图像核验。这些只是导航和版面线索，并不表示系统已识别 PDF 的语义标题或表格结构。
 - 同一 Adapter 保存 Agent 工具生成的类型化注释，并通过 `POST /api/documents/:documentId/export` 统一导出 JSON、CSV、PDF、DOCX、PPTX 和 XLSX。会话单独保留上传源字节；原文件不会被覆盖，导出会生成新文件。
 - 对于密集表格或视觉上有歧义的页面，Orchestrator 可委派给只读的嵌套 `Document Reader Agent`。Reader 返回有界证据和布局提示；分类及注释权限仍由 Orchestrator 掌握。独立 Validator 检查整份文档，格式 Adapter 负责确定性导出。
 - 只有用户明确要求文件输出时，才启用 `export_annotations` 工具，并在完成指定范围的阅读后通过 Adapter 准备文件。下载产物会加密保存，最长 30 分钟，并显示下载操作；存在未解决审核时不会生成原格式副本，JSON / CSV 会保留审核状态。
@@ -69,7 +70,7 @@ npm start
 - 在 Settings 中按模型查看输入、输出、推理、缓存输入和总 token 用量。
 - 为 macOS、Windows 和 Linux 构建 Tauri 2 桌面外壳。
 
-注释版 PDF 是页面渲染图的视觉副本，包含注释轮廓和编号标记。已批准的 Excel 更改可导出为新工作簿；已批准的 DOCX 注释可导出为新 Word 文件中的批注，均不会覆盖原文件。若段落结构受支持，Word 批注会锚定到唯一原文摘录的精确范围；同一段落中的多个注释共用段落锚点。缺少摘录、找不到摘录或匹配不唯一时会跳过并报告。已批准的 PowerPoint 注释会作为可编辑轮廓和标签形状添加到对应幻灯片，并写入幻灯片级用户定义标签。标签以机器可读的名称／值属性保存分类、证据摘录、说明、审核优先级和状态，同时保留无关的现有标签。标签不显示在幻灯片画布上，可通过 PowerPoint Tags API 或 Open XML 读取。标签、理由、审核优先级、坐标及可选数值估计会包含在 CSV / JSON 中。
+注释版 PDF 是页面渲染图的视觉副本，包含注释轮廓和编号标记。已批准的 Excel 更改可导出为新工作簿；已批准的 DOCX 注释可导出为新 Word 文件中的批注，均不会覆盖原文件。段落结构受支持时，Word 批注会锚定到唯一原文摘录的精确范围。同一段落中不重叠的不同摘录会分别锚定；相同范围可以共用一条批注。重叠、缺失、匹配不唯一或位于不支持的嵌套结构中的摘录会跳过并报告，不会扩大成整段批注。已批准的 PowerPoint 注释会作为可编辑轮廓和标签形状添加到对应幻灯片，并写入幻灯片级用户定义标签。标签以机器可读的名称／值属性保存分类、证据摘录、说明、审核优先级和状态，同时保留无关的现有标签。标签不显示在幻灯片画布上，可通过 PowerPoint Tags API 或 Open XML 读取。标签、理由、审核优先级、坐标及可选数值估计会包含在 CSV / JSON 中。LibreOffice 26.2 能显示可编辑形状，但保存并重新打开后会丢弃自定义幻灯片标签；此环境无法验证 Microsoft Office 的行为。
 
 转换警告会显示在应用中。SVG 会以图片形式显示，不会直接插入 HTML。Codex App Server 使用运行服务的主机上的 Codex CLI 登录状态和模型列表。在 macOS 上，如果可用，会优先使用 ChatGPT 应用自带的 Codex 可执行文件；可通过 `CODEX_APP_SERVER_BIN` 覆盖。远程 Web 部署时，请在本地或公司主机上运行 API 服务和 Codex CLI。Tauri 软件包会包含 Node API 和目标平台的生产依赖；桌面应用会在 loopback 上自动启动 API，并在退出时停止。服务器 URL 留空时使用内置 API，填写 URL 时则使用指定的本地或公司 API。桌面会话数据默认保存在系统应用数据目录，Web API 默认保存在 `~/.annotation-studio/session-state`；可通过 `ANNOTATION_STUDIO_DATA_DIR` 更改。
 

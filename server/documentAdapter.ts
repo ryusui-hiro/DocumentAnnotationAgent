@@ -19,8 +19,31 @@ export type DocumentOutline = {
   fileType: string;
   kind: 'paged' | 'spreadsheet';
   pageCount?: number;
-  pages?: Array<{ pageNumber: number; width: number; height: number; warningCount: number }>;
+  pages?: Array<{
+    pageNumber: number;
+    width: number;
+    height: number;
+    warningCount: number;
+    headingCandidates?: PdfHeadingCandidate[];
+  }>;
   sheets?: Array<{ name: string; rowCount: number; columnCount: number; headers: string[] }>;
+};
+
+export type PdfHeadingCandidate = {
+  text: string;
+  boundingBox: PositionedTextBlock['boundingBox'];
+  fontSize: number;
+  bold: boolean;
+};
+
+export type PageTextRowHint = {
+  baselineY: number;
+  cells: Array<{
+    text: string;
+    boundingBox: PositionedTextBlock['boundingBox'];
+    fontSize?: number;
+    bold?: boolean;
+  }>;
 };
 
 export type DocumentView =
@@ -88,10 +111,72 @@ function extractSvgText(svg: string) {
     .filter(Boolean);
 }
 
+function inferPdfHeadingCandidates(blocks: PositionedTextBlock[]): PdfHeadingCandidate[] {
+  const fontSizes = blocks.map((block) => block.fontSize).filter((size): size is number => typeof size === 'number' && Number.isFinite(size) && size > 0).sort((left, right) => left - right);
+  if (!fontSizes.length) return [];
+  const typicalFontSize = fontSizes[Math.floor(fontSizes.length / 2)]!;
+  return blocks
+    .filter((block) => {
+      const text = block.text.trim();
+      if (!text || text.length > 48 || !Number.isFinite(block.fontSize) || block.fontSize! < 8) return false;
+      if (/[.;:,!?]$/.test(text)) return false;
+      if (/^[+-]?\d+(?:[.,]\d+)?\s+[A-Za-z°]{1,4}(?:\s|$)/.test(text)) return false;
+      if (block.boundingBox.y < 0.015 || block.boundingBox.y > 0.92) return false;
+      return block.fontSize! >= Math.max(12, typicalFontSize * 1.25) || (block.bold === true && block.fontSize! >= Math.max(10, typicalFontSize * 1.1));
+    })
+    .sort((left, right) => left.boundingBox.y - right.boundingBox.y || left.boundingBox.x - right.boundingBox.x)
+    .slice(0, 12)
+    .map((block) => ({
+      text: block.text.slice(0, 160),
+      boundingBox: { ...block.boundingBox },
+      fontSize: Math.round(block.fontSize! * 10) / 10,
+      bold: block.bold === true,
+    }));
+}
+
+function inferPageTextRowHints(blocks: PositionedTextBlock[]): PageTextRowHint[] {
+  const ordered = blocks
+    .filter((block) => block.text.trim())
+    .map((block) => ({ block, baselineY: block.boundingBox.y + block.boundingBox.height * 0.8 }))
+    .sort((left, right) => left.baselineY - right.baselineY || left.block.boundingBox.x - right.block.boundingBox.x);
+  const rows: Array<{ baselineY: number; height: number; cells: typeof ordered[number]['block'][] }> = [];
+  for (const item of ordered) {
+    const match = [...rows].reverse().find((row) => {
+      const tolerance = Math.max(0.002, Math.min(0.012, Math.min(item.block.boundingBox.height, row.height) * 0.35));
+      return Math.abs(row.baselineY - item.baselineY) <= tolerance;
+    });
+    if (match) {
+      match.cells.push(item.block);
+      match.baselineY = (match.baselineY * (match.cells.length - 1) + item.baselineY) / match.cells.length;
+      match.height = Math.min(match.height, item.block.boundingBox.height);
+    } else rows.push({ baselineY: item.baselineY, height: item.block.boundingBox.height, cells: [item.block] });
+  }
+
+  let remainingChars = 2400;
+  return rows
+    .filter((row) => row.cells.length > 1)
+    .sort((left, right) => left.baselineY - right.baselineY)
+    .slice(0, 24)
+    .map((row) => ({
+      baselineY: Math.round(row.baselineY * 10000) / 10000,
+      cells: row.cells
+        .sort((left, right) => left.boundingBox.x - right.boundingBox.x)
+        .slice(0, 8)
+        .flatMap((block) => {
+          if (remainingChars <= 0) return [];
+          const text = block.text.trim().slice(0, Math.min(180, remainingChars));
+          remainingChars -= text.length;
+          return [{ text, boundingBox: { ...block.boundingBox }, ...(block.fontSize ? { fontSize: block.fontSize } : {}), ...(block.bold ? { bold: true } : {}) }];
+        }),
+    }))
+    .filter((row) => row.cells.length > 1 && row.cells.some((cell) => cell.text));
+}
+
 export class PagedDocumentAdapter implements DocumentAdapter {
   private readonly textCache = new Map<number, string[]>();
   private readonly positionedTextCache = new Map<number, string[]>();
   private readonly positionedTextBlocksCache = new Map<number, PositionedTextBlock[]>();
+  private readonly headingCandidatesCache = new Map<number, PdfHeadingCandidate[]>();
   private readonly annotations = new Map<string, DocumentAnnotationRecord>();
 
   constructor(readonly fileName: string, readonly report: PreviewReport, readonly documentId = '', private readonly sourceBuffer?: Buffer) {}
@@ -109,7 +194,13 @@ export class PagedDocumentAdapter implements DocumentAdapter {
       fileType: this.report.sourceFormat,
       kind: 'paged',
       pageCount: this.report.pageCount,
-      pages: this.report.pages.map((page) => ({ pageNumber: page.number, width: page.widthPoints, height: page.heightPoints, warningCount: page.warningCount })),
+      pages: this.report.pages.map((page) => ({
+        pageNumber: page.number,
+        width: page.widthPoints,
+        height: page.heightPoints,
+        warningCount: page.warningCount,
+        ...(this.report.sourceFormat.toLowerCase() === 'pdf' ? { headingCandidates: this.getPageHeadingCandidates(page.number) } : {}),
+      })),
     };
   }
 
@@ -146,6 +237,23 @@ export class PagedDocumentAdapter implements DocumentAdapter {
     const blocks = extractPositionedTextBlocks(view.svg);
     this.positionedTextBlocksCache.set(pageNumber, blocks);
     return blocks.map((line) => structuredClone(line));
+  }
+
+  getPageHeadingCandidates(pageNumber: number) {
+    if (this.report.sourceFormat.toLowerCase() !== 'pdf') return [];
+    const cached = this.headingCandidatesCache.get(pageNumber);
+    if (cached) return cached.map((candidate) => structuredClone(candidate));
+    const view = this.inspect({ kind: 'page', pageNumber });
+    if (view.kind !== 'page') return [];
+    const textBlocks = this.positionedTextBlocksCache.get(pageNumber) ?? extractPositionedTextBlocks(view.svg);
+    const candidates = inferPdfHeadingCandidates(textBlocks);
+    this.headingCandidatesCache.set(pageNumber, candidates);
+    return candidates.map((candidate) => structuredClone(candidate));
+  }
+
+  /** Geometric hints for text blocks sharing a visual row; these do not assert semantic table structure. */
+  getPageTextRowHints(pageNumber: number) {
+    return inferPageTextRowHints(this.getPositionedPageTextBlocks(pageNumber));
   }
 
   search(query: string, limit = 20): DocumentSearchResult[] {

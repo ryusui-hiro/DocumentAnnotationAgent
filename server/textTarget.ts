@@ -6,6 +6,8 @@ export type PositionedTextBlock = {
   boundingBox: NormalizedTextBox;
   characterBoxes?: Array<NormalizedTextBox | undefined>;
   lineNumber: number;
+  fontSize?: number;
+  bold?: boolean;
 };
 export type PositionedTextTarget = {
   excerpt: string;
@@ -101,6 +103,22 @@ function fontSizeFor(element: XmlElement, fallback = 10) {
     if (Number.isFinite(parsed) && parsed > 0) return parsed;
   }
   return fallback;
+}
+
+function isBoldFor(element: XmlElement) {
+  for (let node: XmlNode | null = element; node && node.nodeType === 1; node = node.parentNode) {
+    const current = node as XmlElement;
+    const weight = attr(current, 'font-weight') || attr(current, 'style').match(/font-weight\s*:\s*([^;]+)/i)?.[1] || '';
+    if (weight) {
+      const normalized = weight.trim().toLowerCase();
+      if (normalized === 'bold' || normalized === 'bolder') return true;
+      const numeric = Number.parseFloat(normalized);
+      return Number.isFinite(numeric) && numeric >= 600;
+    }
+    const family = attr(current, 'font-family') || attr(current, 'style').match(/font-family\s*:\s*([^;]+)/i)?.[1] || '';
+    if (/bold|semibold|demi/i.test(family)) return true;
+  }
+  return false;
 }
 
 function glyphAdvance(value: string, fontSize: number) {
@@ -200,6 +218,8 @@ function normalizeSvgTextElement(element: XmlElement, page: { x: number; y: numb
   if (!visibleText) return null;
 
   const fontSize = fontSizeFor(element, 10);
+  const textFontSize = Math.max(fontSize, ...leafSpans.map((span) => fontSizeFor(span, fontSize)));
+  const bold = isBoldFor(element) || leafSpans.some(isBoldFor);
   const glyphs: Glyph[] = [];
   if (leafSpans.length && normalizeSearchText(spanText) === normalizeSearchText(visibleText)) {
     let cursorX = textX;
@@ -274,7 +294,7 @@ function normalizeSvgTextElement(element: XmlElement, page: { x: number; y: numb
   }
   const normalized = normalizeVisibleText(sourceText, characterBoxes);
   if (!normalized.text) return null;
-  return { text: normalized.text, boundingBox: lineBounds, characterBoxes: normalized.boxes, lineNumber };
+  return { text: normalized.text, boundingBox: lineBounds, characterBoxes: normalized.boxes, lineNumber, fontSize: textFontSize, bold };
 }
 
 export function extractPositionedTextBlocks(svg: string, maxLines = 600): PositionedTextBlock[] {

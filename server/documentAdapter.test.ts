@@ -24,6 +24,32 @@ test('paged adapter exposes structure, inspects page SVG, and searches text acro
   assert.match(adapter.search('termination')[1]?.excerpt ?? '', /Termination — review/);
 });
 
+test('PDF structure exposes cautious heading candidates and aligned table row evidence', () => {
+  const report = {
+    sourceFormat: 'PDF', pageCount: 1,
+    pages: [{
+      number: 1, widthPoints: 120, heightPoints: 160, warningCount: 0, warnings: [],
+      svg: '<svg xmlns="http://www.w3.org/2000/svg" width="120" height="160" viewBox="0 0 120 160"><text x="8" y="26" font-size="20" font-weight="700">Contract Review</text><text x="10" y="65" font-size="10" font-weight="700">Party</text><text x="70" y="65" font-size="10" font-weight="700">Right</text><text x="10" y="85" font-size="10">Buyer</text><text x="70" y="85" font-size="10">May terminate on notice</text><text x="8" y="110" font-size="20" font-weight="700">55 dBA maximum</text><text x="8" y="132" font-size="20" font-weight="700">WARNING Isolate the power supply.</text></svg>',
+    }],
+  } as unknown as PreviewReport;
+  const adapter = new PagedDocumentAdapter('contract.pdf', report);
+
+  const outlinePage = adapter.getStructure().pages?.[0];
+  assert.equal(outlinePage?.headingCandidates?.length, 1);
+  assert.deepEqual(outlinePage?.headingCandidates?.[0]?.text, 'Contract Review');
+  assert.equal(outlinePage?.headingCandidates?.[0]?.fontSize, 20);
+  assert.equal(outlinePage?.headingCandidates?.[0]?.bold, true);
+  assert.ok(outlinePage?.headingCandidates?.[0]?.boundingBox.x! > 0.06);
+
+  const rowHints = adapter.getPageTextRowHints(1);
+  assert.deepEqual(rowHints.map((row) => row.cells.map((cell) => cell.text)), [
+    ['Party', 'Right'],
+    ['Buyer', 'May terminate on notice'],
+  ]);
+  assert.ok(rowHints[0]!.cells[0]!.boundingBox.x < rowHints[0]!.cells[1]!.boundingBox.x);
+  assert.equal(rowHints[0]!.cells[0]!.bold, true);
+});
+
 test('paged adapter keeps canonical review records and exports approved annotations through one format adapter', async () => {
   const report = {
     sourceFormat: 'PDF', pageCount: 1,

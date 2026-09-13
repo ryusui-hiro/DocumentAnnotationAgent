@@ -17,9 +17,37 @@ async function makeDocx(options: { commentsXml?: string; commentsRelationship?: 
   zip.file('[Content_Types].xml', `<Types xmlns="${TYPES}"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>${options.commentsXml ? '<Override PartName="/word/comments.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml"/>' : ''}</Types>`);
   zip.file('_rels/.rels', `<Relationships xmlns="${RELS}"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>`);
   zip.file('word/_rels/document.xml.rels', `<Relationships xmlns="${RELS}"><Relationship Id="rIdStyles" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>${options.commentsRelationship ?? ''}</Relationships>`);
+  zip.file('word/styles.xml', `<w:styles xmlns:w="${W}"><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style></w:styles>`);
+  zip.file('word/media/keep.bin', Buffer.from([0, 1, 2, 3, 255]));
   zip.file('word/document.xml', options.documentXml ?? `<w:document xmlns:w="${W}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body><w:p><w:pPr><w:pStyle w:val="Normal"/></w:pPr><w:r><w:t xml:space="preserve">Either party may </w:t></w:r><w:r><w:t>terminate at any time.</w:t></w:r></w:p><w:p><w:r><w:t>Repeated claim without evidence.</w:t></w:r></w:p><w:p><w:r><w:t>Repeated claim without evidence.</w:t></w:r></w:p><w:sectPr/></w:body></w:document>`);
   if (options.commentsXml) zip.file('word/comments.xml', options.commentsXml);
   return Buffer.from(await zip.generateAsync({ type: 'nodebuffer' }));
+}
+
+function selectedCommentTextById(paragraph: TestXmlElement) {
+  const selections = new Map<string, string>();
+  let activeId: string | null = null;
+  let selected = '';
+  for (let child = paragraph.firstChild; child; child = child.nextSibling) {
+    if (child.nodeType !== child.ELEMENT_NODE) continue;
+    const element = child as unknown as TestXmlElement;
+    if (element.namespaceURI === W && element.localName === 'commentRangeStart') {
+      activeId = element.getAttributeNS(W, 'id');
+      selected = '';
+      continue;
+    }
+    if (element.namespaceURI === W && element.localName === 'commentRangeEnd') {
+      if (activeId !== null && element.getAttributeNS(W, 'id') === activeId) selections.set(activeId, selected);
+      activeId = null;
+      selected = '';
+      continue;
+    }
+    if (activeId !== null && element.namespaceURI === W && element.localName === 'r') {
+      const textNodes = element.getElementsByTagNameNS(W, 't');
+      for (let index = 0; index < textNodes.length; index += 1) selected += textNodes.item(index)?.textContent ?? '';
+    }
+  }
+  return selections;
 }
 
 test('the shared DocumentAdapter exports canonical records as Word comments', async () => {
@@ -120,22 +148,52 @@ test('anchors only the matched excerpt across split Word runs and preserves surr
   assert.equal(selectedItalicRuns, 1, 'the selected italic run retains its formatting');
 });
 
-test('uses one paragraph anchor when several annotations target the same paragraph', async () => {
+test('keeps disjoint excerpts as separate exact comment anchors in the same paragraph', async () => {
   const source = await makeDocx();
   const exported = await exportWordComments(source, [
     { id: 'comment-first', label: 'Right holder', note: '', excerpt: 'Either party may' },
     { id: 'comment-second', label: 'Termination timing', note: '', excerpt: 'terminate at any time' },
   ]);
-  assert.equal(exported.commentsAdded, 1);
+  assert.equal(exported.commentsAdded, 2);
   assert.equal(exported.annotationsAnchored, 2);
   const zip = await JSZip.loadAsync(exported.buffer);
   const document = new DOMParser().parseFromString(await zip.file('word/document.xml')!.async('string'), 'application/xml');
   const paragraph = document.getElementsByTagNameNS(W, 'p').item(0)! as unknown as TestXmlElement;
-  const start = paragraph.getElementsByTagNameNS(W, 'commentRangeStart').item(0)!;
-  const end = paragraph.getElementsByTagNameNS(W, 'commentRangeEnd').item(0)!;
-  const textBeforeStart = Array.from(paragraph.getElementsByTagNameNS(W, 't')).map((node) => node.textContent ?? '').join('');
-  assert.equal(textBeforeStart, 'Either party may terminate at any time.');
-  assert.ok(start && end);
+  const selections = selectedCommentTextById(paragraph);
+  const comments = new DOMParser().parseFromString(await zip.file('word/comments.xml')!.async('string'), 'application/xml');
+  const labelsById = new Map(Array.from(comments.getElementsByTagNameNS(W, 'comment')).map((comment) => [
+    comment.getAttributeNS(W, 'id') ?? '',
+    (comment.getElementsByTagNameNS(W, 't').item(0)?.textContent ?? '').replace(/^Label: /, ''),
+  ]));
+  const selectedByLabel = new Map([...selections].map(([id, selected]) => [labelsById.get(id) ?? '', selected]));
+  assert.deepEqual(selectedByLabel.get('Right holder'), 'Either party may');
+  assert.deepEqual(selectedByLabel.get('Termination timing'), 'terminate at any time');
+  assert.equal(paragraph.getElementsByTagNameNS(W, 'commentRangeStart').length, 2);
+  assert.equal(paragraph.getElementsByTagNameNS(W, 'commentRangeEnd').length, 2);
+});
+
+test('skips overlapping excerpts rather than broadening either anchor', async () => {
+  const source = await makeDocx({ documentXml: `<w:document xmlns:w="${W}"><w:body><w:p><w:r><w:t>the termination right is broad</w:t></w:r></w:p><w:sectPr/></w:body></w:document>` });
+  const exported = await exportWordComments(source, [
+    { id: 'overlap-one', label: 'First', note: '', excerpt: 'termination right' },
+    { id: 'overlap-two', label: 'Second', note: '', excerpt: 'right is broad' },
+  ]);
+  assert.equal(exported.buffer, source);
+  assert.equal(exported.commentsAdded, 0);
+  assert.equal(exported.annotationsAnchored, 0);
+  assert.deepEqual(exported.skipped.map(({ annotationId, reason }) => ({ annotationId, reason })), [
+    { annotationId: 'overlap-one', reason: 'ambiguous' },
+    { annotationId: 'overlap-two', reason: 'ambiguous' },
+  ]);
+});
+
+test('does not fall back to a full paragraph anchor when the exact excerpt is inside a hyperlink', async () => {
+  const source = await makeDocx({ documentXml: `<w:document xmlns:w="${W}"><w:body><w:p><w:hyperlink w:anchor="section"><w:r><w:t>Unique linked excerpt</w:t></w:r></w:hyperlink><w:r><w:t> surrounding text</w:t></w:r></w:p><w:sectPr/></w:body></w:document>` });
+  const exported = await exportWordComments(source, [{ id: 'nested-run', label: 'Link', note: '', excerpt: 'Unique linked excerpt' }]);
+  assert.equal(exported.buffer, source);
+  assert.equal(exported.commentsAdded, 0);
+  assert.equal(exported.annotationsAnchored, 0);
+  assert.deepEqual(exported.skipped, [{ annotationId: 'nested-run', label: 'Link', reason: 'unsupported_structure' }]);
 });
 
 test('reports an excerpt repeated twice in one paragraph as ambiguous', async () => {
@@ -156,6 +214,10 @@ test('preserves existing Word comments and allocates a new comment id', async ()
     excerpt: 'Either party may terminate at any time.', reviewPriority: 'low',
   }]);
   const zip = await JSZip.loadAsync(exported.buffer);
+  assert.deepEqual(await zip.file('word/styles.xml')!.async('nodebuffer'), await (await JSZip.loadAsync(source)).file('word/styles.xml')!.async('nodebuffer'));
+  assert.deepEqual(await zip.file('word/media/keep.bin')!.async('nodebuffer'), Buffer.from([0, 1, 2, 3, 255]));
+  const relations = new DOMParser().parseFromString(await zip.file('word/_rels/document.xml.rels')!.async('string'), 'application/xml');
+  assert.equal(Array.from(relations.getElementsByTagNameNS(RELS, 'Relationship')).some((item) => item.getAttribute('Id') === 'rIdStyles' && item.getAttribute('Type') === 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles' && item.getAttribute('Target') === 'styles.xml'), true);
   const comments = new DOMParser().parseFromString(await zip.file('word/comments.xml')!.async('string'), 'application/xml');
   const entries = Array.from(comments.getElementsByTagNameNS(W, 'comment'));
   assert.equal(entries.length, 2);

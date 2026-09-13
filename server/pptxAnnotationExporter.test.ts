@@ -26,8 +26,9 @@ async function makePptx(options: { existingTags?: boolean } = {}) {
   zip.file('ppt/_rels/presentation.xml.rels', `<Relationships xmlns="${PKG}"><Relationship Id="rIdFirst" Type="${R}/slide" Target="slides/slide2.xml"/><Relationship Id="rIdSecond" Type="${R}/slide" Target="slides/slide9.xml"/></Relationships>`);
   zip.file('ppt/slides/slide2.xml', slideXml('Existing slide two'));
   zip.file('ppt/slides/slide9.xml', slideXml('Existing slide nine'));
+  zip.file('ppt/slides/_rels/slide2.xml.rels', `<Relationships xmlns="${PKG}"><Relationship Id="rIdCustom" Type="urn:annotation-studio:test-custom" Target="../custom/metadata.xml"/>${options.existingTags ? `<Relationship Id="rIdExistingTags" Type="${TAGS_REL}" Target="../tags/custom.xml"/>` : ''}</Relationships>`);
+  zip.file('ppt/custom/metadata.xml', '<metadata>keep this unrelated OOXML part</metadata>');
   if (options.existingTags) {
-    zip.file('ppt/slides/_rels/slide2.xml.rels', `<Relationships xmlns="${PKG}"><Relationship Id="rIdExistingTags" Type="${TAGS_REL}" Target="../tags/custom.xml"/></Relationships>`);
     zip.file('ppt/tags/custom.xml', `<p:tagLst xmlns:p="${P}"><p:tag name="Owner" val="Legal"/><p:tag name="AnnotationStudio.Categories" val="stale"/></p:tagLst>`);
   }
   zip.file('ppt/media/keep.txt', 'untouched media part');
@@ -92,10 +93,12 @@ test('writes editable annotation shapes to the correct slide relationship withou
   assert.equal(extent?.getAttribute('cx'), '2743200');
   assert.equal(extent?.getAttribute('cy'), '1714500');
   assert.equal(await output.file('ppt/media/keep.txt')!.async('string'), 'untouched media part');
+  assert.equal(await output.file('ppt/custom/metadata.xml')!.async('string'), '<metadata>keep this unrelated OOXML part</metadata>');
 
   const tagRelationships = new DOMParser().parseFromString(await output.file('ppt/slides/_rels/slide2.xml.rels')!.async('string'), 'application/xml');
   const tagRelationship = Array.from(tagRelationships.getElementsByTagNameNS(PKG, 'Relationship')).find((item) => item.getAttribute('Type') === TAGS_REL);
   assert.equal(tagRelationship?.getAttribute('Target'), '../tags/annotation-studio-tags1.xml');
+  assert.equal(Array.from(tagRelationships.getElementsByTagNameNS(PKG, 'Relationship')).some((item) => item.getAttribute('Id') === 'rIdCustom' && item.getAttribute('Type') === 'urn:annotation-studio:test-custom' && item.getAttribute('Target') === '../custom/metadata.xml'), true);
   const tagPart = new DOMParser().parseFromString(await output.file('ppt/tags/annotation-studio-tags1.xml')!.async('string'), 'application/xml');
   const values = new Map(Array.from(tagPart.getElementsByTagNameNS(P, 'tag')).map((tag) => [tag.getAttribute('name'), tag.getAttribute('val')]));
   assert.equal(values.get('AnnotationStudio.AnnotationCount'), '1');
@@ -119,6 +122,9 @@ test('preserves user-defined slide tags and replaces only its own semantic value
   const output = await JSZip.loadAsync(result.buffer);
   assert.ok(output.file('ppt/tags/custom.xml'));
   assert.equal(output.file('ppt/tags/annotation-studio-tags1.xml'), null);
+  assert.equal(await output.file('ppt/custom/metadata.xml')!.async('string'), '<metadata>keep this unrelated OOXML part</metadata>');
+  const relations = new DOMParser().parseFromString(await output.file('ppt/slides/_rels/slide2.xml.rels')!.async('string'), 'application/xml');
+  assert.equal(Array.from(relations.getElementsByTagNameNS(PKG, 'Relationship')).some((item) => item.getAttribute('Id') === 'rIdCustom' && item.getAttribute('Type') === 'urn:annotation-studio:test-custom' && item.getAttribute('Target') === '../custom/metadata.xml'), true);
   const tags = new DOMParser().parseFromString(await output.file('ppt/tags/custom.xml')!.async('string'), 'application/xml');
   const entries = Array.from(tags.getElementsByTagNameNS(P, 'tag'));
   assert.equal(entries.find((tag) => tag.getAttribute('name') === 'Owner')?.getAttribute('val'), 'Legal');

@@ -93,7 +93,7 @@ test('provider-free Agent opens its bound document, pauses for review, resumes t
       heightPoints: 160,
       warningCount: 0,
       warnings: [],
-      svg: '<svg xmlns="http://www.w3.org/2000/svg" width="120" height="160" viewBox="0 0 120 160"><text x="8" y="30">ACOUSTIC PRESSURE</text><text x="8" y="52">55 dBA maximum</text></svg>',
+      svg: '<svg xmlns="http://www.w3.org/2000/svg" width="120" height="160" viewBox="0 0 120 160"><text x="8" y="30" font-size="18" font-weight="700">ACOUSTIC PRESSURE</text><text x="8" y="52" font-size="10">55 dBA maximum</text><text x="8" y="80" font-size="10" font-weight="700">Metric</text><text x="68" y="80" font-size="10" font-weight="700">Value</text><text x="8" y="100" font-size="10">Acoustic</text><text x="68" y="100" font-size="10">55 dBA</text></svg>',
     }],
   } as unknown as PreviewReport;
   class ObservedPagedDocumentAdapter extends PagedDocumentAdapter {
@@ -163,6 +163,8 @@ test('provider-free Agent opens its bound document, pauses for review, resumes t
       assert.equal(output.totalPages, 1);
       assert.equal(output.currentPage, 1);
       assert.match(JSON.stringify(output.documentAdapters), /demo-specification\.pdf/);
+      const adapters = output.documentAdapters as Array<{ pages?: Array<{ headingCandidates?: Array<{ text: string }> }> }>;
+      assert.ok(adapters[0]?.pages?.[0]?.headingCandidates?.some((heading) => heading.text === 'ACOUSTIC PRESSURE'), 'PDF outline exposes style-based heading candidates');
       return [functionCall('inspect_page', {}, { callId: 'bound-inspect' })];
     }),
     modelResponder((call) => {
@@ -170,6 +172,11 @@ test('provider-free Agent opens its bound document, pauses for review, resumes t
       assert.equal(inspected.pageNumber, 1);
       assert.match(String(inspected.extractedText), /ACOUSTIC PRESSURE/);
       assert.match(String(inspected.extractedText), /55 dBA maximum/);
+      const tableRowHints = inspected.tableRowHints as Array<{ cells: Array<{ text: string }> }>;
+      assert.deepEqual(tableRowHints.map((row) => row.cells.map((cell) => cell.text)), [
+        ['Metric', 'Value'],
+        ['Acoustic', '55 dBA'],
+      ], 'page inspection groups aligned text into table-reading hints without asserting semantic table structure');
       return [functionCall('request_review', {
         x: 0.06,
         y: 0.12,

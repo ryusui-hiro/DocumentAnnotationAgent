@@ -20,7 +20,7 @@ export interface WordCommentExportResult {
   buffer: Buffer;
   commentsAdded: number;
   annotationsAnchored: number;
-  skipped: Array<{ annotationId: string; label: string; reason: 'missing_excerpt' | 'not_found' | 'ambiguous' }>;
+  skipped: Array<{ annotationId: string; label: string; reason: 'missing_excerpt' | 'not_found' | 'ambiguous' | 'unsupported_structure' }>;
 }
 
 function parseXml(xml: string, partName: string) {
@@ -117,7 +117,10 @@ interface MatchedWordExcerpt {
 
 interface ParagraphCommentGroup {
   annotations: WordCommentExportAnnotation[];
-  match: MatchedWordExcerpt | null;
+  match: MatchedWordExcerpt;
+  query: string;
+  startIndex: number;
+  endIndex: number;
 }
 
 function runOffsetForPosition(run: XmlElement, textNode: XmlNode, offset: number) {
@@ -283,16 +286,6 @@ function canInsertExactCommentRange(paragraph: XmlElement, match: MatchedWordExc
   return betweenEndRuns;
 }
 
-function insertParagraphCommentRange(document: XmlDocument, paragraph: XmlElement, id: number) {
-  const pProperties = Array.from(paragraph.childNodes).find((node) => node.nodeType === node.ELEMENT_NODE && (node as XmlElement).namespaceURI === wordNamespace && (node as XmlElement).localName === 'pPr') ?? null;
-  const rangeStart = document.createElementNS(wordNamespace, 'w:commentRangeStart');
-  setWordAttribute(rangeStart, 'id', String(id));
-  paragraph.insertBefore(rangeStart, pProperties?.nextSibling ?? paragraph.firstChild);
-  const lastContent = paragraph.lastChild;
-  if (!lastContent) return;
-  appendCommentReference(document, paragraph, lastContent as XmlNode, id);
-}
-
 function setWordAttribute(element: XmlElement, localName: string, value: string) {
   element.setAttributeNS(wordNamespace, `w:${localName}`, value);
 }
@@ -368,7 +361,7 @@ export async function exportWordComments(source: Buffer, annotations: WordCommen
   if (!contentTypesRoot || contentTypesRoot.namespaceURI !== contentTypesNamespace || contentTypesRoot.localName !== 'Types') throw Object.assign(new Error('The Word content types part is invalid.'), { status: 415 });
   const paragraphs = getParagraphs(document);
   const paragraphIndexes = new Map<XmlElement, ParagraphTextIndex>();
-  const paragraphsByExcerpt = new Map<XmlElement, ParagraphCommentGroup>();
+  const groupsByParagraph = new Map<XmlElement, ParagraphCommentGroup[]>();
   const skipped: WordCommentExportResult['skipped'] = [];
 
   for (const annotation of annotations.slice(0, 500)) {
@@ -378,7 +371,7 @@ export async function exportWordComments(source: Buffer, annotations: WordCommen
       skipped.push({ annotationId: annotation.id, label: annotation.label, reason: 'missing_excerpt' });
       continue;
     }
-    const matches: Array<{ paragraph: XmlElement; match: MatchedWordExcerpt }> = [];
+    const matches: Array<{ paragraph: XmlElement; match: MatchedWordExcerpt; startIndex: number }> = [];
     for (const paragraph of paragraphs) {
       let index = paragraphIndexes.get(paragraph);
       if (!index) {
@@ -391,7 +384,7 @@ export async function exportWordComments(source: Buffer, annotations: WordCommen
         if (foundAt < 0) break;
         const start = index.positions[foundAt];
         const end = index.positions[foundAt + query.length - 1];
-        if (start && end) matches.push({ paragraph, match: { start, end } });
+        if (start && end) matches.push({ paragraph, match: { start, end }, startIndex: foundAt });
         fromIndex = foundAt + 1;
       }
     }
@@ -403,17 +396,39 @@ export async function exportWordComments(source: Buffer, annotations: WordCommen
       skipped.push({ annotationId: annotation.id, label: annotation.label, reason: 'ambiguous' });
       continue;
     }
-    const { paragraph, match } = matches[0]!;
-    const group = paragraphsByExcerpt.get(paragraph);
-    if (group) {
-      group.annotations.push(annotation);
-      group.match = null;
-    } else {
-      paragraphsByExcerpt.set(paragraph, { annotations: [annotation], match });
+    const { paragraph, match, startIndex } = matches[0]!;
+    const groups = groupsByParagraph.get(paragraph) ?? [];
+    const endIndex = startIndex + query.length;
+    const identicalRange = groups.find((group) => group.startIndex === startIndex && group.endIndex === endIndex);
+    if (identicalRange) identicalRange.annotations.push(annotation);
+    else groups.push({ annotations: [annotation], match, query, startIndex, endIndex });
+    groupsByParagraph.set(paragraph, groups);
+  }
+
+  const safeGroups: ParagraphCommentGroup[] = [];
+  for (const [paragraph, groups] of groupsByParagraph) {
+    const overlapping = new Set<ParagraphCommentGroup>();
+    for (let left = 0; left < groups.length; left += 1) {
+      for (let right = left + 1; right < groups.length; right += 1) {
+        const first = groups[left]!;
+        const second = groups[right]!;
+        if (first.startIndex < second.endIndex && second.startIndex < first.endIndex) {
+          overlapping.add(first);
+          overlapping.add(second);
+        }
+      }
+    }
+    for (const group of groups) {
+      if (overlapping.has(group)) {
+        for (const annotation of group.annotations) skipped.push({ annotationId: annotation.id, label: annotation.label, reason: 'ambiguous' });
+      } else if (canInsertExactCommentRange(paragraph, group.match)) safeGroups.push(group);
+      else {
+        for (const annotation of group.annotations) skipped.push({ annotationId: annotation.id, label: annotation.label, reason: 'unsupported_structure' });
+      }
     }
   }
 
-  if (!paragraphsByExcerpt.size) return { buffer: source, commentsAdded: 0, annotationsAnchored: 0, skipped };
+  if (!safeGroups.length) return { buffer: source, commentsAdded: 0, annotationsAnchored: 0, skipped };
 
   const relationshipsPath = 'word/_rels/document.xml.rels';
   const relationshipsFile = zip.file(relationshipsPath);
@@ -456,15 +471,36 @@ export async function exportWordComments(source: Buffer, annotations: WordCommen
       const id = Number(comment.getAttributeNS(wordNamespace, 'id'));
       return Number.isInteger(id) ? Math.max(maximum, id) : maximum;
     }, -1) + 1;
-  for (const [paragraph, group] of paragraphsByExcerpt) {
-    if (group.annotations.length === 1 && group.match && canInsertExactCommentRange(paragraph, group.match)) {
-      insertExactCommentRange(document, paragraph, group.match, nextCommentId);
-    } else {
-      insertParagraphCommentRange(document, paragraph, nextCommentId);
+  let commentsAdded = 0;
+  let annotationsAnchored = 0;
+  for (const [paragraph, groups] of groupsByParagraph) {
+    const paragraphSafeGroups = groups.filter((group) => safeGroups.includes(group)).sort((left, right) => right.startIndex - left.startIndex);
+    for (const group of paragraphSafeGroups) {
+      // Earlier anchors may have split the original Word runs. Rebuild the text index
+      // against the live paragraph before inserting the next exact range.
+      const index = paragraphTextIndex(paragraph);
+      const foundAt = index.text.indexOf(group.query);
+      const nextMatch = foundAt < 0 ? -1 : index.text.indexOf(group.query, foundAt + 1);
+      const start = foundAt >= 0 ? index.positions[foundAt] : undefined;
+      const end = foundAt >= 0 ? index.positions[foundAt + group.query.length - 1] : undefined;
+      const match = start && end ? { start, end } : null;
+      if (foundAt < 0 || nextMatch >= 0 || !match) {
+        for (const annotation of group.annotations) skipped.push({ annotationId: annotation.id, label: annotation.label, reason: 'ambiguous' });
+        continue;
+      }
+      if (!canInsertExactCommentRange(paragraph, match)) {
+        for (const annotation of group.annotations) skipped.push({ annotationId: annotation.id, label: annotation.label, reason: 'unsupported_structure' });
+        continue;
+      }
+      insertExactCommentRange(document, paragraph, match, nextCommentId);
+      addCommentContent(comments, commentsRoot, nextCommentId, group.annotations);
+      nextCommentId += 1;
+      commentsAdded += 1;
+      annotationsAnchored += group.annotations.length;
     }
-    addCommentContent(comments, commentsRoot, nextCommentId, group.annotations);
-    nextCommentId += 1;
   }
+
+  if (!commentsAdded) return { buffer: source, commentsAdded: 0, annotationsAnchored: 0, skipped };
 
   const serializer = new XMLSerializer();
   zip.file('word/document.xml', serializer.serializeToString(document));
@@ -472,5 +508,5 @@ export async function exportWordComments(source: Buffer, annotations: WordCommen
   zip.file('[Content_Types].xml', serializer.serializeToString(contentTypes));
   zip.file(commentsPath, serializer.serializeToString(comments));
   const output = await zip.generateAsync({ type: 'nodebuffer' });
-  return { buffer: output, commentsAdded: paragraphsByExcerpt.size, annotationsAnchored: annotations.slice(0, 500).length - skipped.length, skipped };
+  return { buffer: output, commentsAdded, annotationsAnchored, skipped };
 }
