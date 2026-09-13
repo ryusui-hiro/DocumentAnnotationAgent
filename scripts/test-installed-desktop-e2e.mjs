@@ -308,8 +308,23 @@ const installBrowserDiagnosticsScript = `
 `;
 
 async function runScenario(scenario, fixture, index, total, apiBaseUrl) {
+  if (index > 0) {
+    await executeScript(`
+      const save = document.querySelector('.top-save');
+      if (!save) throw new Error('The workspace save control is missing before scenario reset.');
+      if (!save.disabled) save.click();
+      return true;
+    `);
+    await waitForScript('the previous review decision to finish saving', `
+      return document.querySelector('.save-status')?.textContent.includes('保存済み') ?? false;
+    `, [], 15_000);
+  }
+  const previousTimeOrigin = await executeScript(`return performance.timeOrigin;`);
   await executeScript(installEmptyWorkspaceScript, [fixture]);
   await sessionCommand('POST', '/refresh', {}, 30_000);
+  await waitForScript('a fresh document after resetting the workspace', `
+    return performance.timeOrigin > Number(arguments[0]);
+  `, [previousTimeOrigin], 30_000);
 
   await waitForScript('the packaged demo page to render', `
     return document.querySelector('#ai-prompt')
