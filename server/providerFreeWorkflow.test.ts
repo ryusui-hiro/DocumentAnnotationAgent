@@ -113,7 +113,9 @@ test('provider-free Agent opens its bound document, pauses for review, resumes t
       assert.match(initialContext, /Structured annotation task plan:/);
       assert.match(initialContext, /Review ambiguous acoustic limits/);
       const openTool = call.request.tools.find((candidate) => candidate.name === 'open_document');
+      const infoTool = call.request.tools.find((candidate) => candidate.name === 'get_document_info');
       assert.ok(openTool, 'the run exposes open_document');
+      assert.ok(infoTool, 'the run exposes get_document_info');
       assert.equal(openTool.type, 'function');
       if (openTool.type === 'function') {
         assert.equal(openTool.strict, true, 'open_document uses strict tool arguments');
@@ -121,12 +123,32 @@ test('provider-free Agent opens its bound document, pauses for review, resumes t
         assert.deepEqual(parameters.properties, {}, 'the model cannot provide a document selector');
         assert.equal(parameters.additionalProperties, false, 'the no-argument schema rejects extra selectors');
       }
+      assert.equal(infoTool.type, 'function');
+      if (infoTool.type === 'function') {
+        assert.equal(infoTool.strict, true, 'get_document_info uses strict tool arguments');
+        const parameters = infoTool.parameters as Record<string, unknown>;
+        assert.deepEqual(parameters.properties, {}, 'the model cannot select another document for metadata');
+        assert.equal(parameters.additionalProperties, false, 'the metadata tool rejects extra selectors');
+      }
       return [functionCall('open_document', {}, { callId: 'open-bound-session' })];
     }),
     modelResponder((call) => {
       const opened = readToolResult(call, 'open_document');
       assert.deepEqual(opened, {
         opened: true,
+        documentId,
+        fileName: 'demo-specification.pdf',
+        fileType: 'PDF',
+        kind: 'paged',
+        pageCount: 1,
+        currentPage: 1,
+      });
+      return [functionCall('get_document_info', {}, { callId: 'bound-info' })];
+    }),
+    modelResponder((call) => {
+      const info = readToolResult(call, 'get_document_info');
+      assert.deepEqual(info, {
+        found: true,
         documentId,
         fileName: 'demo-specification.pdf',
         fileType: 'PDF',
@@ -208,6 +230,7 @@ test('provider-free Agent opens its bound document, pauses for review, resumes t
   assert.equal(paused.annotations[0]?.reviewedByHuman, undefined);
   assert.deepEqual(paused.toolEvents.map((event) => event.toolName), [
     'open_document',
+    'get_document_info',
     'get_document_outline',
     'inspect_page',
     'request_review',
@@ -259,6 +282,11 @@ test('open_document fails closed when a run has no user-bound document session',
     modelResponder((call) => {
       const opened = readToolResult(call, 'open_document');
       assert.deepEqual(opened, { opened: false, error: 'No user-opened document session is bound to this Agent run.' });
+      return [functionCall('get_document_info', {}, { callId: 'info-unbound-document' })];
+    }),
+    modelResponder((call) => {
+      const info = readToolResult(call, 'get_document_info');
+      assert.deepEqual(info, { found: false, error: 'No matching user-opened document session is bound to this Agent run.' });
       return [assistantMessage('No document session was available, so I did not open a file.')];
     }),
   ]);
@@ -279,9 +307,10 @@ test('open_document fails closed when a run has no user-bound document session',
 
   model.assertComplete();
   assert.equal(result.status, 'complete');
-  assert.deepEqual(result.toolEvents.map((event) => event.toolName), ['open_document']);
+  assert.deepEqual(result.toolEvents.map((event) => event.toolName), ['open_document', 'get_document_info']);
   assert.equal(result.toolEvents[0]?.status, 'complete');
   assert.match(result.toolEvents[0]?.detail ?? '', /No user-opened document session/);
+  assert.match(result.toolEvents[1]?.detail ?? '', /No matching user-opened document session/);
 });
 
 test('open_document cannot switch to an adapter from a different document session', async () => {
