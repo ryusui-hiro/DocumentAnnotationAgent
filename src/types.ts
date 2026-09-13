@@ -84,7 +84,6 @@ export interface AppSettings {
   azureDeployment: string;
   model: ModelId;
   reasoningEffort: ReasoningEffort;
-  rememberApiKey: boolean;
 }
 
 export interface TokenUsage {

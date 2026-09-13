@@ -306,13 +306,24 @@ export function extractPositionedTextLines(svg: string, maxLines = 600) {
 
 export function parsePositionedTextLines(lines: string[]): PositionedTextBlock[] {
   return lines.flatMap((line, lineNumber) => {
-    const match = line.match(/^\[\s*x=([\d.]+),\s*y=([\d.]+),\s*w=([\d.]+),\s*h=([\d.]+)\s*\]\s*(.+)$/u);
-    if (!match) return [];
-    const values = match.slice(1, 5).map(Number);
+    if (!line.startsWith('[x=')) return [];
+    const closeIndex = line.indexOf('] ');
+    if (closeIndex < 0 || closeIndex > 128) return [];
+    const fields = line.slice(1, closeIndex).split(',');
+    const names = ['x', 'y', 'w', 'h'];
+    if (fields.length !== names.length) return [];
+    const values = fields.map((field, index) => {
+      const equalsIndex = field.indexOf('=');
+      if (equalsIndex < 0 || field.slice(0, equalsIndex).trim() !== names[index]) return Number.NaN;
+      const rawValue = field.slice(equalsIndex + 1).trim();
+      if (!rawValue || rawValue.length > 20) return Number.NaN;
+      return Number(rawValue);
+    });
     if (!values.every(Number.isFinite)) return [];
     const [x, y, width, height] = values;
     if (x! < 0 || y! < 0 || width! <= 0 || height! <= 0 || x! + width! > 1.001 || y! + height! > 1.001) return [];
-    return [{ text: match[5]!.trim(), boundingBox: { x: x!, y: y!, width: width!, height: height! }, lineNumber }];
+    const text = line.slice(closeIndex + 2).trim();
+    return text ? [{ text, boundingBox: { x: x!, y: y!, width: width!, height: height! }, lineNumber }] : [];
   });
 }
 

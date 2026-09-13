@@ -109,8 +109,7 @@ export default function SettingsDialog({
 
                 <label className="field-label settings-field-label" htmlFor="api-key">APIキー</label>
                 <div className="api-key-field"><input id="api-key" className="text-input settings-input" type={showKey ? 'text' : 'password'} autoComplete="off" spellCheck={false} value={apiKey} onChange={(event) => onApiKeyChange(event.target.value)} placeholder={settings.provider === 'azure-openai' ? 'Azure OpenAI key' : 'sk-…'} /><button type="button" className="key-visibility" aria-label={showKey ? 'APIキーを隠す' : 'APIキーを表示'} onClick={() => setShowKey((value) => !value)}>{showKey ? <EyeOff size={15} /> : <Eye size={15} />}</button></div>
-                <label className="remember-key-row"><input type="checkbox" checked={settings.rememberApiKey} onChange={(event) => onChange({ rememberApiKey: event.target.checked })} /><span>この端末のブラウザー保存領域にキーを保存する</span></label>
-                <p className="secret-note">キーは接続テストまたは候補作成時に、上記の文書/APIサーバーへ送って処理します。保存をオフにすると再読み込み時に再入力が必要です。保存をオンにした場合はlocalStorageに平文保存されるため、共有端末では使わないでください。</p>
+                <p className="secret-note">キーは接続テストまたは候補作成時に、上記の文書/APIサーバーへ送って処理します。キーはこのタブのメモリにのみ保持し、再読み込みまたはタブを閉じると消去します。</p>
               </>
             )}
           </section>

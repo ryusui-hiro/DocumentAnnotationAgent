@@ -23,7 +23,7 @@ npm run dev
 
 在 Settings 中选择 OpenAI API、Azure OpenAI 或兼容 OpenAI 的 API，并填写 endpoint、API key、模型和推理级别。支持 GPT-6 Astra 以及 GPT-5.6 Sol / Terra / Luna。Azure 还需要填写 deployment 名称。如果未在应用中输入密钥，也可以使用本地环境变量 `OPENAI_API_KEY` 和 `AZURE_OPENAI_*` 作为备用配置。
 
-除非启用“在此设备上记住”，API 密钥只保存在内存中，页面刷新后需要重新输入。启用后，密钥会以明文保存在浏览器或 Tauri WebView 的 `localStorage` 中；请勿在共享设备上启用。AI 分析会将页面图片、带归一化位置的提取文本、指令、指南、可选修正规则以及人工确认的判断发送给所选服务。整份文档会逐页运行 Agent；工具操作可能触发多次模型请求，应用会按实际请求统计 token 用量和请求数。OpenAI Responses API 请求使用 `store: false`，并禁用 SDK tracing。连接远程 API 服务时请使用 HTTPS。
+API 密钥仅保存在当前浏览器标签页的内存中，不会写入浏览器或 Tauri WebView 存储。刷新页面或关闭标签页后会清除密钥。AI 分析会将页面图片、带归一化位置的提取文本、指令、指南、可选修正规则以及人工确认的判断发送给所选服务。整份文档会逐页运行 Agent；工具操作可能触发多次模型请求，应用会按实际请求统计 token 用量和请求数。OpenAI Responses API 请求使用 `store: false`，并禁用 SDK tracing。连接远程 API 服务时请使用 HTTPS。
 
 构建并运行生产版本：
 
@@ -89,7 +89,7 @@ npm start
 
 - Settings 可在 OpenAI API、Azure OpenAI、兼容 OpenAI 的 API 和 Codex App Server 之间切换。
 - API 模式支持 endpoint、API key、GPT-6 Astra / GPT-5.6 Sol / Terra / Luna 和推理级别。Azure 还需要 deployment 名称。
-- 除非明确启用“在此设备上记住”，否则 API 密钥不会写入设备存储。启用后，密钥会以明文保存在浏览器 / Tauri WebView 存储中；共享设备请保持关闭。
+- API 密钥不会写入设备存储，仅保存在当前浏览器标签页的内存中。
 - Codex App Server 使用同一主机上的 Codex CLI，包括其登录账户、可用模型和推理设置。
 - Tauri 2 桌面版使用相同的文档处理 API。请在 Settings 中设置可访问的本地或公司 Annotation Studio API URL。
 

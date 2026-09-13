@@ -2,7 +2,7 @@ import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import { chmod, mkdir, open, readFile, readdir, rename, unlink } from 'node:fs/promises';
 import { gzipSync, gunzipSync } from 'node:zlib';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve, sep } from 'node:path';
 
 const recordFormat = 1;
 const maximumPlaintextBytes = 256 * 1024 * 1024;
@@ -13,8 +13,16 @@ function safePart(value: string) {
   return value;
 }
 
+function containedPath(directory: string, ...parts: string[]) {
+  const root = resolve(directory);
+  const target = resolve(root, ...parts);
+  const rootPrefix = root === sep ? root : `${root}${sep}`;
+  if (target === root || !target.startsWith(rootPrefix)) throw new Error('Private record path escaped its storage directory.');
+  return target;
+}
+
 export function createPrivateRecordStore(directory: string) {
-  const keyPath = join(directory, 'record-key');
+  const keyPath = containedPath(directory, 'record-key');
 
   async function ensureDirectory() {
     await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -49,7 +57,7 @@ export function createPrivateRecordStore(directory: string) {
   }
 
   function recordPath(namespace: string, id: string) {
-    return join(directory, safePart(namespace), `${safePart(id)}.json`);
+    return containedPath(directory, safePart(namespace), `${safePart(id)}.json`);
   }
 
   return {
@@ -67,10 +75,10 @@ export function createPrivateRecordStore(directory: string) {
         content: ciphertext.toString('base64'),
       };
       const target = recordPath(namespace, id);
-      const parent = join(directory, safePart(namespace));
+      const parent = containedPath(directory, safePart(namespace));
       await mkdir(parent, { recursive: true, mode: 0o700 });
       await chmod(parent, 0o700);
-      const temporary = join(parent, `.${safePart(id)}-${randomBytes(8).toString('hex')}.tmp`);
+      const temporary = containedPath(parent, `.${safePart(id)}-${randomBytes(8).toString('hex')}.tmp`);
       await open(temporary, 'wx', 0o600).then(async (file) => {
         try {
           await file.writeFile(JSON.stringify(envelope));
@@ -113,7 +121,7 @@ export function createPrivateRecordStore(directory: string) {
     },
 
     async list(namespace: string) {
-      const parent = join(directory, safePart(namespace));
+      const parent = containedPath(directory, safePart(namespace));
       try {
         return (await readdir(parent)).filter((fileName) => /^[a-zA-Z0-9_-]{1,100}\.json$/.test(fileName)).map((fileName) => fileName.slice(0, -5));
       } catch (error) {

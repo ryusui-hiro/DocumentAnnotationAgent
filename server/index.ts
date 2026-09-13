@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, extname, join, resolve } from 'node:path';
 import express from 'express';
+import { rateLimit } from 'express-rate-limit';
 import multer from 'multer';
 import OpenAI from 'openai';
 import { z } from 'zod';
@@ -32,6 +33,9 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: maxUploadMb * 1024 * 1024, files: 1 },
 });
+const demoFileRateLimit = rateLimit({ windowMs: 60_000, limit: 30, standardHeaders: 'draft-8', legacyHeaders: false });
+const pagePreviewRateLimit = rateLimit({ windowMs: 60_000, limit: 240, standardHeaders: 'draft-8', legacyHeaders: false });
+const frontendRateLimit = rateLimit({ windowMs: 60_000, limit: 600, standardHeaders: 'draft-8', legacyHeaders: false });
 
 app.use(express.json({ limit: '12mb' }));
 const allowedOrigins = new Set([
@@ -393,7 +397,7 @@ function workspaceDisplayName(value: unknown, fallback: string) {
   return normalized && extname(normalized).toLowerCase() === extname(fallback).toLowerCase() ? normalized : fallback;
 }
 
-app.get('/api/demo', async (_request, response, next) => {
+app.get('/api/demo', demoFileRateLimit, async (_request, response, next) => {
   try {
     let currentDemo = demoSessionId ? documentSessions.get(demoSessionId) : undefined;
     if (!currentDemo) {
@@ -411,7 +415,7 @@ app.get('/api/demo', async (_request, response, next) => {
   }
 });
 
-app.get('/api/documents/:documentId/pages/:pageNumber.svg', (request, response) => {
+app.get<{ documentId: string; pageNumber: string }>('/api/documents/:documentId/pages/:pageNumber.svg', pagePreviewRateLimit, (request, response) => {
   pruneDocumentSessions();
   const session = documentSessions.get(request.params.documentId);
   const pageNumber = Number(request.params.pageNumber);
@@ -1225,8 +1229,8 @@ app.post('/api/ai/approve', async (request, response, next) => {
 
 if (process.env.NODE_ENV === 'production' || process.argv.includes('--serve-frontend')) {
   const webRoot = resolve('dist');
-  app.use(express.static(webRoot));
-  app.use((_request, response) => response.sendFile(join(webRoot, 'index.html')));
+  app.use(frontendRateLimit, express.static(webRoot));
+  app.use(frontendRateLimit, (_request, response) => response.sendFile(join(webRoot, 'index.html')));
 }
 
 app.use((error: unknown, _request: express.Request, response: express.Response, _next: express.NextFunction) => {

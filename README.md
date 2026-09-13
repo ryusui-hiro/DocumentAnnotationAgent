@@ -23,7 +23,7 @@ Open `http://127.0.0.1:5173` to try the sample document. Manual annotations, lab
 
 In Settings, choose OpenAI API, Azure OpenAI, or an OpenAI-compatible API and enter the endpoint, API key, model, and reasoning level. GPT-6 Astra and GPT-5.6 Sol / Terra / Luna are supported. Azure also requires a deployment name. Local environment variables such as `OPENAI_API_KEY` and `AZURE_OPENAI_*` are fallback values when no key is entered in the app.
 
-Unless “Remember on this device” is enabled, the API key stays in memory and must be entered again after a reload. When enabled, it is stored as plain text in the browser or Tauri WebView `localStorage`; leave this option off on shared devices. AI analysis sends page images, extracted text with normalized locations, instructions, guidelines, optional correction rules, and human-confirmed decisions to the configured provider. A full-document scan runs an agent turn for each page; function-tool calls may require multiple model requests, and the app records actual token usage and request counts. OpenAI Responses API requests use `store: false`, and SDK tracing is disabled. Use HTTPS when connecting to a remote API server.
+The API key is held in memory for the current browser tab only and is never written to browser or Tauri WebView storage. Reloading the page or closing the tab clears it. AI analysis sends page images, extracted text with normalized locations, instructions, guidelines, optional correction rules, and human-confirmed decisions to the configured provider. A full-document scan runs an agent turn for each page; function-tool calls may require multiple model requests, and the app records actual token usage and request counts. OpenAI Responses API requests use `store: false`, and SDK tracing is disabled. Use HTTPS when connecting to a remote API server.
 
 Build and run the production app:
 
@@ -89,7 +89,7 @@ Earlier proof-of-concept files were used only to understand the annotation workf
 
 - Settings can switch between OpenAI API, Azure OpenAI, OpenAI-compatible API, and Codex App Server.
 - API mode supports endpoints and API keys, GPT-6 Astra / GPT-5.6 Sol / Terra / Luna, and reasoning levels. Azure also uses a deployment name.
-- API keys are not written to device storage unless “Remember on this device” is explicitly enabled. The key is stored in browser / Tauri WebView storage as plain text when enabled; keep it off on shared devices.
+- API keys are never written to device storage; they stay in memory for the current browser tab.
 - Codex App Server uses the Codex CLI on the same host, including its signed-in account, available models, and reasoning settings.
 - Tauri 2 desktop builds use the same document-processing API. Set a reachable local or company Annotation Studio API URL in Settings.
 

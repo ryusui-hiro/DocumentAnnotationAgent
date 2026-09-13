@@ -20,13 +20,12 @@ function isTauriRuntime() {
 }
 
 export const defaultSettings: AppSettings = {
-  apiServerUrl: import.meta.env.VITE_API_BASE_URL?.trim() || (isTauriRuntime() ? 'http://127.0.0.1:3001' : ''),
+  apiServerUrl: import.meta.env?.VITE_API_BASE_URL?.trim() || (isTauriRuntime() ? 'http://127.0.0.1:3001' : ''),
   provider: 'openai-api',
   endpoint: 'https://api.openai.com/v1',
   azureDeployment: '',
   model: 'gpt-6-astra',
   reasoningEffort: 'medium',
-  rememberApiKey: false,
 };
 
 export const emptyUsageTotals: UsageTotals = {
@@ -63,13 +62,14 @@ export function loadSettings(): AppSettings {
     azureDeployment: typeof value.azureDeployment === 'string' ? value.azureDeployment : '',
     model: modelIds.includes(value.model as ModelId) ? value.model as ModelId : defaultSettings.model,
     reasoningEffort: effortIds.includes(value.reasoningEffort as ReasoningEffort) ? value.reasoningEffort as ReasoningEffort : defaultSettings.reasoningEffort,
-    rememberApiKey: Boolean(value.rememberApiKey),
   };
 }
 
-export function loadApiKey(settings: AppSettings): string {
-  if (!settings.rememberApiKey) return '';
-  try { return localStorage.getItem(API_KEY_STORAGE_KEY) ?? ''; } catch { return ''; }
+type SettingsStorage = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>;
+
+export function loadApiKey(storage: SettingsStorage = window.localStorage): string {
+  try { storage.removeItem(API_KEY_STORAGE_KEY); } catch { /* Clear legacy plaintext secrets when storage is available. */ }
+  return '';
 }
 
 export function loadUsageTotals(): UsageTotals {
@@ -79,11 +79,10 @@ export function loadUsageTotals(): UsageTotals {
   return { ...emptyUsageTotals, ...value, byModel: value.byModel ?? {} };
 }
 
-export function persistSettings(settings: AppSettings, apiKey: string) {
+export function persistSettings(settings: AppSettings, storage: SettingsStorage = window.localStorage) {
   try {
-    localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
-    if (settings.rememberApiKey && apiKey.trim()) localStorage.setItem(API_KEY_STORAGE_KEY, apiKey.trim());
-    else localStorage.removeItem(API_KEY_STORAGE_KEY);
+    storage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+    storage.removeItem(API_KEY_STORAGE_KEY);
   } catch {
     // Storage may be disabled; the in-memory settings still work for this session.
   }

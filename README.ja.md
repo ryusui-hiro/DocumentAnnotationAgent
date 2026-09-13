@@ -21,7 +21,7 @@ npm run dev
 
 設定画面でOpenAI API、Azure OpenAI、OpenAI互換APIを選び、endpoint、API key、モデル、推論レベルを入力します。GPT-6 AstraとGPT-5.6 Sol / Terra / Lunaに対応します。Azureではendpoint、key、deployment名を入力します。サーバー環境変数 OPENAI_API_KEY / AZURE_OPENAI_* は、画面にAPIキーを入力しない場合のローカル用fallbackです。
 
-APIキーは保存を選ばなければメモリにのみ保持され、再読み込み時に再入力が必要です。「この端末に保存」を有効にした場合はブラウザー/Tauri WebViewのlocalStorageに平文保存します。共有端末では無効にしてください。AI解析ではページ画像、位置を正規化した抽出テキスト、指示、ガイドライン、任意の修正ルール、人が確定した判断例を設定先へ送信します。文書全体を解析するとページごとにAgentを実行し、Tool操作に複数のモデル要求が必要な場合があります。実際のtoken usageと要求数を集計します。OpenAI Responses APIには `store: false` を設定し、SDK tracingは無効にしています。リモートAPIサーバーへ接続する場合はHTTPSを使ってください。
+APIキーは現在のブラウザータブのメモリにのみ保持し、ブラウザー/Tauri WebViewの保存領域には書き込みません。再読み込みまたはタブを閉じると消去されます。AI解析ではページ画像、位置を正規化した抽出テキスト、指示、ガイドライン、任意の修正ルール、人が確定した判断例を設定先へ送信します。文書全体を解析するとページごとにAgentを実行し、Tool操作に複数のモデル要求が必要な場合があります。実際のtoken usageと要求数を集計します。OpenAI Responses APIには `store: false` を設定し、SDK tracingは無効にしています。リモートAPIサーバーへ接続する場合はHTTPSを使ってください。
 
 ビルドと本番モードの起動:
 
@@ -92,7 +92,7 @@ npm start
 
 - 設定画面で OpenAI API、Azure OpenAI、OpenAI互換API、Codex App Server を切り替えます。
 - APIモードではエンドポイントとAPIキーを設定し、GPT-6 Astra / GPT-5.6 Sol / GPT-5.6 Terra / GPT-5.6 Luna、推論レベルを選べます。
-- APIキーは通常は設定を保存しても端末へ書き込みません。明示的に「この端末に保存」を選んだ場合のみ、Web/TauriのWebViewストレージに保存されます。共有端末では無効にしてください。
+- APIキーは端末へ保存されません。現在のブラウザータブのメモリにのみ保持します。
 - Codex App Serverモードは同じホスト上のCodex CLIを使います。CLIのログイン済みアカウント、利用可能モデル、推論設定を引き継ぎます。
 - Tauri 2でデスクトップアプリをビルドできます。デスクトップ版は同じ文書処理APIを使うため、設定の「文書/APIサーバーURL」にローカルまたは社内で運用する Annotation Studio API を指定します。
 

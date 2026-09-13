@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { resolve } from 'node:path';
 import test from 'node:test';
 import { preview } from 'document-svg';
-import { extractPositionedTextBlocks, extractPositionedTextLines, findPositionedTextTargets } from './textTarget';
+import { extractPositionedTextBlocks, extractPositionedTextLines, findPositionedTextTargets, parsePositionedTextLines } from './textTarget';
 
 test('resolves PDF text transforms and glyph positions into stable page coordinates', () => {
   const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 800"><text x="0" y="0" transform="matrix(1 0 0 1 60 200)" aria-label="SAFETY WARNING"><tspan font-size="20"><tspan x="0" y="0">S</tspan><tspan x="12" y="0">A</tspan><tspan x="24" y="0">F</tspan><tspan x="36" y="0">E</tspan><tspan x="48" y="0">T</tspan><tspan x="60" y="0">Y</tspan><tspan x="72" y="0"> </tspan><tspan x="80" y="0">W</tspan><tspan x="96" y="0">A</tspan><tspan x="108" y="0">R</tspan><tspan x="120" y="0">N</tspan><tspan x="132" y="0">I</tspan><tspan x="140" y="0">N</tspan><tspan x="152" y="0">G</tspan></tspan></text></svg>';
@@ -13,6 +13,13 @@ test('resolves PDF text transforms and glyph positions into stable page coordina
   assert.equal(block.characterBoxes?.length, 'SAFETY WARNING'.length);
   assert.ok(block.boundingBox.x > 0.09);
   assert.ok(block.boundingBox.y > 0.22);
+});
+
+test('parses positioned line headers with bounded linear string operations', () => {
+  const [block] = parsePositionedTextLines(['[x=0.125, y=0.25, w=0.5, h=0.05] Bounded source text']);
+  assert.deepEqual(block?.boundingBox, { x: 0.125, y: 0.25, width: 0.5, height: 0.05 });
+  assert.equal(block?.text, 'Bounded source text');
+  assert.deepEqual(parsePositionedTextLines([`[x=${' '.repeat(50_000)}0.1, y=0.2, w=0.3, h=0.04] hostile text`]), []);
 });
 
 test('uses document-svg PDF text matrices when locating selectable source text', async () => {

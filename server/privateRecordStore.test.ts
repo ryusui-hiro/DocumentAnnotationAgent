@@ -26,3 +26,15 @@ test('stores compressed private records encrypted with user-only file permission
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test('rejects path separators in private record namespaces and ids', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'annotation-studio-private-'));
+  try {
+    const store = createPrivateRecordStore(directory);
+    await assert.rejects(store.put('../outside', 'run-123', { value: true }), /unsupported characters/);
+    await assert.rejects(store.get('namespace', '../../outside'), /unsupported characters/);
+    await assert.rejects(store.delete('namespace', 'nested/run-123'), /unsupported characters/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

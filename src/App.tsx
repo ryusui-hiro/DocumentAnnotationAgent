@@ -349,7 +349,7 @@ function App() {
   const [taskPlanLoading, setTaskPlanLoading] = useState(false);
   const [guidelineImporting, setGuidelineImporting] = useState(false);
   const [settings, setSettings] = useState<AppSettings>(loadSettings);
-  const [apiKey, setApiKey] = useState(() => loadApiKey(loadSettings()));
+  const [apiKey, setApiKey] = useState(() => loadApiKey());
   const [usage, setUsage] = useState<UsageTotals>(loadUsageTotals);
   const [lastUsage, setLastUsage] = useState<TokenUsage | null>(null);
   const [codexModels, setCodexModels] = useState<CodexModel[]>([]);
@@ -755,20 +755,19 @@ function App() {
     if (patch.model || patch.provider || patch.endpoint || patch.azureDeployment) invalidateTaskPlan();
     setSettings((current) => {
       const next = { ...current, ...patch };
-      persistSettings(next, apiKey);
+      persistSettings(next);
       return next;
     });
   };
 
   const changeApiKey = (key: string) => {
     setApiKey(key);
-    if (settings.rememberApiKey) persistSettings(settings, key);
   };
 
   const saveConnectionSettings = () => {
-    persistSettings(settings, apiKey);
+    persistSettings(settings);
     setSettingsOpen(false);
-    setMessage('接続設定を保存しました。APIキーは選択した保存設定に従います。');
+    setMessage('接続設定を保存しました。APIキーはこのセッションのメモリにのみ保持します。');
   };
 
   const recordUsage = (provider: ProviderId, modelName: string, usageValue?: Partial<TokenUsage>, requestCount = 1) => {
