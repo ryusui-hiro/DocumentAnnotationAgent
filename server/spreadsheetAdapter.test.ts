@@ -60,6 +60,7 @@ test('stages cell and column edits at the selected table header row, applies onl
   assert.equal(adapter.readRange('Customers', 'A1').rows[0]?.[0]?.value, 'Customer churn review');
   assert.equal(adapter.readRange('Customers', 'B2').rows[0]?.[0]?.value, null);
   assert.equal(adapter.readRange('Customers', 'D3').rows[0]?.[0]?.value, 'Churn Risk');
+  assert.ok((adapter.workbook.getWorksheet('Customers')?.getColumn(4).width ?? 0) >= 'Churn Risk'.length + 2);
 
   const rejected = adapter.writeCell('Customers', 'D4', 'LOW', 'Aki has no support tickets.', 0.96, true, 'rejected-cell');
   adapter.rejectChange(rejected.id);

@@ -344,10 +344,10 @@ export class SpreadsheetDocumentAdapter implements DocumentAdapter, SpreadsheetI
     const worksheet = this.getWorksheet(sheetName);
     if (!header.trim() || header.length > 120) throw fail('Column header must contain 1 to 120 characters.');
     if (!Number.isInteger(headerRow) || headerRow < 1 || headerRow > maxWorkbookRows) throw fail('Header row is outside the supported worksheet range.');
-    const row = worksheet.getRow(headerRow);
     const address = this.nextEmptyColumnAddress(sheetName, headerRow);
-    if (!options.requiresReview) row.getCell(parseCellAddress(address).column).value = header.trim();
-    return this.recordChange({ operation: 'create_column', sheetName: worksheet.name, range: address, values: [[header.trim()]], reason, requiresReview: Boolean(options.requiresReview), ...(options.requiresReview ? {} : { approved: true }) }, options.id);
+    const change = this.recordChange({ operation: 'create_column', sheetName: worksheet.name, range: address, values: [[header.trim()]], reason, requiresReview: Boolean(options.requiresReview), ...(options.requiresReview ? {} : { approved: true }) }, options.id);
+    if (!options.requiresReview) this.applyChange(change);
+    return change;
   }
 
   nextEmptyColumnAddress(sheetName: string, headerRow: number) {
@@ -453,7 +453,23 @@ export class SpreadsheetDocumentAdapter implements DocumentAdapter, SpreadsheetI
 
   private applyChange(change: SpreadsheetCellChange) {
     const worksheet = this.getWorksheet(change.sheetName);
-    if (change.operation === 'create_column' || change.operation === 'write_cell') {
+    if (change.operation === 'create_column') {
+      const cell = parseCellAddress(change.range);
+      const headerCell = worksheet.getCell(cell.row, cell.column);
+      const header = String(change.values[0]?.[0] ?? '');
+      headerCell.value = header;
+      const column = worksheet.getColumn(cell.column);
+      const minWidth = Math.max(12, Array.from(header).length + 2);
+      const width = Math.min(40, Math.max(typeof column.width === 'number' ? column.width : 8.43, minWidth));
+      if (typeof column.width !== 'number' || column.width < width) column.width = width;
+      if (minWidth > 40) {
+        headerCell.alignment = { ...headerCell.alignment, wrapText: true, vertical: 'middle' };
+        const headerRow = worksheet.getRow(cell.row);
+        headerRow.height = Math.max(headerRow.height ?? 15, Math.min(90, Math.ceil(Array.from(header).length / 38) * 15));
+      }
+      return;
+    }
+    if (change.operation === 'write_cell') {
       const cell = parseCellAddress(change.range);
       worksheet.getCell(cell.row, cell.column).value = change.values[0]?.[0] ?? null;
       return;
