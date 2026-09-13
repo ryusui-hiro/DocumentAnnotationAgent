@@ -180,7 +180,12 @@ test('select_text and annotate_text map a unique positioned phrase to a read-onl
 test('get_selected_region returns the viewer-selected annotation location to the Agent', async () => {
   const selected = { id: 'viewer-region', pageNumber: 2, x: 0.2, y: 0.3, width: 0.25, height: 0.05, label: 'HIGH RISK', note: 'Manual reviewer selection.', excerpt: 'Either party may terminate.', reviewPriority: 'high' as const, status: 'active' as const };
   const model = new ScriptedModel([
-    modelResponse([functionCall('get_document_outline', {}, { callId: 'selected-outline' })]),
+    modelResponder((call) => {
+      const initialContext = JSON.stringify(call.request.input);
+      assert.match(initialContext, /USER-SELECTED VIEWER ANNOTATION/);
+      assert.match(initialContext, /x=0\.200, y=0\.300, width=0\.250, height=0\.050/);
+      return [functionCall('get_document_outline', {}, { callId: 'selected-outline' })];
+    }),
     modelResponse([functionCall('inspect_page', {}, { callId: 'selected-inspect' })]),
     modelResponse([functionCall('get_selected_region', {}, { callId: 'selected-region-read' })]),
     modelResponder((call) => {
@@ -195,6 +200,7 @@ test('get_selected_region returns the viewer-selected annotation location to the
       assert.deepEqual(JSON.parse(outputText), {
         selected: true,
         source: 'viewer_annotation',
+        userSelected: true,
         annotationId: 'viewer-region',
         pageNumber: 2,
         boundingBox: { x: 0.2, y: 0.3, width: 0.25, height: 0.05 },
@@ -212,6 +218,7 @@ test('get_selected_region returns the viewer-selected annotation location to the
     guidelines: '', correction: '', humanDecisions: '', pageText: 'Current page text.',
     imageDataUrl: 'data:image/png;base64,AA==', pageNumber: 2, totalPages: 2, mode: 'observe',
     existingAnnotations: [selected], selectedAnnotationId: selected.id,
+    viewerAspectRatio: 1.5, viewerViewport: { x: 0.2, y: 0.3, width: 0.25, height: 0.05 },
   }, model);
 
   model.assertComplete();
@@ -220,9 +227,104 @@ test('get_selected_region returns the viewer-selected annotation location to the
   assert.equal(result.toolEvents.find((event) => event.toolName === 'get_selected_region')?.pageNumber, 2);
 });
 
+test('scroll_document continues from the user-visible region instead of resetting to the page origin', async () => {
+  const adapter = new PagedDocumentAdapter('viewer-context.pdf', {
+    sourceFormat: 'PDF', pageCount: 1,
+    pages: [{
+      number: 1, widthPoints: 120, heightPoints: 160, warningCount: 0, warnings: [],
+      svg: '<svg xmlns="http://www.w3.org/2000/svg" width="120" height="160" viewBox="0 0 120 160"><rect width="120" height="160" fill="white"/></svg>',
+    }],
+  } as unknown as PreviewReport, 'viewer-context');
+  const viewport = { x: 0.2, y: 0.3, width: 0.35, height: 0.4 };
+  const model = new ScriptedModel([
+    modelResponder((call) => {
+      const initialContext = JSON.stringify(call.request.input);
+      assert.match(initialContext, /USER-SELECTED VIEWER ANNOTATION/);
+      assert.match(initialContext, /Current human-visible page bounds .*x=0\.200, y=0\.300, width=0\.350, height=0\.400/);
+      return [functionCall('get_document_outline', {}, { callId: 'viewer-context-outline' })];
+    }),
+    modelResponse([functionCall('inspect_page', {}, { callId: 'viewer-context-inspect' })]),
+    modelResponse([functionCall('get_selected_region', {}, { callId: 'viewer-context-selected' })]),
+    modelResponse([functionCall('scroll_document', { direction: 'down', amount: 0.1 }, { callId: 'viewer-context-scroll' })]),
+    modelResponder((call) => {
+      const output = Array.isArray(call.request.input)
+        ? call.request.input.find((item) => item.type === 'function_call_result' && item.name === 'scroll_document')
+        : undefined;
+      assert.ok(output, 'the viewer-relative crop returns to the Agent');
+      const raw = 'output' in output ? output.output : undefined;
+      assert.ok(Array.isArray(raw));
+      const text = raw.find((item) => typeof item === 'object' && item.type === 'input_text');
+      assert.ok(text && 'text' in text && typeof text.text === 'string');
+      const result = JSON.parse(text.text) as { viewport: typeof viewport };
+      assert.deepEqual(result.viewport, { ...viewport, y: 0.4 });
+      return [assistantMessage('The crop starts from the human-visible part of the page.')];
+    }),
+  ]);
+
+  const result = await runDocumentAgent({
+    model: 'gpt-6-astra', reasoningEffort: 'low', instruction: 'Review the selected contract section.',
+    guidelines: '', correction: '', humanDecisions: '', pageText: 'Full page text.',
+    imageDataUrl: 'data:image/png;base64,AA==', pageNumber: 1, totalPages: 1, mode: 'observe',
+    documentAdapters: [adapter], selectedAnnotationId: 'viewer-selected',
+    viewerAspectRatio: 1.5, viewerViewport: viewport,
+    existingAnnotations: [{ id: 'viewer-selected', pageNumber: 1, ...viewport, label: 'HIGH RISK', note: 'Clause selected by the reviewer.', status: 'active' }],
+  }, model);
+
+  model.assertComplete();
+  assert.equal(result.status, 'complete');
+  assert.equal(result.toolEvents.find((event) => event.toolName === 'scroll_document')?.viewport?.y, 0.4);
+});
+
+test('scroll_document zooms into a detail crop when the human was viewing the full page', async () => {
+  const adapter = new PagedDocumentAdapter('full-page-view.pdf', {
+    sourceFormat: 'PDF', pageCount: 1,
+    pages: [{
+      number: 1, widthPoints: 120, heightPoints: 160, warningCount: 0, warnings: [],
+      svg: '<svg xmlns="http://www.w3.org/2000/svg" width="120" height="160" viewBox="0 0 120 160"><rect width="120" height="160" fill="white"/></svg>',
+    }],
+  } as unknown as PreviewReport, 'full-page-view');
+  const model = new ScriptedModel([
+    modelResponse([functionCall('get_document_outline', {}, { callId: 'full-view-outline' })]),
+    modelResponse([functionCall('inspect_page', {}, { callId: 'full-view-inspect' })]),
+    modelResponse([functionCall('scroll_document', { direction: 'down', amount: 0.1 }, { callId: 'full-view-scroll' })]),
+    modelResponder((call) => {
+      const output = Array.isArray(call.request.input)
+        ? call.request.input.find((item) => item.type === 'function_call_result' && item.name === 'scroll_document')
+        : undefined;
+      assert.ok(output);
+      const raw = 'output' in output ? output.output : undefined;
+      assert.ok(Array.isArray(raw));
+      const text = raw.find((item) => typeof item === 'object' && item.type === 'input_text');
+      assert.ok(text && 'text' in text && typeof text.text === 'string');
+      const result = JSON.parse(text.text) as { moved: boolean; viewport: { x: number; y: number; width: number; height: number } };
+      assert.equal(result.moved, true);
+      assert.ok(Math.abs(result.viewport.x - 0.16) < 1e-9);
+      assert.ok(Math.abs(result.viewport.y - 0.43) < 1e-9);
+      assert.ok(Math.abs(result.viewport.width - 0.68) < 1e-9);
+      assert.ok(Math.abs(result.viewport.height - 0.34) < 1e-9);
+      return [assistantMessage('The first scroll opened a centered detail crop.')];
+    }),
+  ]);
+
+  const result = await runDocumentAgent({
+    model: 'gpt-6-astra', reasoningEffort: 'low', instruction: 'Inspect this page for small details.',
+    guidelines: '', correction: '', humanDecisions: '', pageText: 'Full page text.',
+    imageDataUrl: 'data:image/png;base64,AA==', pageNumber: 1, totalPages: 1, mode: 'observe',
+    documentAdapters: [adapter], viewerAspectRatio: 1.5,
+    viewerViewport: { x: 0, y: 0, width: 1, height: 1 },
+  }, model);
+
+  model.assertComplete();
+  assert.equal(result.status, 'complete');
+  assert.equal(result.toolEvents.find((event) => event.toolName === 'scroll_document')?.status, 'complete');
+});
+
 test('get_selected_region returns the unique text region selected by select_text', async () => {
   const model = new ScriptedModel([
-    modelResponse([functionCall('get_document_outline', {}, { callId: 'text-region-outline' })]),
+    modelResponder((call) => {
+      assert.match(JSON.stringify(call.request.input), /No viewer annotation is selected by the user/);
+      return [functionCall('get_document_outline', {}, { callId: 'text-region-outline' })];
+    }),
     modelResponse([functionCall('inspect_page', {}, { callId: 'text-region-inspect' })]),
     modelResponse([functionCall('select_text', { text: '12 N-m' }, { callId: 'text-region-select' })]),
     modelResponse([functionCall('get_selected_region', {}, { callId: 'text-region-read' })]),

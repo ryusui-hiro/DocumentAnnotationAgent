@@ -208,6 +208,26 @@ function scrollAreaContentSize(area: HTMLElement) {
   };
 }
 
+function visiblePageViewport(area: HTMLElement | null, frame: HTMLElement | null): NormalizedTextBox | undefined {
+  if (!area || !frame) return undefined;
+  const visible = scrollAreaContentSize(area);
+  const areaStyle = window.getComputedStyle(area);
+  const pixels = (value: string) => Number.parseFloat(value) || 0;
+  const areaRect = area.getBoundingClientRect();
+  const frameRect = frame.getBoundingClientRect();
+  if (frameRect.width <= 0 || frameRect.height <= 0) return undefined;
+  const width = Math.max(0.001, Math.min(1, visible.width / frameRect.width));
+  const height = Math.max(0.001, Math.min(1, visible.height / frameRect.height));
+  const clipLeft = areaRect.left + area.clientLeft + pixels(areaStyle.paddingLeft);
+  const clipTop = areaRect.top + area.clientTop + pixels(areaStyle.paddingTop);
+  return {
+    x: clamp((clipLeft - frameRect.left) / frameRect.width, 0, 1 - width),
+    y: clamp((clipTop - frameRect.top) / frameRect.height, 0, 1 - height),
+    width,
+    height,
+  };
+}
+
 function parseDocument(payload: Record<string, unknown>): ConvertedDocument {
   return {
     documentId: String(payload.documentId ?? ''),
@@ -1979,6 +1999,7 @@ function App() {
     const effectiveScope = continuation
       ? continuation.fullDocument === undefined ? continuation.remainingPages.length > 1 ? 'all' : 'current' : continuation.fullDocument ? 'all' : 'current'
       : selectedMode === 'autopilot' ? 'all' : scope;
+    const startingPageNumber = pageNumber;
     const isWorkbook = documentData.fileType.toLowerCase() === 'xlsx';
     const envProviderMatches = (settings.provider === 'azure-openai' && health?.provider === 'azure') ||
       (settings.provider === 'openai-api' && health?.provider === 'openai');
@@ -2032,7 +2053,9 @@ function App() {
       setAgentContinuation(null);
     }
     setActiveTab('ai');
-    window.requestAnimationFrame(() => activityPanelRef.current?.scrollIntoView({ block: 'start', behavior: 'smooth' }));
+    if (!window.matchMedia('(max-width: 560px)').matches) {
+      window.requestAnimationFrame(() => activityPanelRef.current?.scrollIntoView({ block: 'start', behavior: 'smooth' }));
+    }
     setScanProgress({ current: 0, total: runTotalPages, scope: effectiveScope });
     let failure = '';
     let completedPages = activeAgentRunRef.current?.completedPages ?? 0;
@@ -2119,7 +2142,11 @@ function App() {
         setScanProgress({ current: useAgentNavigation ? Math.max(1, completedPages) : index + 1, total: runTotalPages, scope: effectiveScope });
         const navigationId = addAgentActivity('Navigating', `navigate_page({ page: ${targetPage} }) → opening page ${targetPage} of ${documentData.pageCount}.`, 'active', targetPage);
         setPageNumber(targetPage);
-        clearAgentViewport();
+        const preserveCurrentViewer = !continuation && effectiveScope === 'current' && targetPage === startingPageNumber && !isWorkbook;
+        const viewerViewport = preserveCurrentViewer
+          ? visiblePageViewport(pageScrollAreaRef.current, pageFrameRef.current)
+          : undefined;
+        if (!viewerViewport) clearAgentViewport();
         try {
           let workbookApprovalRunId: string | undefined;
           let workbookApprovalId: string | undefined;
@@ -2163,6 +2190,7 @@ function App() {
                 requireToolApproval: !workspaceBatchActiveRef.current,
                 selectedAnnotationId: selectedAnnotationSummary?.id,
                 viewerAspectRatio,
+                viewerViewport,
                 existingAnnotations: existingAnnotationsForRequest,
                 documentAnnotations: normalizeDocumentAnnotationRecords({ documentId: documentData.documentId, sourceHash: documentData.sourceHash, fileType: documentData.fileType, ...documentAnnotationView }),
                 settings: { ...settings, apiKey },
