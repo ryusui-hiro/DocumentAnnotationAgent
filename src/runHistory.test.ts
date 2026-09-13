@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { maxSavedAgentRuns, readAgentRunHistory, upsertAgentRunHistory, writeAgentRunHistory } from './runHistory';
+import { maxSavedAgentRuns, readAgentRunHistory, resolveHumanReviewStatus, upsertAgentRunHistory, writeAgentRunHistory } from './runHistory';
 import { localTaskPlan } from './taskPlan';
 import type { AgentRunHistory } from './types';
 
@@ -99,4 +99,27 @@ test('persists per-page coverage without treating unread or unprocessed pages as
   assert.equal(restored?.pageCoverage?.find((page) => page.pageNumber === 3)?.status, 'failed');
   assert.equal(restored?.pageCoverage?.some((page) => page.pageNumber === 4), false, 'unprocessed pages stay absent instead of looking like no-findings pages');
   assert.deepEqual(restored?.pageCoverageTargets, [1, 2, 3, 4]);
+});
+
+test('persists item-only decisions and versioned rules with explicit page scope', () => {
+  const storage = new MemoryStorage();
+  const entry = run('decision-run', 600, 'waiting');
+  entry.humanDecisions = [
+    { id: 'decision-item', action: 'correct', scope: 'item', sourceCandidateId: 'candidate-1', pageNumber: 1, text: 'Keep this clause at medium risk.', createdAt: 610 },
+    { id: 'decision-rule', action: 'correct', scope: 'remaining_pages', sourceCandidateId: 'candidate-2', pageNumber: 2, text: 'Treat missing approval as high risk.', createdAt: 620, ruleVersion: 1, appliesFromPage: 3 },
+  ];
+  entry.lastHumanRuleVersion = 7;
+  writeAgentRunHistory(storage, entry.fileName, [entry]);
+
+  const restored = readAgentRunHistory(storage, entry.fileName)[0];
+  assert.deepEqual(restored?.humanDecisions, entry.humanDecisions);
+  assert.equal(restored?.lastHumanRuleVersion, 7);
+});
+
+test('finishes a run after the final review only when every target page has valid coverage', () => {
+  const coverage = [{ pageNumber: 1, status: 'checked' as const, findingCount: 1, reviewCount: 0, warningCount: 0 }];
+  assert.deepEqual(resolveHumanReviewStatus(false, [1], coverage), { status: 'complete', coverageStillNeedsReview: false });
+  assert.deepEqual(resolveHumanReviewStatus(false, [1, 2], coverage), { status: 'waiting', coverageStillNeedsReview: true });
+  assert.deepEqual(resolveHumanReviewStatus(false, [1], [{ ...coverage[0], warningCount: 1 }]), { status: 'waiting', coverageStillNeedsReview: true });
+  assert.deepEqual(resolveHumanReviewStatus(true, [1], coverage), { status: 'waiting', coverageStillNeedsReview: false });
 });

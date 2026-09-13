@@ -1,5 +1,6 @@
 import type { AgentActivityEvent, AgentMode, AgentPageCoverage, AgentRunHistory, AnnotationCandidate, AnnotationReviewPriority, NormalizedTextBox, PageCoverageStatus, TextAnchor } from './types';
 import { parseTaskPlan } from './taskPlan';
+import { readHumanDecisionRecords } from './humanDecisionScope';
 
 const historyPrefix = 'annotation-studio:run-history:';
 export const maxSavedAgentRuns = 20;
@@ -7,6 +8,20 @@ const maxEventsPerRun = 48;
 const maxEventDetailLength = 1200;
 const maxObservationFindingsPerRun = 100;
 const maxObservationFieldLength = 1000;
+const maxHumanDecisionsPerRun = 100;
+
+export function resolveHumanReviewStatus(
+  hasPendingReview: boolean,
+  targets: number[] | undefined,
+  pageCoverage: AgentPageCoverage[] | undefined,
+): { status: 'waiting' | 'complete'; coverageStillNeedsReview: boolean } {
+  const covered = new Map((pageCoverage ?? []).map((item) => [item.pageNumber, item]));
+  const coverageStillNeedsReview = (targets ?? []).some((page) => {
+    const item = covered.get(page);
+    return !item || item.status !== 'checked' || item.warningCount > 0;
+  });
+  return { status: hasPendingReview || coverageStillNeedsReview ? 'waiting' : 'complete', coverageStillNeedsReview };
+}
 
 type HistoryStorage = Pick<Storage, 'getItem' | 'setItem'>;
 
@@ -126,6 +141,9 @@ function readEntry(value: unknown, fileName: string): AgentRunHistory | null {
   const pageCoverageTargets = Array.isArray(value.pageCoverageTargets)
     ? [...new Set(value.pageCoverageTargets.map(Number).filter((page) => Number.isInteger(page) && page >= 1 && page <= 120))].slice(0, 120)
     : undefined;
+  const humanDecisions = Array.isArray(value.humanDecisions) ? readHumanDecisionRecords(value.humanDecisions).slice(-maxHumanDecisionsPerRun) : undefined;
+  const recordedRuleVersion = humanDecisions?.reduce((maximum, decision) => Math.max(maximum, decision.ruleVersion ?? 0), 0) ?? 0;
+  const storedRuleVersion = Number.isInteger(value.lastHumanRuleVersion) ? Math.max(0, Math.min(100_000, Number(value.lastHumanRuleVersion))) : 0;
   return {
     id: value.id.slice(0, 100),
     fileName,
@@ -143,6 +161,8 @@ function readEntry(value: unknown, fileName: string): AgentRunHistory | null {
     ...(observationFindingOverflow > 0 ? { observationFindingOverflow } : {}),
     ...(pageCoverageTargets ? { pageCoverageTargets } : {}),
     ...(Array.isArray(value.pageCoverage) ? { pageCoverage: readPageCoverage(value.pageCoverage) } : {}),
+    ...(humanDecisions?.length ? { humanDecisions } : {}),
+    ...(Math.max(recordedRuleVersion, storedRuleVersion) > 0 ? { lastHumanRuleVersion: Math.max(recordedRuleVersion, storedRuleVersion) } : {}),
     events,
   };
 }
@@ -180,6 +200,8 @@ export function upsertAgentRunHistory(current: AgentRunHistory[], entry: AgentRu
     } : {}),
     ...(item.pageCoverageTargets ? { pageCoverageTargets: [...new Set(item.pageCoverageTargets.filter((page) => Number.isInteger(page) && page >= 1 && page <= 120))].slice(0, 120) } : {}),
     ...(item.pageCoverage ? { pageCoverage: readPageCoverage(item.pageCoverage) } : {}),
+    ...(item.humanDecisions ? { humanDecisions: readHumanDecisionRecords(item.humanDecisions).slice(-maxHumanDecisionsPerRun) } : {}),
+    ...(Number.isInteger(item.lastHumanRuleVersion) && item.lastHumanRuleVersion! > 0 ? { lastHumanRuleVersion: Math.min(100_000, item.lastHumanRuleVersion!) } : {}),
   }));
 }
 

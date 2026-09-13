@@ -250,6 +250,13 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .run-history-item > summary span:first-child { width: 100%; color: #7a888e; font-weight: 500; }
 .run-history-instruction, .run-history-summary { margin: 6px 0; color: #627178; font-size: 8px; line-height: 1.45; overflow-wrap: anywhere; }
 .run-history-summary { color: #32827a; }
+.run-human-decisions { display: grid; gap: 5px; margin: 7px 0; padding: 7px; border: 1px solid #e1e8e7; border-radius: 5px; background: #f8fbfa; color: #627276; font-size: 8px; }
+.run-human-decisions ol { display: grid; gap: 5px; margin: 0; padding: 0; list-style: none; }
+.run-human-decisions li { display: grid; gap: 3px; padding: 5px; border-radius: 4px; background: #fff; }
+.run-human-decision-meta { display: flex; align-items: center; gap: 6px; color: #75858a; font-size: 7px; }
+.run-human-decision-meta span:first-child { color: #257873; font-weight: 700; }
+.run-human-decision-meta .candidate-page { margin-left: auto; }
+.run-human-decisions li p { margin: 0; color: #56666c; font-size: 8px; line-height: 1.4; overflow-wrap: anywhere; }
 .run-page-coverage { display: grid; gap: 5px; margin: 8px 0; padding: 7px; border: 1px solid #e2e9e8; border-radius: 5px; background: #f9fbfb; }
 .run-page-coverage-heading { display: flex; align-items: center; justify-content: space-between; color: #52636a; font-size: 8px; }
 .run-page-coverage-heading span { color: #68827f; font-variant-numeric: tabular-nums; }

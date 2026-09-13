@@ -4,10 +4,11 @@ import ExcelJS from 'exceljs';
 import JSZip from 'jszip';
 import { SpreadsheetDocumentAdapter } from './spreadsheetAdapter';
 
-async function createSourceWorkbook() {
+async function createSourceWorkbook(withTitleRows = false) {
   const workbook = new ExcelJS.Workbook();
   const customers = workbook.addWorksheet('Customers');
   customers.addRows([
+    ...(withTitleRows ? [['Customer churn review'], ['Internal use only']] : []),
     ['Name', 'Last login', 'Tickets'],
     ['Aki', '2026-09-01', 0],
     ['Mina', '2026-01-05', 8],
@@ -36,24 +37,37 @@ test('opens workbook outline, inspects sheets, and reads bounded cell ranges', a
   assert.deepEqual(adapter.search('Mina')[0]?.location, { kind: 'sheet', sheetName: 'Customers', range: 'A3' });
 });
 
-test('stages cell and column edits, applies only approved changes, and exports a separate workbook', async () => {
-  const source = await createSourceWorkbook();
+test('supports a table header row beyond the initial preview sample', async () => {
+  const workbook = new ExcelJS.Workbook();
+  const sheet = workbook.addWorksheet('Details');
+  sheet.getCell('A21').value = 'Name';
+  sheet.getCell('A22').value = 'Mina';
+  const adapter = await SpreadsheetDocumentAdapter.fromBuffer('details.xlsx', Buffer.from(await workbook.xlsx.writeBuffer()));
+  const change = adapter.createColumn('Details', 'Review', 21, 'Add a result beside the table header.', { requiresReview: false });
+  assert.equal(change.range, 'B21');
+  assert.equal(adapter.readRange('Details', 'B21').rows[0]?.[0]?.value, 'Review');
+});
+
+test('stages cell and column edits at the selected table header row, applies only approved changes, and exports a separate workbook', async () => {
+  const source = await createSourceWorkbook(true);
   const untouchedSource = Buffer.from(source);
   const adapter = await SpreadsheetDocumentAdapter.fromBuffer('customers.xlsx', source);
 
-  const riskColumn = adapter.createColumn('Customers', 'Churn Risk', 1, 'Classify each customer.', { requiresReview: true, id: 'proposal-column' });
-  assert.equal(riskColumn.range, 'D1');
-  assert.equal(adapter.readRange('Customers', 'D1').rows[0]?.[0]?.value, null);
+  const riskColumn = adapter.createColumn('Customers', 'Churn Risk', 3, 'Classify each customer.', { requiresReview: true, id: 'proposal-column' });
+  assert.equal(riskColumn.range, 'D3');
+  assert.equal(adapter.readRange('Customers', 'D3').rows[0]?.[0]?.value, null);
   adapter.approveChange(riskColumn.id);
-  assert.equal(adapter.readRange('Customers', 'D1').rows[0]?.[0]?.value, 'Churn Risk');
+  assert.equal(adapter.readRange('Customers', 'A1').rows[0]?.[0]?.value, 'Customer churn review');
+  assert.equal(adapter.readRange('Customers', 'B2').rows[0]?.[0]?.value, null);
+  assert.equal(adapter.readRange('Customers', 'D3').rows[0]?.[0]?.value, 'Churn Risk');
 
-  const rejected = adapter.writeCell('Customers', 'D2', 'LOW', 'Aki has no support tickets.', 0.96, true, 'rejected-cell');
+  const rejected = adapter.writeCell('Customers', 'D4', 'LOW', 'Aki has no support tickets.', 0.96, true, 'rejected-cell');
   adapter.rejectChange(rejected.id);
-  assert.equal(adapter.readRange('Customers', 'D2').rows[0]?.[0]?.value, null);
+  assert.equal(adapter.readRange('Customers', 'D4').rows[0]?.[0]?.value, null);
 
-  const accepted = adapter.writeRange('Customers', 'D2', [['LOW'], ['HIGH']], 'Risk classification based on activity.', 0.91, true, 'approved-range');
+  const accepted = adapter.writeRange('Customers', 'D4', [['LOW'], ['HIGH']], 'Risk classification based on activity.', 0.91, true, 'approved-range');
   adapter.approveChange(accepted.id);
-  assert.deepEqual(adapter.readRange('Customers', 'D2:D3').rows.map((row) => row[0]?.value), ['LOW', 'HIGH']);
+  assert.deepEqual(adapter.readRange('Customers', 'D4:D5').rows.map((row) => row[0]?.value), ['LOW', 'HIGH']);
   assert.equal(adapter.getChanges().find((change) => change.id === 'approved-range')?.approved, true);
   assert.equal(adapter.getChanges().find((change) => change.id === 'rejected-cell')?.rejected, true);
 
@@ -62,15 +76,17 @@ test('stages cell and column edits, applies only approved changes, and exports a
   assert.equal(exportResult.fileName, 'customers-annotated.xlsx');
   assert.equal(exportResult.annotationsExported, 2);
   const reopened = await SpreadsheetDocumentAdapter.fromBuffer('customers.annotated.xlsx', exported);
-  assert.equal(reopened.readRange('Customers', 'D1').rows[0]?.[0]?.value, 'Churn Risk');
-  assert.deepEqual(reopened.readRange('Customers', 'D2:D3').rows.map((row) => row[0]?.value), ['LOW', 'HIGH']);
+  assert.equal(reopened.readRange('Customers', 'A1').rows[0]?.[0]?.value, 'Customer churn review');
+  assert.equal(reopened.readRange('Customers', 'D3').rows[0]?.[0]?.value, 'Churn Risk');
+  assert.deepEqual(reopened.readRange('Customers', 'D4:D5').rows.map((row) => row[0]?.value), ['LOW', 'HIGH']);
   assert.equal(reopened.readRange('Notes', 'A1').rows[0]?.[0]?.value, 'Keep this sheet');
   assert.deepEqual(source, untouchedSource, 'the uploaded source bytes stay unchanged');
 
   const restored = await SpreadsheetDocumentAdapter.fromSavedState('customers.xlsx', exported, adapter.getChanges());
   assert.deepEqual(restored.getChanges(), adapter.getChanges(), 'review and approval records are restored with the working workbook');
-  assert.equal(restored.readRange('Customers', 'D1').rows[0]?.[0]?.value, 'Churn Risk');
-  assert.deepEqual(restored.readRange('Customers', 'D2:D3').rows.map((row) => row[0]?.value), ['LOW', 'HIGH']);
+  assert.equal(restored.readRange('Customers', 'A1').rows[0]?.[0]?.value, 'Customer churn review');
+  assert.equal(restored.readRange('Customers', 'D3').rows[0]?.[0]?.value, 'Churn Risk');
+  assert.deepEqual(restored.readRange('Customers', 'D4:D5').rows.map((row) => row[0]?.value), ['LOW', 'HIGH']);
 });
 
 test('opens default-namespace drawing XML and preserves embedded images when exporting edits', async () => {

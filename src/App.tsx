@@ -33,16 +33,16 @@ import {
   createSvgPreviewUrl,
   revokeSvgPreviewUrl,
 } from 'document-svg/preview-ui';
-import type { AgentActivityEvent, AgentActivityPhase, AgentMode, AgentPageCoverage, AgentRunHistory, AgentRunStatus, Annotation, AnnotationCandidate, AnnotationReviewPriority, ApiHealth, AppSettings, CodexModel, ConvertedDocument, ConvertedPage, DocumentAnnotationOperation, DocumentAnnotationRecord, ModelId, NormalizedTextBox, PreparedDocumentExport, ProviderId, SpreadsheetCellChange, TokenUsage, UsageTotals, WorkbookSessionSummary, WorkspaceDocumentEntry, WorkspaceProject } from './types';
+import type { AgentActivityEvent, AgentActivityPhase, AgentMode, AgentPageCoverage, AgentHumanDecisionRecord, AgentRunHistory, AgentRunStatus, Annotation, AnnotationCandidate, AnnotationReviewPriority, ApiHealth, AppSettings, CodexModel, ConvertedDocument, ConvertedPage, DocumentAnnotationOperation, DocumentAnnotationRecord, ModelId, NormalizedTextBox, PreparedDocumentExport, ProviderId, SpreadsheetCellChange, TokenUsage, UsageTotals, WorkbookSessionSummary, WorkspaceDocumentEntry, WorkspaceProject } from './types';
 import SettingsDialog from './components/SettingsDialog';
 import { apiFetch } from './api';
 import { consumeAgentStream, type LiveToolActivity } from './agentStream';
-import { readAgentRunHistory, upsertAgentRunHistory, writeAgentRunHistory } from './runHistory';
+import { readAgentRunHistory, resolveHumanReviewStatus, upsertAgentRunHistory, writeAgentRunHistory } from './runHistory';
 import { localTaskPlan, parseTaskPlan, taskPlanAsInstructions, taskPlanSignature, type AnnotationTaskPlan, type TaskPlanSource } from './taskPlan';
 import { findInconsistentRepeatedExcerpts, restoreAnnotationConsistencyIssues, type AnnotationConsistencyIssue } from './consistency';
 import { normalizeDocumentAnnotationRecords, readStoredDocumentAnnotationRecords, resolveCandidateReview, restoreDocumentAnnotationRecords } from './documentAnnotations';
 import { mergePreparedDocumentExports, restorePreparedDocumentExports } from './preparedExports';
-import { recordHumanDecision, type HumanDecisionScope } from './humanDecisionScope';
+import { createHumanDecisionRecord, readHumanDecisionRecords, recordHumanDecision, type HumanDecisionScope } from './humanDecisionScope';
 import { isSupportedWorkspaceFile, loadWorkspaceProject, maxWorkspaceDocuments, saveWorkspaceProject, shouldIgnoreWorkspaceDirectory } from './workspace';
 import { readWorkspaceState, writeWorkspaceState } from './workspaceState';
 import {
@@ -110,6 +110,8 @@ type AgentContinuation = {
   correction: string;
   decisionContext: string;
   pageDecisionContext?: string;
+  humanDecisions?: AgentHumanDecisionRecord[];
+  lastHumanRuleVersion?: number;
   approvalRunId?: string;
   approvalId?: string;
   runHistoryId?: string;
@@ -620,6 +622,8 @@ function App() {
                   correction: String(pending.correction ?? ''),
                   decisionContext: String(pending.decisionContext ?? '').slice(0, 4000),
                   pageDecisionContext: String(pending.pageDecisionContext ?? '').slice(0, 4000),
+                  humanDecisions: readHumanDecisionRecords(pending.humanDecisions),
+                  ...(Number.isInteger(pending.lastHumanRuleVersion) ? { lastHumanRuleVersion: Math.max(0, Math.min(100_000, Number(pending.lastHumanRuleVersion))) } : {}),
                   ...(typeof pending.approvalRunId === 'string' ? { approvalRunId: pending.approvalRunId } : {}),
                   ...(typeof pending.approvalId === 'string' ? { approvalId: pending.approvalId } : {}),
                   ...(typeof pending.runHistoryId === 'string' ? { runHistoryId: pending.runHistoryId } : {}),
@@ -1535,42 +1539,75 @@ function App() {
 
   function continueAfterHumanDecision(candidate: AnnotationCandidate, decision: 'approved' | 'rejected', options?: { decisionText?: string; sdkApproved?: boolean; scope?: HumanDecisionScope }) {
     const continuation = agentContinuation;
+    if (continuation && candidate.pageNumber !== continuation.blockedPage) return;
+    const action = options?.sdkApproved === false ? 'correct' : decision === 'approved' ? 'approve' : 'reject';
+    const requestedScope = options?.scope ?? 'item';
+    const scope: HumanDecisionScope = requestedScope === 'remaining_pages' && Boolean(continuation?.remainingPages.length)
+      ? 'remaining_pages'
+      : 'item';
+    const decisionText = (options?.decisionText ?? `人が${decision === 'approved' ? '確定' : '却下'}: P.${candidate.pageNumber} ${candidate.label}: ${candidate.excerpt || candidate.note}`).slice(0, 1000);
+    const historyRun = continuation?.runHistoryId
+      ? agentRunHistoryRef.current.find((run) => run.id === continuation.runHistoryId)
+      : agentRunHistoryRef.current.find((run) => run.status === 'waiting' && run.fileName === documentData?.fileName && run.sourceHash === documentData?.sourceHash);
+    const previousDecisions = [...new Map([...(historyRun?.humanDecisions ?? []), ...(continuation?.humanDecisions ?? [])].map((item) => [item.id, item])).values()];
+    const previousRuleVersion = Math.max(historyRun?.lastHumanRuleVersion ?? 0, continuation?.lastHumanRuleVersion ?? 0);
+    const appliesFromPage = scope === 'remaining_pages' ? continuation?.remainingPages[0] : undefined;
+    const humanDecision = createHumanDecisionRecord(previousDecisions, {
+      id: crypto.randomUUID(),
+      action,
+      scope,
+      sourceCandidateId: candidate.id,
+      pageNumber: candidate.pageNumber,
+      text: decisionText,
+      createdAt: Date.now(),
+      ...(appliesFromPage ? { appliesFromPage } : {}),
+    }, previousRuleVersion);
+    const humanDecisions = [...previousDecisions, humanDecision].slice(-100);
+    const lastHumanRuleVersion = Math.max(previousRuleVersion, humanDecision.ruleVersion ?? 0);
+    const decisionContexts = recordHumanDecision(continuation ?? {}, decisionText, humanDecision);
     if (!continuation) {
-      if (candidates.some((item) => item.id !== candidate.id)
+      const hasPendingReview = candidates.some((item) => item.id !== candidate.id)
         || spreadsheetChanges.some((change) => change.requiresReview && !change.approved && !change.rejected)
-        || annotationOperations.some((operation) => operation.status === 'needs_review')) return;
+        || annotationOperations.some((operation) => operation.status === 'needs_review');
       const latestWaiting = agentRunHistoryRef.current.find((run) => run.status === 'waiting' && run.fileName === documentData?.fileName && run.sourceHash === documentData?.sourceHash);
       if (latestWaiting) {
-        const targets = latestWaiting.pageCoverageTargets ?? [];
-        const covered = new Map((latestWaiting.pageCoverage ?? []).map((item) => [item.pageNumber, item]));
-        const coverageStillNeedsReview = targets.some((page) => {
-          const item = covered.get(page);
-          return !item || item.status !== 'checked' || item.warningCount > 0;
-        });
-        persistRunHistoryEntry({
+        const updatedDecisions = readHumanDecisionRecords([...(latestWaiting.humanDecisions ?? []), humanDecision]);
+        const outcome = resolveHumanReviewStatus(hasPendingReview, latestWaiting.pageCoverageTargets, latestWaiting.pageCoverage);
+        const updatedRun: AgentRunHistory = {
           ...latestWaiting,
-          status: coverageStillNeedsReview ? 'waiting' : 'complete',
+          humanDecisions: updatedDecisions,
+          lastHumanRuleVersion,
+          status: outcome.status,
           endedAt: Date.now(),
-          summary: coverageStillNeedsReview ? 'Human review is resolved; the page coverage list still has items to inspect.' : 'Human review is complete.',
-        });
+          summary: hasPendingReview
+            ? 'Human decision recorded; additional reviews remain.'
+            : outcome.coverageStillNeedsReview
+              ? 'Human review is resolved; the page coverage list still has items to inspect.'
+              : 'Human review is complete.',
+        };
+        persistRunHistoryEntry(updatedRun);
+        if (activeAgentRunRef.current?.id === updatedRun.id) activeAgentRunRef.current = updatedRun;
       }
       return;
     }
-    if (candidate.pageNumber !== continuation.blockedPage) return;
     const actionLabel = options?.sdkApproved === false ? '修正' : decision === 'approved' ? '承認' : '却下';
     const anotherCandidateOnBlockedPage = candidates.some((item) => item.id !== candidate.id && item.pageNumber === continuation.blockedPage);
-    const scope = options?.scope ?? 'item';
-    const decisionText = options?.decisionText ?? `人が${decision === 'approved' ? '確定' : '却下'}: P.${candidate.pageNumber} ${candidate.label}: ${candidate.excerpt || candidate.note}`;
-    const decisionContexts = recordHumanDecision(continuation, decisionText, scope);
     const currentApprovalDecision = candidate.approvalId && candidate.approvalRunId === continuation.approvalRunId
       ? { approved: options?.sdkApproved ?? decision === 'approved', note: decisionContexts.pageDecisionContext }
       : continuation.pendingApprovalDecision;
     const updatedContinuation = {
       ...continuation,
       ...decisionContexts,
+      humanDecisions,
+      lastHumanRuleVersion,
       pendingApprovalDecision: currentApprovalDecision,
-      ...(options?.sdkApproved === false ? { humanCorrections: (continuation.humanCorrections ?? 0) + 1 } : {}),
+      ...(options?.sdkApproved === false && scope === 'remaining_pages' ? { humanCorrections: (continuation.humanCorrections ?? 0) + 1 } : {}),
     };
+    if (historyRun) {
+      const updatedRun = { ...historyRun, humanDecisions, lastHumanRuleVersion };
+      persistRunHistoryEntry(updatedRun);
+      if (activeAgentRunRef.current?.id === updatedRun.id) activeAgentRunRef.current = updatedRun;
+    }
     if (anotherCandidateOnBlockedPage) {
       setAgentContinuation(updatedContinuation);
       setAgentStatus('waiting');
@@ -1594,8 +1631,29 @@ function App() {
       setAgentStatus('running');
       void resumeAgentRef.current?.(updatedContinuation);
     } else {
+      const hasPendingReview = candidates.some((item) => item.id !== candidate.id)
+        || spreadsheetChanges.some((change) => change.requiresReview && !change.approved && !change.rejected)
+        || annotationOperations.some((operation) => operation.status === 'needs_review');
+      const outcome = resolveHumanReviewStatus(hasPendingReview, historyRun?.pageCoverageTargets, historyRun?.pageCoverage);
+      if (historyRun) {
+        const updatedRun: AgentRunHistory = {
+          ...historyRun,
+          humanDecisions,
+          lastHumanRuleVersion,
+          status: outcome.status,
+          endedAt: Date.now(),
+          summary: hasPendingReview
+            ? 'Human decision recorded; additional reviews remain.'
+            : outcome.coverageStillNeedsReview
+              ? 'Human review is resolved; the page coverage list still has items to inspect.'
+              : 'Human review is complete.',
+        };
+        persistRunHistoryEntry(updatedRun);
+        if (activeAgentRunRef.current?.id === updatedRun.id) activeAgentRunRef.current = updatedRun;
+      }
       setAgentContinuation(null);
-      setAgentStatus(candidates.some((item) => item.id !== candidate.id) ? 'waiting' : 'complete');
+      setAgentStatus(outcome.status);
+      if (documentData) autoSaveDocumentWorkspace(documentData.fileName);
     }
   }
 
@@ -1844,6 +1902,8 @@ function App() {
         events: [],
         pageCoverageTargets: coverageTargetPages,
         pageCoverage: [],
+        ...(continuation?.humanDecisions?.length ? { humanDecisions: continuation.humanDecisions } : {}),
+        ...(continuation?.lastHumanRuleVersion ? { lastHumanRuleVersion: continuation.lastHumanRuleVersion } : {}),
         ...(selectedMode === 'observe' ? { observationFindings: [] } : {}),
       };
     }
@@ -2168,6 +2228,8 @@ function App() {
               guidelines: taskGuidelines,
               correction: taskCorrection,
               decisionContext: continuation?.decisionContext ?? '',
+              humanDecisions: continuation?.humanDecisions ?? [],
+              ...(continuation?.lastHumanRuleVersion ? { lastHumanRuleVersion: continuation.lastHumanRuleVersion } : {}),
               ...((toolApprovalCandidate?.approvalRunId ?? pendingAnnotationOperation?.approvalRunId ?? workbookApprovalRunId) ? { approvalRunId: toolApprovalCandidate?.approvalRunId ?? pendingAnnotationOperation?.approvalRunId ?? workbookApprovalRunId } : {}),
               ...((toolApprovalCandidate?.approvalId ?? pendingAnnotationOperation?.approvalId ?? workbookApprovalId) ? { approvalId: toolApprovalCandidate?.approvalId ?? pendingAnnotationOperation?.approvalId ?? workbookApprovalId } : {}),
               ...(activeAgentRunRef.current?.id ? { runHistoryId: activeAgentRunRef.current.id } : {}),
@@ -3002,6 +3064,19 @@ function App() {
                           </summary>
                           <p className="run-history-instruction">{run.instruction}</p>
                           {run.summary && <p className="run-history-summary">{run.summary}</p>}
+                          {run.humanDecisions?.length ? <section className="run-human-decisions" aria-label="Saved human decisions">
+                            <strong>人の判断・修正ルール</strong>
+                            <ol>
+                              {run.humanDecisions.map((item) => <li key={item.id}>
+                                <div className="run-human-decision-meta">
+                                  <span>{item.action === 'correct' ? '修正' : item.action === 'approve' ? '承認' : '却下'}</span>
+                                  <span>{item.scope === 'remaining_pages' ? `残りページのルール v${item.ruleVersion} · P.${item.appliesFromPage}以降` : 'この候補のみ'}</span>
+                                  <button type="button" className="candidate-page" onClick={() => goToPage(item.pageNumber)}>P.{item.pageNumber}</button>
+                                </div>
+                                <p>{item.text}</p>
+                              </li>)}
+                            </ol>
+                          </section> : null}
                           {run.pageCoverage?.length || run.pageCoverageTargets?.length ? <section className="run-page-coverage" aria-label="Page coverage">
                             <div className="run-page-coverage-heading"><strong>ページ確認範囲</strong><span>{(run.pageCoverage ?? []).filter((item) => item.status === 'checked').length}/{run.pageCoverageTargets?.length ?? run.totalPages} テキスト確認</span></div>
                             <p className="run-page-coverage-summary">
@@ -3133,8 +3208,8 @@ function App() {
                           <summary>変更して確定</summary>
                           <label>修正ラベル<input value={candidateCorrections[candidate.id]?.label ?? candidate.label} onChange={(event) => setCandidateCorrections((items) => ({ ...items, [candidate.id]: { label: event.target.value, note: items[candidate.id]?.note ?? candidate.note } }))} maxLength={60} /></label>
                           <label>修正メモ<textarea value={candidateCorrections[candidate.id]?.note ?? candidate.note} onChange={(event) => setCandidateCorrections((items) => ({ ...items, [candidate.id]: { label: items[candidate.id]?.label ?? candidate.label, note: event.target.value } }))} maxLength={500} /></label>
-                          <label>修正の適用範囲<select value={candidateCorrectionScopes[candidate.id] ?? 'item'} onChange={(event) => setCandidateCorrectionScopes((items) => ({ ...items, [candidate.id]: event.target.value as HumanDecisionScope }))}><option value="item">この候補だけ（初期設定）</option><option value="remaining_pages">残りのページにも適用するルール</option></select></label>
-                          <small>「この候補だけ」は他の候補の判断基準に使いません。</small>
+                          <label>修正の適用範囲<select value={candidateCorrectionScopes[candidate.id] ?? 'item'} onChange={(event) => setCandidateCorrectionScopes((items) => ({ ...items, [candidate.id]: event.target.value as HumanDecisionScope }))}><option value="item">この候補だけ（初期設定）</option><option value="remaining_pages" disabled={!agentContinuation?.remainingPages.length}>残りのページにも適用するルール</option></select></label>
+                          <small>{agentContinuation?.remainingPages.length ? 'この候補だけの修正は別ページへ適用しません。ルールにすると、適用開始ページと版番号を履歴に保存します。' : '残りのページはありません。修正はこの候補だけに適用します。'}</small>
                           <button type="button" className="candidate-add" disabled={working} onClick={() => correctCandidate(candidate)}><Check size={14} /> 変更を反映して続行</button>
                         </details>
                         <div className="candidate-actions"><button type="button" className="candidate-add" onClick={() => addCandidate(candidate)}><Check size={14} /> 確認して追加</button><button type="button" className="candidate-reject" onClick={() => rejectCandidate(candidate)}>却下</button></div>

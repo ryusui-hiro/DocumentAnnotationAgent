@@ -366,6 +366,8 @@ test('concurrent duplicate approvals cannot apply the same workbook mutation twi
 test('the workbook tools inspect and edit a sheet, pausing and resuming the same RunState for each write', async () => {
   const workbook = new ExcelJS.Workbook();
   workbook.addWorksheet('Customers').addRows([
+    ['Customer churn review'],
+    ['Internal use only'],
     ['Name', 'Tickets'],
     ['Aki', 0],
     ['Mina', 8],
@@ -376,10 +378,10 @@ test('the workbook tools inspect and edit a sheet, pausing and resuming the same
     modelResponse([functionCall('inspect_page', {}, { callId: 'xlsx-inspect' })]),
     modelResponse([functionCall('get_workbook_outline', {}, { callId: 'xlsx-workbook' })]),
     modelResponse([functionCall('inspect_sheet', { sheetName: 'Customers' }, { callId: 'xlsx-sheet' })]),
-    modelResponse([functionCall('read_range', { sheetName: 'Customers', range: 'A1:B3' }, { callId: 'xlsx-range' })]),
+    modelResponse([functionCall('read_range', { sheetName: 'Customers', range: 'A1:B5' }, { callId: 'xlsx-range' })]),
     modelResponse([functionCall('search_document', { query: 'Mina' }, { callId: 'xlsx-global-search' })]),
-    modelResponse([functionCall('create_column', { sheetName: 'Customers', header: 'Churn Risk', reason: 'Add a column for risk labels.', reviewPriority: 'medium' }, { callId: 'xlsx-column' })]),
-    modelResponse([functionCall('write_cell', { sheetName: 'Customers', address: 'C2', value: 'LOW', reason: 'No support tickets indicate low risk.', confidence: 0.94, reviewPriority: 'low' }, { callId: 'xlsx-cell' })]),
+    modelResponse([functionCall('create_column', { sheetName: 'Customers', header: 'Churn Risk', headerRow: 3, reason: 'Add a column for risk labels beside the customer table.', reviewPriority: 'medium' }, { callId: 'xlsx-column' })]),
+    modelResponse([functionCall('write_cell', { sheetName: 'Customers', address: 'C4', value: 'LOW', reason: 'No support tickets indicate low risk.', confidence: 0.94, reviewPriority: 'low' }, { callId: 'xlsx-cell' })]),
     modelResponse([assistantMessage('The workbook was classified with approved changes.')]),
   ]);
 
@@ -392,19 +394,22 @@ test('the workbook tools inspect and edit a sheet, pausing and resuming the same
   assert.equal(pausedColumn.status, 'interrupted');
   assert.equal(pausedColumn.toolEvents.some((event) => event.toolName === 'search_document'), true);
   assert.equal(pausedColumn.spreadsheetChanges?.[0]?.operation, 'create_column');
-  assert.equal(adapter.readRange('Customers', 'C1').rows[0]?.[0]?.value, null);
+  assert.equal(pausedColumn.spreadsheetChanges?.[0]?.range, 'C3');
+  assert.equal(adapter.readRange('Customers', 'C3').rows[0]?.[0]?.value, null);
 
   const pausedCell = await resumeDocumentAgentRun({ runId: pausedColumn.approvalRunId!, approvalId: pausedColumn.approvalId!, approved: true });
   assert.equal(pausedCell.status, 'interrupted');
   assert.equal(pausedCell.spreadsheetChanges?.find((change) => change.id === pausedColumn.approvalId)?.approved, true);
-  assert.equal(adapter.readRange('Customers', 'C1').rows[0]?.[0]?.value, 'Churn Risk');
-  assert.equal(adapter.readRange('Customers', 'C2').rows[0]?.[0]?.value, null);
+  assert.equal(adapter.readRange('Customers', 'A1').rows[0]?.[0]?.value, 'Customer churn review');
+  assert.equal(adapter.readRange('Customers', 'C1').rows[0]?.[0]?.value, null);
+  assert.equal(adapter.readRange('Customers', 'C3').rows[0]?.[0]?.value, 'Churn Risk');
+  assert.equal(adapter.readRange('Customers', 'C4').rows[0]?.[0]?.value, null);
 
   const completed = await resumeDocumentAgentRun({ runId: pausedCell.approvalRunId!, approvalId: pausedCell.approvalId!, approved: true });
   model.assertComplete();
   assert.equal(completed.status, 'complete');
   assert.equal(completed.spreadsheetChanges?.find((change) => change.id === pausedCell.approvalId)?.approved, true);
-  assert.equal(adapter.readRange('Customers', 'C2').rows[0]?.[0]?.value, 'LOW');
+  assert.equal(adapter.readRange('Customers', 'C4').rows[0]?.[0]?.value, 'LOW');
 });
 
 test('rejecting an Excel cell write resumes the same RunState and leaves the workbook unchanged', async () => {

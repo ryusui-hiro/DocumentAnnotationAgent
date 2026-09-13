@@ -34,6 +34,22 @@ export interface AgentPageCoverage {
   detail?: string;
 }
 
+export type HumanDecisionScope = 'item' | 'remaining_pages';
+export type HumanDecisionAction = 'approve' | 'correct' | 'reject';
+
+export interface AgentHumanDecisionRecord {
+  id: string;
+  action: HumanDecisionAction;
+  scope: HumanDecisionScope;
+  sourceCandidateId: string;
+  pageNumber: number;
+  text: string;
+  createdAt: number;
+  /** Present only for a rule explicitly applied to later pages. */
+  ruleVersion?: number;
+  appliesFromPage?: number;
+}
+
 export interface AgentRunHistory {
   id: string;
   fileName: string;
@@ -51,6 +67,9 @@ export interface AgentRunHistory {
   observationFindingOverflow?: number;
   pageCoverageTargets?: number[];
   pageCoverage?: AgentPageCoverage[];
+  humanDecisions?: AgentHumanDecisionRecord[];
+  /** Monotonic across the whole run even when older decision records are pruned. */
+  lastHumanRuleVersion?: number;
   events: AgentActivityEvent[];
 }
 

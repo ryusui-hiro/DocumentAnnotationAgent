@@ -340,19 +340,19 @@ export class SpreadsheetDocumentAdapter implements DocumentAdapter, SpreadsheetI
     return { sheetName: worksheet.name, range: `${cellAddress(parsed.start.row, parsed.start.column)}:${cellAddress(parsed.end.row, parsed.end.column)}`, rows, cellCount: parsed.count };
   }
 
-  createColumn(sheetName: string, header: string, headerRow = 1, reason = 'Created by the document agent.', options: { requiresReview?: boolean; id?: string } = {}) {
+  createColumn(sheetName: string, header: string, headerRow: number, reason = 'Created by the document agent.', options: { requiresReview?: boolean; id?: string } = {}) {
     const worksheet = this.getWorksheet(sheetName);
     if (!header.trim() || header.length > 120) throw fail('Column header must contain 1 to 120 characters.');
-    if (!Number.isInteger(headerRow) || headerRow < 1 || headerRow > 20) throw fail('Header row must be between 1 and 20.');
+    if (!Number.isInteger(headerRow) || headerRow < 1 || headerRow > maxWorkbookRows) throw fail('Header row is outside the supported worksheet range.');
     const row = worksheet.getRow(headerRow);
     const address = this.nextEmptyColumnAddress(sheetName, headerRow);
     if (!options.requiresReview) row.getCell(parseCellAddress(address).column).value = header.trim();
     return this.recordChange({ operation: 'create_column', sheetName: worksheet.name, range: address, values: [[header.trim()]], reason, requiresReview: Boolean(options.requiresReview), ...(options.requiresReview ? {} : { approved: true }) }, options.id);
   }
 
-  nextEmptyColumnAddress(sheetName: string, headerRow = 1) {
+  nextEmptyColumnAddress(sheetName: string, headerRow: number) {
     const worksheet = this.getWorksheet(sheetName);
-    if (!Number.isInteger(headerRow) || headerRow < 1 || headerRow > 20) throw fail('Header row must be between 1 and 20.');
+    if (!Number.isInteger(headerRow) || headerRow < 1 || headerRow > maxWorkbookRows) throw fail('Header row is outside the supported worksheet range.');
     const row = worksheet.getRow(headerRow);
     let column = Math.max(1, worksheet.columnCount) + 1;
     for (let index = 1; index <= Math.min(maxWorkbookColumns, worksheet.columnCount + 1); index += 1) {
