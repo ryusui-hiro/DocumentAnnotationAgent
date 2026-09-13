@@ -1,10 +1,12 @@
-import type { Annotation, AnnotationCandidate, AnnotationReviewPriority, DocumentAnnotationRecord, SpreadsheetCellChange } from './types';
+import type { Annotation, AnnotationCandidate, AnnotationReviewPriority, DocumentAnnotationRecord, NormalizedTextBox, SpreadsheetCellChange, TextAnchor } from './types';
 
 function visualTarget(annotation: Annotation, fileType: string): DocumentAnnotationRecord['target'] {
   const boundingBox = { x: annotation.x, y: annotation.y, width: annotation.width, height: annotation.height };
+  const fragments = annotation.fragments?.slice(0, 32);
+  const textAnchor = annotation.textAnchor;
   return fileType.toLowerCase() === 'pptx'
-    ? { kind: 'slide', slide: annotation.pageNumber, boundingBox }
-    : { kind: 'page', page: annotation.pageNumber, boundingBox };
+    ? { kind: 'slide', slide: annotation.pageNumber, boundingBox, ...(fragments?.length ? { fragments } : {}), ...(textAnchor ? { textAnchor } : {}) }
+    : { kind: 'page', page: annotation.pageNumber, boundingBox, ...(fragments?.length ? { fragments } : {}), ...(textAnchor ? { textAnchor } : {}) };
 }
 
 function visualStatus(annotation: Annotation): DocumentAnnotationRecord['status'] {
@@ -14,10 +16,11 @@ function visualStatus(annotation: Annotation): DocumentAnnotationRecord['status'
   return 'auto';
 }
 
-function visualRecord(documentId: string, fileType: string, annotation: Annotation & Pick<Partial<AnnotationCandidate>, 'approvalRunId' | 'approvalId'>, status = visualStatus(annotation)): DocumentAnnotationRecord {
+function visualRecord(documentId: string, fileType: string, sourceHash: string | undefined, annotation: Annotation & Pick<Partial<AnnotationCandidate>, 'approvalRunId' | 'approvalId'>, status = visualStatus(annotation)): DocumentAnnotationRecord {
   return {
     id: annotation.id,
     documentId,
+    ...(sourceHash ? { sourceHash } : {}),
     target: visualTarget(annotation, fileType),
     label: annotation.label,
     evidence: annotation.excerpt ?? '',
@@ -39,6 +42,7 @@ function visualRecord(documentId: string, fileType: string, annotation: Annotati
 
 export function normalizeDocumentAnnotationRecords(args: {
   documentId: string;
+  sourceHash?: string;
   fileType: string;
   annotations: Annotation[];
   candidates: AnnotationCandidate[];
@@ -46,14 +50,15 @@ export function normalizeDocumentAnnotationRecords(args: {
   spreadsheetChanges: SpreadsheetCellChange[];
 }): DocumentAnnotationRecord[] {
   const records = [
-    ...args.annotations.map((annotation) => visualRecord(args.documentId, args.fileType, annotation)),
-    ...args.candidates.map((candidate) => visualRecord(args.documentId, args.fileType, candidate, 'needs_review')),
-    ...args.rejectedCandidates.map((candidate) => visualRecord(args.documentId, args.fileType, candidate, 'rejected')),
+    ...args.annotations.map((annotation) => visualRecord(args.documentId, args.fileType, args.sourceHash, annotation)),
+    ...args.candidates.map((candidate) => visualRecord(args.documentId, args.fileType, args.sourceHash, candidate, 'needs_review')),
+    ...args.rejectedCandidates.map((candidate) => visualRecord(args.documentId, args.fileType, args.sourceHash, candidate, 'rejected')),
     ...args.spreadsheetChanges.map((change): DocumentAnnotationRecord => {
       const status = change.rejected ? 'rejected' : change.approved ? 'approved' : change.requiresReview ? 'needs_review' : 'auto';
       return {
         id: change.id,
         documentId: args.documentId,
+        ...(args.sourceHash ? { sourceHash: args.sourceHash } : {}),
         target: { kind: 'sheet', sheet: change.sheetName, cellRange: change.range },
         label: change.operation === 'create_column' ? `Create column: ${String(change.values[0]?.[0] ?? '')}` : 'Workbook cell update',
         evidence: JSON.stringify(change.values),
@@ -87,6 +92,28 @@ function boundedNumber(value: unknown, fallback: number, minimum: number, maximu
   return Number.isFinite(parsed) ? Math.min(maximum, Math.max(minimum, parsed)) : fallback;
 }
 
+function readNormalizedBox(value: unknown): NormalizedTextBox | null {
+  if (!isRecord(value) || !['x', 'y', 'width', 'height'].every((key) => typeof value[key] === 'number' && Number.isFinite(value[key]))) return null;
+  const x = value.x as number;
+  const y = value.y as number;
+  const width = value.width as number;
+  const height = value.height as number;
+  if (x < 0 || y < 0 || width <= 0 || height <= 0 || x + width > 1.001 || y + height > 1.001) return null;
+  return { x, y, width: Math.min(width, 1 - x), height: Math.min(height, 1 - y) };
+}
+
+function readTextAnchor(value: unknown): TextAnchor | undefined {
+  if (!isRecord(value) || !isRecord(value.quote) || !isRecord(value.position)) return undefined;
+  const { exact, prefix, suffix } = value.quote;
+  const { start, end, unit } = value.position;
+  if (typeof exact !== 'string' || !exact.trim() || typeof prefix !== 'string' || typeof suffix !== 'string' ||
+    !Number.isInteger(start) || !Number.isInteger(end) || Number(start) < 0 || Number(end) < Number(start) || unit !== 'normalized-page-text') return undefined;
+  return {
+    quote: { exact: exact.slice(0, 1000), prefix: prefix.slice(-100), suffix: suffix.slice(0, 100) },
+    position: { start: Number(start), end: Number(end), unit },
+  };
+}
+
 const reviewPriorities = new Set(['low', 'medium', 'high']);
 const annotationStatuses = new Set(['auto', 'needs_review', 'approved', 'corrected', 'rejected']);
 
@@ -110,6 +137,10 @@ export function restoreDocumentAnnotationRecords(value: unknown) {
       const rawPageNumber = Number(target.kind === 'page' ? target.page : target.slide);
       if (!Number.isFinite(rawPageNumber) || rawPageNumber < 1 || rawPageNumber > 120) continue;
       const pageNumber = Math.floor(rawPageNumber);
+      const fragments = Array.isArray(target.fragments)
+        ? target.fragments.slice(0, 32).map(readNormalizedBox).filter((box): box is NormalizedTextBox => box !== null)
+        : [];
+      const textAnchor = readTextAnchor(target.textAnchor);
       const x = boundedNumber(target.boundingBox.x, 0, 0, 0.98);
       const y = boundedNumber(target.boundingBox.y, 0, 0, 0.98);
       const width = Math.min(1 - x, boundedNumber(target.boundingBox.width, 0.02, 0.015, 1));
@@ -127,6 +158,8 @@ export function restoreDocumentAnnotationRecords(value: unknown) {
         reason: typeof raw.reason === 'string' ? raw.reason.slice(0, 500) : typeof raw.explanation === 'string' ? raw.explanation.slice(0, 500) : '',
         requiresReview,
         excerpt: typeof raw.excerpt === 'string' ? raw.excerpt.slice(0, 1000) : typeof raw.evidence === 'string' ? raw.evidence.slice(0, 1000) : '',
+        ...(fragments.length ? { fragments } : {}),
+        ...(textAnchor ? { textAnchor } : {}),
         reviewedByHuman: Boolean(raw.reviewedByHuman) || status === 'corrected',
         ...(typeof raw.approvalRunId === 'string' ? { approvalRunId: raw.approvalRunId.slice(0, 100) } : {}),
         ...(typeof raw.approvalId === 'string' ? { approvalId: raw.approvalId.slice(0, 200) } : {}),
@@ -155,8 +188,32 @@ export function restoreDocumentAnnotationRecords(value: unknown) {
   return { annotations, candidates, rejectedCandidates, spreadsheetChanges };
 }
 
+export function resolveCandidateReview(
+  current: ReturnType<typeof restoreDocumentAnnotationRecords>,
+  candidateId: string,
+  outcome:
+    | { type: 'approve' | 'correct'; annotation: Annotation }
+    | { type: 'reject'; candidate: AnnotationCandidate },
+) {
+  const withoutCandidate = current.candidates.filter((candidate) => candidate.id !== candidateId);
+  if (outcome.type === 'reject') {
+    return {
+      ...current,
+      candidates: withoutCandidate,
+      annotations: current.annotations.filter((annotation) => annotation.id !== candidateId),
+      rejectedCandidates: [...current.rejectedCandidates.filter((candidate) => candidate.id !== candidateId), outcome.candidate],
+    };
+  }
+  return {
+    ...current,
+    candidates: withoutCandidate,
+    rejectedCandidates: current.rejectedCandidates.filter((candidate) => candidate.id !== candidateId),
+    annotations: [...current.annotations.filter((annotation) => annotation.id !== candidateId), outcome.annotation],
+  };
+}
+
 /** Reads a saved per-document workspace and rebinds its records to the current server session. */
-export function readStoredDocumentAnnotationRecords(raw: string | null, documentId: string, fileType: string): DocumentAnnotationRecord[] {
+export function readStoredDocumentAnnotationRecords(raw: string | null, documentId: string, fileType: string, sourceHash?: string): DocumentAnnotationRecord[] {
   if (!raw) return [];
   try {
     const stored: unknown = JSON.parse(raw);
@@ -177,9 +234,15 @@ export function readStoredDocumentAnnotationRecords(raw: string | null, document
     } else {
       return [];
     }
-    const normalized = normalizeDocumentAnnotationRecords({ documentId, fileType, ...restored });
+    const rawHashes = Array.isArray(stored)
+      ? stored.filter(isRecord).map((record) => record.sourceHash).filter((hash): hash is string => typeof hash === 'string')
+      : isRecord(stored) && Array.isArray(stored.documentAnnotations)
+        ? stored.documentAnnotations.filter(isRecord).map((record) => record.sourceHash).filter((hash): hash is string => typeof hash === 'string')
+        : [];
+    if (sourceHash && rawHashes.some((hash) => hash !== sourceHash)) return [];
+    const normalized = normalizeDocumentAnnotationRecords({ documentId, sourceHash, fileType, ...restored });
     const checked = restoreDocumentAnnotationRecords(normalized);
-    return normalizeDocumentAnnotationRecords({ documentId, fileType, ...checked });
+    return normalizeDocumentAnnotationRecords({ documentId, sourceHash, fileType, ...checked });
   } catch {
     return [];
   }

@@ -2,7 +2,7 @@ import type { PreviewReport } from 'document-svg';
 import sharp from 'sharp';
 import type { Annotation, DocumentAnnotationRecord } from '../src/types';
 import { documentAnnotationsToCsv } from './annotationCsv';
-import { extractPositionedTextLines } from './textTarget';
+import { extractPositionedTextBlocks, type PositionedTextBlock } from './textTarget';
 
 export type DocumentLocation =
   | { kind: 'page'; pageNumber: number }
@@ -88,6 +88,7 @@ function extractSvgText(svg: string) {
 export class PagedDocumentAdapter implements DocumentAdapter {
   private readonly textCache = new Map<number, string[]>();
   private readonly positionedTextCache = new Map<number, string[]>();
+  private readonly positionedTextBlocksCache = new Map<number, PositionedTextBlock[]>();
   private readonly annotations = new Map<string, DocumentAnnotationRecord>();
 
   constructor(readonly fileName: string, readonly report: PreviewReport, readonly documentId = '', private readonly sourceBuffer?: Buffer) {}
@@ -122,11 +123,19 @@ export class PagedDocumentAdapter implements DocumentAdapter {
   getPositionedPageText(pageNumber: number) {
     const cached = this.positionedTextCache.get(pageNumber);
     if (cached) return [...cached];
-    const view = this.inspect({ kind: 'page', pageNumber });
-    if (view.kind !== 'page') return [];
-    const lines = extractPositionedTextLines(view.svg);
+    const lines = this.getPositionedPageTextBlocks(pageNumber).map((line) => `[x=${line.boundingBox.x.toFixed(3)}, y=${line.boundingBox.y.toFixed(3)}, w=${line.boundingBox.width.toFixed(3)}, h=${line.boundingBox.height.toFixed(3)}] ${line.text}`);
     this.positionedTextCache.set(pageNumber, lines);
     return [...lines];
+  }
+
+  getPositionedPageTextBlocks(pageNumber: number) {
+    const cached = this.positionedTextBlocksCache.get(pageNumber);
+    if (cached) return cached.map((line) => structuredClone(line));
+    const view = this.inspect({ kind: 'page', pageNumber });
+    if (view.kind !== 'page') return [];
+    const blocks = extractPositionedTextBlocks(view.svg);
+    this.positionedTextBlocksCache.set(pageNumber, blocks);
+    return blocks.map((line) => structuredClone(line));
   }
 
   search(query: string, limit = 20): DocumentSearchResult[] {
@@ -159,6 +168,16 @@ export class PagedDocumentAdapter implements DocumentAdapter {
     if (box.x < 0 || box.y < 0 || box.width <= 0 || box.height <= 0 || box.x + box.width > 1 || box.y + box.height > 1) {
       throw fail('Annotation bounds must fit inside the normalized page.');
     }
+    if (target.fragments?.length && (target.fragments.length > 32 || target.fragments.some((fragment) =>
+      fragment.x < 0 || fragment.y < 0 || fragment.width <= 0 || fragment.height <= 0 || fragment.x + fragment.width > 1.001 || fragment.y + fragment.height > 1.001))) {
+      throw fail('Annotation text fragments must fit inside the normalized page.');
+    }
+    if (target.textAnchor && (!target.textAnchor.quote.exact.trim() || target.textAnchor.quote.exact.length > 1000 ||
+      !Number.isInteger(target.textAnchor.position.start) || !Number.isInteger(target.textAnchor.position.end) ||
+      target.textAnchor.position.start < 0 || target.textAnchor.position.end < target.textAnchor.position.start ||
+      target.textAnchor.position.unit !== 'normalized-page-text')) {
+      throw fail('Annotation text selectors are invalid.');
+    }
     const record = structuredClone(annotation);
     this.annotations.set(record.id, record);
     return structuredClone(record);
@@ -189,7 +208,8 @@ export class PagedDocumentAdapter implements DocumentAdapter {
     const annotations = sourceAnnotations.filter((annotation) => ['auto', 'approved', 'corrected'].includes(annotation.status));
     const fileBase = this.fileName.replace(/\.[^.]+$/, '').replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').slice(0, 140) || 'document';
     if (request.format === 'annotations-json') {
-      const buffer = Buffer.from(JSON.stringify({ schemaVersion: 1, document: { documentId: this.documentId, fileName: this.fileName, fileType: this.report.sourceFormat }, documentAnnotations: sourceAnnotations }, null, 2));
+      const sourceHash = sourceAnnotations.find((annotation) => annotation.sourceHash)?.sourceHash;
+      const buffer = Buffer.from(JSON.stringify({ schemaVersion: 1, document: { documentId: this.documentId, fileName: this.fileName, fileType: this.report.sourceFormat, ...(sourceHash ? { sourceHash } : {}) }, documentAnnotations: sourceAnnotations }, null, 2));
       return { format: request.format, fileName: `${fileBase}-annotations.json`, contentType: 'application/json', buffer, annotationsExported: sourceAnnotations.length, skipped: [] };
     }
     if (request.format === 'annotations-csv') {
@@ -284,12 +304,19 @@ export class PagedDocumentAdapter implements DocumentAdapter {
         const colorValue = pending ? 'E89A27' : annotation.color ?? '#278779';
         const match = colorValue.replace(/^#/, '').match(/^[0-9a-f]{6}$/i);
         const color = match ? rgb(Number.parseInt(match[0].slice(0, 2), 16) / 255, Number.parseInt(match[0].slice(2, 4), 16) / 255, Number.parseInt(match[0].slice(4, 6), 16) / 255) : rgb(0.09, 0.5, 0.47);
-        const x = box.x * width;
-        const y = height - (box.y + box.height) * height;
-        page.drawRectangle({ x, y, width: Math.max(1, box.width * width), height: Math.max(1, box.height * height), borderColor: color, borderWidth: 1.5 });
-        const tagY = Math.min(height - 13, Math.max(0, height - box.y * height - 13));
-        page.drawRectangle({ x, y: tagY, width: 15, height: 13, color });
-        page.drawText(String(index + 1), { x: x + 4, y: tagY + 3, size: 8, font, color: rgb(1, 1, 1) });
+        const fragments = (annotation.target.kind === 'page' || annotation.target.kind === 'slide') && annotation.target.fragments?.length
+          ? annotation.target.fragments
+          : [box];
+        fragments.forEach((fragment, fragmentIndex) => {
+          const x = fragment.x * width;
+          const y = height - (fragment.y + fragment.height) * height;
+          page.drawRectangle({ x, y, width: Math.max(1, fragment.width * width), height: Math.max(1, fragment.height * height), borderColor: color, borderWidth: 1.5 });
+          if (fragmentIndex === 0) {
+            const tagY = Math.min(height - 13, Math.max(0, height - fragment.y * height - 13));
+            page.drawRectangle({ x, y: tagY, width: 15, height: 13, color });
+            page.drawText(String(index + 1), { x: x + 4, y: tagY + 3, size: 8, font, color: rgb(1, 1, 1) });
+          }
+        });
         annotationsExported += 1;
       });
     }

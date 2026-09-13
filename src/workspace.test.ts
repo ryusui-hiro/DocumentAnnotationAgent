@@ -22,7 +22,7 @@ test('stores project metadata and requires the user to reconnect the folder afte
   const storage = new MemoryStorage();
   const project: WorkspaceProject = {
     id: '/work/contracts', name: 'contracts', source: 'desktop', rootPath: '/work/contracts', connected: true,
-    documents: [{ id: 'a.pdf', relativePath: 'contracts/a.pdf', selected: true, status: 'running', nativePath: '/work/contracts/a.pdf' }],
+    documents: [{ id: 'a.pdf', relativePath: 'contracts/a.pdf', selected: true, status: 'running', sourceHash: 'a'.repeat(64), nativePath: '/work/contracts/a.pdf' }],
   };
   saveWorkspaceProject(storage, project);
   const restored = loadWorkspaceProject(storage);
@@ -30,4 +30,5 @@ test('stores project metadata and requires the user to reconnect the folder afte
   assert.equal(restored?.connected, false);
   assert.equal(restored?.documents[0]?.status, 'ready');
   assert.equal(restored?.documents[0]?.nativePath, '/work/contracts/a.pdf');
+  assert.equal(restored?.documents[0]?.sourceHash, 'a'.repeat(64));
 });

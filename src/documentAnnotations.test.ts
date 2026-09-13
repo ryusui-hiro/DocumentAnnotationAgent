@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { normalizeDocumentAnnotationRecords, readStoredDocumentAnnotationRecords, restoreDocumentAnnotationRecords } from './documentAnnotations';
+import { normalizeDocumentAnnotationRecords, readStoredDocumentAnnotationRecords, resolveCandidateReview, restoreDocumentAnnotationRecords } from './documentAnnotations';
 
 test('normalizes visual and spreadsheet annotations into a shared target and review schema', () => {
   const records = normalizeDocumentAnnotationRecords({
@@ -109,6 +109,55 @@ test('maps presentation page regions to slide targets and rejected items to reje
   assert.equal(record?.status, 'rejected');
 });
 
+test('keeps text quote selectors and per-line fragments in the canonical record', () => {
+  const fragments = [
+    { x: 0.2, y: 0.3, width: 0.25, height: 0.03 },
+    { x: 0.1, y: 0.34, width: 0.3, height: 0.03 },
+  ];
+  const textAnchor = {
+    quote: { exact: 'power supply before servicing', prefix: 'disconnect the ', suffix: ' the fan.' },
+    position: { start: 15, end: 44, unit: 'normalized-page-text' as const },
+  };
+  const records = normalizeDocumentAnnotationRecords({
+    documentId: 'selector-doc', sourceHash: 'c'.repeat(64), fileType: 'PDF',
+    annotations: [{
+      id: 'selector-annotation', pageNumber: 1, x: 0.1, y: 0.3, width: 0.35, height: 0.07,
+      label: 'SAFETY', note: 'Disconnect power.', excerpt: textAnchor.quote.exact, fragments, textAnchor,
+      color: '#178b87', source: 'ai', reviewPriority: 'low',
+    }],
+    candidates: [], rejectedCandidates: [], spreadsheetChanges: [],
+  });
+  assert.equal(records[0]?.sourceHash, 'c'.repeat(64));
+  assert.deepEqual(records[0]?.target.kind === 'page' ? records[0].target.fragments : undefined, fragments);
+  assert.deepEqual(records[0]?.target.kind === 'page' ? records[0].target.textAnchor : undefined, textAnchor);
+  const restored = restoreDocumentAnnotationRecords(records);
+  assert.deepEqual(restored.annotations[0]?.fragments, fragments);
+  assert.deepEqual(restored.annotations[0]?.textAnchor, textAnchor);
+});
+
+test('moves a reviewed candidate to a confirmed record atomically without losing its shared id', () => {
+  const candidate = {
+    id: 'same-id', pageNumber: 1, x: 0.1, y: 0.2, width: 0.3, height: 0.1,
+    label: 'MEDIUM RISK', note: 'Review this clause.', reason: 'Needs a human decision.', excerpt: 'This clause',
+    reviewPriority: 'high' as const, requiresReview: true, color: '#9275d3', source: 'ai' as const,
+  };
+  const initial = { annotations: [], candidates: [candidate], rejectedCandidates: [], spreadsheetChanges: [] };
+  const corrected = resolveCandidateReview(initial, candidate.id, {
+    type: 'correct',
+    annotation: { ...candidate, label: 'HIGH RISK', note: 'No termination date is stated.', reason: 'Human correction.', source: 'manual', requiresReview: false, reviewedByHuman: true },
+  });
+  const records = normalizeDocumentAnnotationRecords({ documentId: 'review-doc', fileType: 'PDF', ...corrected });
+  const restored = restoreDocumentAnnotationRecords(records);
+  assert.equal(restored.candidates.length, 0);
+  assert.equal(restored.annotations[0]?.id, 'same-id');
+  assert.equal(restored.annotations[0]?.label, 'HIGH RISK');
+  assert.equal(records[0]?.status, 'corrected');
+
+  const rejected = resolveCandidateReview(initial, candidate.id, { type: 'reject', candidate });
+  const rejectedRecords = normalizeDocumentAnnotationRecords({ documentId: 'review-doc', fileType: 'PDF', ...rejected });
+  assert.equal(restoreDocumentAnnotationRecords(rejectedRecords).rejectedCandidates[0]?.id, 'same-id');
+});
+
 test('rebinds saved workspace annotations to a live session and tolerates malformed local state', () => {
   const saved = normalizeDocumentAnnotationRecords({
     documentId: 'expired-session', fileType: 'XLSX', annotations: [], candidates: [], rejectedCandidates: [],
@@ -119,4 +168,14 @@ test('rebinds saved workspace annotations to a live session and tolerates malfor
   assert.equal(rebound[0]?.target.kind, 'sheet');
   assert.equal(rebound[0]?.status, 'approved');
   assert.deepEqual(readStoredDocumentAnnotationRecords('{broken-json', 'new-session', 'PDF'), []);
+});
+
+test('does not rebind annotations from a different source-file version', () => {
+  const oldVersion = normalizeDocumentAnnotationRecords({
+    documentId: 'expired-session', sourceHash: 'a'.repeat(64), fileType: 'PDF',
+    annotations: [{ id: 'old-version', pageNumber: 1, x: 0.1, y: 0.2, width: 0.3, height: 0.1, label: 'Old', note: 'Old file result.', color: '#178b87', source: 'ai' }],
+    candidates: [], rejectedCandidates: [], spreadsheetChanges: [],
+  });
+  const raw = JSON.stringify({ version: 4, sourceHash: 'a'.repeat(64), documentAnnotations: oldVersion });
+  assert.deepEqual(readStoredDocumentAnnotationRecords(raw, 'new-session', 'PDF', 'b'.repeat(64)), []);
 });

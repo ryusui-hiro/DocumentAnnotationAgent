@@ -33,16 +33,18 @@ import {
   createSvgPreviewUrl,
   revokeSvgPreviewUrl,
 } from 'document-svg/preview-ui';
-import type { AgentActivityEvent, AgentActivityPhase, AgentMode, AgentRunHistory, AgentRunStatus, Annotation, AnnotationCandidate, AnnotationReviewPriority, ApiHealth, AppSettings, CodexModel, ConvertedDocument, ConvertedPage, DocumentAnnotationOperation, DocumentAnnotationRecord, ModelId, PreparedDocumentExport, ProviderId, SpreadsheetCellChange, TokenUsage, UsageTotals, WorkbookSessionSummary, WorkspaceDocumentEntry, WorkspaceProject } from './types';
+import type { AgentActivityEvent, AgentActivityPhase, AgentMode, AgentPageCoverage, AgentRunHistory, AgentRunStatus, Annotation, AnnotationCandidate, AnnotationReviewPriority, ApiHealth, AppSettings, CodexModel, ConvertedDocument, ConvertedPage, DocumentAnnotationOperation, DocumentAnnotationRecord, ModelId, NormalizedTextBox, PreparedDocumentExport, ProviderId, SpreadsheetCellChange, TokenUsage, UsageTotals, WorkbookSessionSummary, WorkspaceDocumentEntry, WorkspaceProject } from './types';
 import SettingsDialog from './components/SettingsDialog';
 import { apiFetch } from './api';
 import { consumeAgentStream, type LiveToolActivity } from './agentStream';
 import { readAgentRunHistory, upsertAgentRunHistory, writeAgentRunHistory } from './runHistory';
 import { localTaskPlan, parseTaskPlan, taskPlanAsInstructions, taskPlanSignature, type AnnotationTaskPlan, type TaskPlanSource } from './taskPlan';
 import { findInconsistentRepeatedExcerpts, restoreAnnotationConsistencyIssues, type AnnotationConsistencyIssue } from './consistency';
-import { normalizeDocumentAnnotationRecords, readStoredDocumentAnnotationRecords, restoreDocumentAnnotationRecords } from './documentAnnotations';
+import { normalizeDocumentAnnotationRecords, readStoredDocumentAnnotationRecords, resolveCandidateReview, restoreDocumentAnnotationRecords } from './documentAnnotations';
 import { mergePreparedDocumentExports, restorePreparedDocumentExports } from './preparedExports';
+import { recordHumanDecision, type HumanDecisionScope } from './humanDecisionScope';
 import { isSupportedWorkspaceFile, loadWorkspaceProject, maxWorkspaceDocuments, saveWorkspaceProject, shouldIgnoreWorkspaceDirectory } from './workspace';
+import { readWorkspaceState, writeWorkspaceState } from './workspaceState';
 import {
   emptyUsageTotals,
   formatTokens,
@@ -90,9 +92,15 @@ async function postAgentRequest(
 type PanelTab = 'ai' | 'annotations' | 'workspace';
 type GuideTab = 'workflow' | 'concept';
 type Point = { x: number; y: number };
+type RegionShape = { x: number; y: number; width: number; height: number; fragments?: NormalizedTextBox[] };
+
+function visibleAnnotationFragments(region: RegionShape): NormalizedTextBox[] {
+  return region.fragments?.length ? region.fragments : [{ x: region.x, y: region.y, width: region.width, height: region.height }];
+}
 type AgentContinuation = {
   remainingPages: number[];
   blockedPage: number;
+  sourceHash?: string;
   fullDocument?: boolean;
   humanCorrections?: number;
   visitedPages?: number[];
@@ -101,6 +109,7 @@ type AgentContinuation = {
   guidelines: string;
   correction: string;
   decisionContext: string;
+  pageDecisionContext?: string;
   approvalRunId?: string;
   approvalId?: string;
   runHistoryId?: string;
@@ -162,6 +171,13 @@ const AGENT_MODES: Array<{ id: AgentMode; label: string; description: string }> 
   { id: 'assist', label: 'Assist', description: '明確な箇所を注釈し、曖昧なら確認します。' },
   { id: 'autopilot', label: 'Autopilot', description: '全ページを連続処理し、曖昧な箇所だけ待ちます。' },
 ];
+const PAGE_COVERAGE_LABELS: Record<AgentPageCoverage['status'], string> = {
+  checked: '確認済み',
+  image_only: '画像のみ・要確認',
+  opened: '開いたが未確認',
+  failed: '処理失敗',
+  demo_only: 'デモ出力・未検証',
+};
 const LABEL_COLORS = [
   { name: 'Teal', value: '#178b87' },
   { name: 'Amber', value: '#e8a532' },
@@ -184,6 +200,7 @@ function clamp(value: number, min = 0, max = 1) {
 function parseDocument(payload: Record<string, unknown>): ConvertedDocument {
   return {
     documentId: String(payload.documentId ?? ''),
+    ...(typeof payload.sourceHash === 'string' && /^[\da-f]{64}$/i.test(payload.sourceHash) ? { sourceHash: payload.sourceHash.toLowerCase() } : {}),
     fileName: String(payload.fileName ?? 'document.pdf'),
     fileType: String(payload.fileType ?? 'PDF'),
     pageCount: Number(payload.pageCount ?? 0),
@@ -240,10 +257,6 @@ function seededCandidates(pageNumber: number, instruction: string): AnnotationCa
     return [{ id: crypto.randomUUID(), pageNumber, x: 0.12, y: 0.29, width: 0.78, height: 0.43, label: '部品構成', note: `「${instruction.slice(0, 28)}」に関係するデモ候補です。`, reason: 'サンプル画面を示すための固定候補です。', reviewPriority: 'high', requiresReview: true, color: '#178b87', source: 'ai' }];
   }
   return [{ id: crypto.randomUUID(), pageNumber, x: 0.36, y: 0.3, width: 0.42, height: 0.34, label: '点検記録', note: `「${instruction.slice(0, 28)}」に関係する写真領域のデモ候補です。`, reason: 'サンプル画面を示すための固定候補です。', reviewPriority: 'high', requiresReview: true, color: '#557ec2', source: 'ai' }];
-}
-
-function annotationStorageKey(fileName: string) {
-  return `annotation-studio:annotations:${fileName}`;
 }
 
 function downloadBlob(blob: Blob, fileName: string) {
@@ -344,6 +357,7 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [connectionTest, setConnectionTest] = useState<{ status: 'idle' | 'testing' | 'success' | 'error'; message: string }>({ status: 'idle', message: '' });
   const [candidateCorrections, setCandidateCorrections] = useState<Record<string, { label: string; note: string }>>({});
+  const [candidateCorrectionScopes, setCandidateCorrectionScopes] = useState<Record<string, HumanDecisionScope>>({});
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [pageNumber, setPageNumber] = useState(1);
   const [activeTool, setActiveTool] = useState<Tool>('select');
@@ -405,6 +419,7 @@ function App() {
       const next = update(current);
       return normalizeDocumentAnnotationRecords({
         documentId: activeDocumentIdRef.current ?? records[0]?.documentId ?? documentData?.documentId ?? '',
+        sourceHash: documentData?.sourceHash,
         fileType: activeFileTypeRef.current ?? documentData?.fileType ?? 'PDF',
         ...next,
       });
@@ -414,10 +429,10 @@ function App() {
   const setCandidates = (action: ArrayStateAction<AnnotationCandidate>) => updateDocumentAnnotationRecords((current) => ({ ...current, candidates: resolveArrayState(action, current.candidates) }));
   const setRejectedCandidates = (action: ArrayStateAction<AnnotationCandidate>) => updateDocumentAnnotationRecords((current) => ({ ...current, rejectedCandidates: resolveArrayState(action, current.rejectedCandidates) }));
   const setSpreadsheetChanges = (action: ArrayStateAction<SpreadsheetCellChange>) => updateDocumentAnnotationRecords((current) => ({ ...current, spreadsheetChanges: resolveArrayState(action, current.spreadsheetChanges) }));
-  const documentWorkspaceStateRef = useRef({ documentId: documentData?.documentId ?? '', fileType: documentData?.fileType ?? '', documentAnnotationRecords, annotationOperations, consistencyIssues, preparedDocumentExports, continuation: agentContinuation, task: { prompt, guidelines, correction, mode: agentMode, plan: taskPlan } });
+  const documentWorkspaceStateRef = useRef({ documentId: documentData?.documentId ?? '', sourceHash: documentData?.sourceHash ?? '', fileType: documentData?.fileType ?? '', documentAnnotationRecords, annotationOperations, consistencyIssues, preparedDocumentExports, continuation: agentContinuation, task: { prompt, guidelines, correction, mode: agentMode, plan: taskPlan } });
   workspaceProjectRef.current = workspaceProject;
   taskPlanRef.current = taskPlan;
-  documentWorkspaceStateRef.current = { documentId: documentData?.documentId ?? '', fileType: documentData?.fileType ?? '', documentAnnotationRecords, annotationOperations, consistencyIssues, preparedDocumentExports, continuation: agentContinuation, task: { prompt, guidelines, correction, mode: agentMode, plan: taskPlan } };
+  documentWorkspaceStateRef.current = { documentId: documentData?.documentId ?? '', sourceHash: documentData?.sourceHash ?? '', fileType: documentData?.fileType ?? '', documentAnnotationRecords, annotationOperations, consistencyIssues, preparedDocumentExports, continuation: agentContinuation, task: { prompt, guidelines, correction, mode: agentMode, plan: taskPlan } };
   annotationOperationsRef.current = annotationOperations;
   activeDocumentIdRef.current = documentData?.documentId ?? activeDocumentIdRef.current;
   activeFileTypeRef.current = documentData?.fileType ?? activeFileTypeRef.current;
@@ -461,14 +476,14 @@ function App() {
     const next = upsertAgentRunHistory(agentRunHistoryRef.current, entry);
     agentRunHistoryRef.current = next;
     setAgentRunHistory(next);
-    try { writeAgentRunHistory(window.localStorage, entry.fileName, next); } catch { /* Keep history in memory if browser storage is disabled. */ }
+    try { writeAgentRunHistory(window.localStorage, entry.fileName, next, entry.sourceHash); } catch { /* Keep history in memory if browser storage is disabled. */ }
   };
 
-  const restoreRunHistory = (fileName: string) => {
+  const restoreRunHistory = (fileName: string, sourceHash?: string) => {
     let history: AgentRunHistory[] = [];
     try {
-      history = readAgentRunHistory(window.localStorage, fileName);
-      writeAgentRunHistory(window.localStorage, fileName, history);
+      history = readAgentRunHistory(window.localStorage, fileName, sourceHash);
+      writeAgentRunHistory(window.localStorage, fileName, history, sourceHash);
     } catch { /* The work session remains usable without browser storage. */ }
     agentRunHistoryRef.current = history;
     setAgentRunHistory(history);
@@ -497,8 +512,10 @@ function App() {
   const saveCurrentDocumentWorkspace = (fileName: string) => {
     const state = documentWorkspaceStateRef.current;
     try {
-      window.localStorage.setItem(annotationStorageKey(fileName), JSON.stringify({
-        version: 3,
+      const sourceHash = state.sourceHash || undefined;
+      writeWorkspaceState(window.localStorage, fileName, sourceHash, {
+        version: 4,
+        ...(sourceHash ? { sourceHash } : {}),
         documentId: state.documentId,
         fileType: state.fileType,
         documentAnnotations: state.documentAnnotationRecords,
@@ -507,7 +524,7 @@ function App() {
         preparedExports: restorePreparedDocumentExports(state.preparedDocumentExports, fileName),
         continuation: state.continuation,
         task: state.task,
-      }));
+      });
     } catch { /* The current analysis remains available in memory. */ }
   };
 
@@ -518,7 +535,7 @@ function App() {
     });
   };
 
-  const restoreDocumentWorkspace = (fileName: string, pageCount: number, restoreTask: boolean) => {
+  const restoreDocumentWorkspace = async (fileName: string, pageCount: number, restoreTask: boolean, sourceHash?: string) => {
     let annotations: Annotation[] = [];
     let candidates: AnnotationCandidate[] = [];
     let rejected: AnnotationCandidate[] = [];
@@ -528,60 +545,123 @@ function App() {
     let restoredPreparedExports: PreparedDocumentExport[] = [];
     let continuation: AgentContinuation | null = null;
     let task: { prompt?: string; guidelines?: string; correction?: string; mode?: AgentMode; plan?: unknown } = {};
+    let sourceChanged = false;
+    let legacySourceVerified = false;
+    let continuationInvalid = false;
+    const verifyDocumentIdentity = async (documentId: string) => {
+      try {
+        const response = await apiFetch(`/api/documents/${encodeURIComponent(documentId)}/identity`, undefined, settings.apiServerUrl);
+        if (!response.ok) return false;
+        const identity = await response.json() as { sourceHash?: unknown };
+        return identity.sourceHash === sourceHash;
+      } catch {
+        return false;
+      }
+    };
+    const latestWorkspace = readWorkspaceState(window.localStorage, fileName);
+    const requestedWorkspace = readWorkspaceState(window.localStorage, fileName, sourceHash);
+    sourceChanged = requestedWorkspace.status === 'changed';
+    let raw = requestedWorkspace.raw;
+    if (requestedWorkspace.status === 'legacy' && raw && sourceHash) {
+      try {
+        const legacy = JSON.parse(raw) as Record<string, unknown>;
+        legacySourceVerified = typeof legacy.documentId === 'string' && await verifyDocumentIdentity(legacy.documentId);
+      } catch { legacySourceVerified = false; }
+      if (!legacySourceVerified) sourceChanged = true;
+    }
+    if (sourceChanged) raw = latestWorkspace.raw;
+
     try {
-      const raw = window.localStorage.getItem(annotationStorageKey(fileName));
       if (raw) {
         const parsed = JSON.parse(raw) as unknown;
-        if (Array.isArray(parsed)) annotations = parsed as Annotation[];
+        if (Array.isArray(parsed)) {
+          if (!sourceHash) annotations = parsed as Annotation[];
+          else sourceChanged = true;
+        }
         else if (parsed && typeof parsed === 'object') {
-          const value = parsed as { version?: unknown; documentAnnotations?: unknown; annotationOperations?: unknown; consistencyIssues?: unknown; preparedExports?: unknown; annotations?: unknown; candidates?: unknown; rejectedCandidates?: unknown; spreadsheetChanges?: unknown; continuation?: unknown; task?: typeof task };
-          restoredAnnotationOperations = restoreAnnotationOperations(value.annotationOperations);
-          restoredConsistencyIssues = restoreAnnotationConsistencyIssues(value.consistencyIssues);
-          restoredPreparedExports = restorePreparedDocumentExports(value.preparedExports, fileName);
-          if (Number(value.version) >= 3 && Array.isArray(value.documentAnnotations)) {
-            const restored = restoreDocumentAnnotationRecords(value.documentAnnotations);
-            annotations = restored.annotations;
-            candidates = restored.candidates;
-            rejected = restored.rejectedCandidates;
-            restoredSpreadsheetChanges = restored.spreadsheetChanges;
-          } else {
-            if (Array.isArray(value.annotations)) annotations = value.annotations as Annotation[];
-            if (Array.isArray(value.candidates)) candidates = value.candidates as AnnotationCandidate[];
-            if (Array.isArray(value.rejectedCandidates)) rejected = value.rejectedCandidates as AnnotationCandidate[];
-            if (Array.isArray(value.spreadsheetChanges)) restoredSpreadsheetChanges = value.spreadsheetChanges.filter((change): change is SpreadsheetCellChange => Boolean(change && typeof change === 'object' && typeof (change as SpreadsheetCellChange).id === 'string'));
-          }
+          const value = parsed as { version?: unknown; sourceHash?: unknown; documentId?: unknown; documentAnnotations?: unknown; annotationOperations?: unknown; consistencyIssues?: unknown; preparedExports?: unknown; annotations?: unknown; candidates?: unknown; rejectedCandidates?: unknown; spreadsheetChanges?: unknown; continuation?: unknown; task?: typeof task };
           if (value.task && typeof value.task === 'object') task = value.task;
-          if (value.continuation && typeof value.continuation === 'object') {
+          const storedSourceHash = typeof value.sourceHash === 'string' && /^[\da-f]{64}$/i.test(value.sourceHash) ? value.sourceHash.toLowerCase() : undefined;
+          const workspaceVersionMatches = !sourceHash || storedSourceHash === sourceHash || legacySourceVerified;
+          if (!workspaceVersionMatches) sourceChanged = true;
+          if (workspaceVersionMatches && !sourceChanged) {
+            restoredAnnotationOperations = restoreAnnotationOperations(value.annotationOperations);
+            restoredConsistencyIssues = restoreAnnotationConsistencyIssues(value.consistencyIssues);
+            restoredPreparedExports = restorePreparedDocumentExports(value.preparedExports, fileName);
+            if (Number(value.version) >= 3 && Array.isArray(value.documentAnnotations)) {
+              const restored = restoreDocumentAnnotationRecords(value.documentAnnotations);
+              annotations = restored.annotations;
+              candidates = restored.candidates;
+              rejected = restored.rejectedCandidates;
+              restoredSpreadsheetChanges = restored.spreadsheetChanges;
+            } else {
+              if (Array.isArray(value.annotations)) annotations = value.annotations as Annotation[];
+              if (Array.isArray(value.candidates)) candidates = value.candidates as AnnotationCandidate[];
+              if (Array.isArray(value.rejectedCandidates)) rejected = value.rejectedCandidates as AnnotationCandidate[];
+              if (Array.isArray(value.spreadsheetChanges)) restoredSpreadsheetChanges = value.spreadsheetChanges.filter((change): change is SpreadsheetCellChange => Boolean(change && typeof change === 'object' && typeof (change as SpreadsheetCellChange).id === 'string'));
+            }
+          }
+          if (!sourceChanged && workspaceVersionMatches && value.continuation && typeof value.continuation === 'object') {
             const pending = value.continuation as Partial<AgentContinuation>;
             if (Array.isArray(pending.remainingPages) && Number.isFinite(pending.blockedPage) && ['observe', 'suggest', 'assist', 'autopilot'].includes(String(pending.mode))) {
-              continuation = {
-                remainingPages: pending.remainingPages.map(Number).filter((page) => page >= 1 && page <= pageCount),
-                blockedPage: Number(pending.blockedPage),
-                ...(typeof pending.fullDocument === 'boolean' ? { fullDocument: pending.fullDocument } : {}),
-                ...(Number.isFinite(pending.humanCorrections) ? { humanCorrections: Number(pending.humanCorrections) } : {}),
-                ...(Array.isArray(pending.visitedPages) ? { visitedPages: pending.visitedPages.map(Number).filter((page) => page >= 1 && page <= pageCount) } : {}),
-                mode: pending.mode as AgentMode,
-                instruction: String(pending.instruction ?? ''),
-                guidelines: String(pending.guidelines ?? ''),
-                correction: String(pending.correction ?? ''),
-                decisionContext: String(pending.decisionContext ?? ''),
-                ...(typeof pending.approvalRunId === 'string' ? { approvalRunId: pending.approvalRunId } : {}),
-                ...(typeof pending.approvalId === 'string' ? { approvalId: pending.approvalId } : {}),
-                ...(typeof pending.runHistoryId === 'string' ? { runHistoryId: pending.runHistoryId } : {}),
-                ...(pending.pendingApprovalDecision && typeof pending.pendingApprovalDecision === 'object' ? {
-                  pendingApprovalDecision: {
-                    approved: Boolean((pending.pendingApprovalDecision as { approved?: unknown }).approved),
-                    note: String((pending.pendingApprovalDecision as { note?: unknown }).note ?? '').slice(0, 500),
-                  },
-                } : {}),
-              };
+              const pendingHashMatches = !sourceHash || pending.sourceHash === sourceHash;
+              const legacyRunMatches = Boolean(sourceHash && !pending.sourceHash && typeof value.documentId === 'string' && await verifyDocumentIdentity(value.documentId));
+              if (pendingHashMatches || legacyRunMatches) {
+                continuation = {
+                  remainingPages: pending.remainingPages.map(Number).filter((page) => page >= 1 && page <= pageCount),
+                  blockedPage: Number(pending.blockedPage),
+                  ...(sourceHash ? { sourceHash } : {}),
+                  ...(typeof pending.fullDocument === 'boolean' ? { fullDocument: pending.fullDocument } : {}),
+                  ...(Number.isFinite(pending.humanCorrections) ? { humanCorrections: Number(pending.humanCorrections) } : {}),
+                  ...(Array.isArray(pending.visitedPages) ? { visitedPages: pending.visitedPages.map(Number).filter((page) => page >= 1 && page <= pageCount) } : {}),
+                  mode: pending.mode as AgentMode,
+                  instruction: String(pending.instruction ?? ''),
+                  guidelines: String(pending.guidelines ?? ''),
+                  correction: String(pending.correction ?? ''),
+                  decisionContext: String(pending.decisionContext ?? '').slice(0, 4000),
+                  pageDecisionContext: String(pending.pageDecisionContext ?? '').slice(0, 4000),
+                  ...(typeof pending.approvalRunId === 'string' ? { approvalRunId: pending.approvalRunId } : {}),
+                  ...(typeof pending.approvalId === 'string' ? { approvalId: pending.approvalId } : {}),
+                  ...(typeof pending.runHistoryId === 'string' ? { runHistoryId: pending.runHistoryId } : {}),
+                  ...(pending.pendingApprovalDecision && typeof pending.pendingApprovalDecision === 'object' ? {
+                    pendingApprovalDecision: {
+                      approved: Boolean((pending.pendingApprovalDecision as { approved?: unknown }).approved),
+                      note: String((pending.pendingApprovalDecision as { note?: unknown }).note ?? '').slice(0, 500),
+                    },
+                  } : {}),
+                };
+              } else continuationInvalid = true;
             }
           }
         }
       }
     } catch { /* Ignore an invalid saved document workspace. */ }
+
+    if (sourceChanged && sourceHash) {
+      let previous: unknown = null;
+      try { previous = raw ? JSON.parse(raw) as unknown : null; } catch { previous = null; }
+      if (previous && typeof previous === 'object') {
+        const previousRecord = previous as Record<string, unknown>;
+        const previousHash = typeof previousRecord.sourceHash === 'string' ? previousRecord.sourceHash : 'legacy';
+        try { writeWorkspaceState(window.localStorage, fileName, previousHash, previous); } catch { /* Preserve the current document even if local storage is full. */ }
+      }
+      try {
+        writeWorkspaceState(window.localStorage, fileName, sourceHash, {
+          version: 4, sourceHash, documentId: activeDocumentIdRef.current ?? '',
+          fileType: activeFileTypeRef.current ?? 'PDF', documentAnnotations: [], annotationOperations: [],
+          consistencyIssues: [], preparedExports: [], continuation: null, task: restoreTask ? task : {},
+        });
+      } catch { /* The current document remains usable without storage. */ }
+    } else if (legacySourceVerified && sourceHash && raw) {
+      try {
+        const migrated = JSON.parse(raw) as Record<string, unknown>;
+        writeWorkspaceState(window.localStorage, fileName, sourceHash, { ...migrated, version: 4, sourceHash });
+      } catch { /* Keep the legacy workspace in place if migration storage fails. */ }
+    }
+
     setDocumentAnnotationRecords(normalizeDocumentAnnotationRecords({
       documentId: activeDocumentIdRef.current ?? '',
+      sourceHash,
       fileType: activeFileTypeRef.current ?? 'PDF',
       annotations, candidates, rejectedCandidates: rejected, spreadsheetChanges: restoredSpreadsheetChanges,
     }));
@@ -610,6 +690,7 @@ function App() {
       setTaskPlan(restoredTaskPlan);
     }
     setSaved(true);
+    return { sourceChanged, continuationInvalid, foundWorkspace: Boolean(raw) || sourceChanged };
   };
 
   const addAgentActivity = (phase: AgentActivityPhase, detail: string, status: AgentActivityEvent['status'] = 'complete', targetPage?: number) => {
@@ -950,7 +1031,7 @@ function App() {
         if (!response.ok) throw new Error((await response.json()).error ?? 'サンプル文書を読み込めませんでした。');
         return response.json();
       }),
-    ]).then(([status, sample]) => {
+    ]).then(async ([status, sample]) => {
       if (!live) return;
       if (status) setHealth(status as ApiHealth);
       const nextDocument = parseDocument(sample as Record<string, unknown>);
@@ -959,64 +1040,11 @@ function App() {
       setWorkbookSummary(null);
       setSpreadsheetChanges([]);
       setDocumentData(nextDocument);
-      restoreRunHistory(nextDocument.fileName);
-      try {
-        const restored = localStorage.getItem(annotationStorageKey(nextDocument.fileName));
-        if (!restored) {
-          setAnnotations(demoAnnotations);
-          setConsistencyIssues([]);
-        } else {
-          const parsed = JSON.parse(restored) as unknown;
-          if (Array.isArray(parsed)) {
-            setAnnotations(parsed as Annotation[]);
-          } else if (parsed && typeof parsed === 'object') {
-            const savedWorkspace = parsed as { version?: unknown; documentAnnotations?: unknown; annotationOperations?: unknown; consistencyIssues?: unknown; annotations?: unknown; candidates?: unknown; rejectedCandidates?: unknown; spreadsheetChanges?: unknown; continuation?: unknown; task?: { prompt?: unknown; guidelines?: unknown; correction?: unknown; mode?: unknown } };
-            setConsistencyIssues(restoreAnnotationConsistencyIssues(savedWorkspace.consistencyIssues));
-            if (Number(savedWorkspace.version) >= 3 && Array.isArray(savedWorkspace.documentAnnotations)) {
-              const restored = restoreDocumentAnnotationRecords(savedWorkspace.documentAnnotations);
-              setAnnotations(restored.annotations);
-              setCandidates(restored.candidates);
-              setRejectedCandidates(restored.rejectedCandidates);
-              setSpreadsheetChanges(restored.spreadsheetChanges);
-              const operations = restoreAnnotationOperations(savedWorkspace.annotationOperations);
-              annotationOperationsRef.current = operations;
-              setAnnotationOperations(operations);
-            } else {
-              setAnnotations(Array.isArray(savedWorkspace.annotations) ? savedWorkspace.annotations as Annotation[] : demoAnnotations);
-              setCandidates(Array.isArray(savedWorkspace.candidates) ? savedWorkspace.candidates as AnnotationCandidate[] : []);
-              setRejectedCandidates(Array.isArray(savedWorkspace.rejectedCandidates) ? savedWorkspace.rejectedCandidates as AnnotationCandidate[] : []);
-              setSpreadsheetChanges(Array.isArray(savedWorkspace.spreadsheetChanges) ? savedWorkspace.spreadsheetChanges.filter((change): change is SpreadsheetCellChange => Boolean(change && typeof change === 'object' && typeof (change as SpreadsheetCellChange).id === 'string')) : []);
-              annotationOperationsRef.current = restoreAnnotationOperations(savedWorkspace.annotationOperations);
-              setAnnotationOperations(annotationOperationsRef.current);
-            }
-            if (savedWorkspace.continuation && typeof savedWorkspace.continuation === 'object') {
-              const pending = savedWorkspace.continuation as Partial<AgentContinuation>;
-              if (Array.isArray(pending.remainingPages) && Number.isFinite(pending.blockedPage) && ['observe', 'suggest', 'assist', 'autopilot'].includes(String(pending.mode))) {
-                setAgentContinuation({
-                  remainingPages: pending.remainingPages.map(Number).filter((page) => page >= 1 && page <= nextDocument.pageCount),
-                  blockedPage: Number(pending.blockedPage),
-                  ...(typeof pending.fullDocument === 'boolean' ? { fullDocument: pending.fullDocument } : {}),
-                  ...(Number.isFinite(pending.humanCorrections) ? { humanCorrections: Number(pending.humanCorrections) } : {}),
-                  ...(Array.isArray(pending.visitedPages) ? { visitedPages: pending.visitedPages.map(Number).filter((page) => page >= 1 && page <= nextDocument.pageCount) } : {}),
-                  mode: pending.mode as AgentMode,
-                  instruction: String(pending.instruction ?? ''),
-                  guidelines: String(pending.guidelines ?? ''),
-                  correction: String(pending.correction ?? ''),
-                  decisionContext: String(pending.decisionContext ?? ''),
-                });
-                setAgentStatus('waiting');
-              }
-            }
-            if (typeof savedWorkspace.task?.prompt === 'string') setPrompt(savedWorkspace.task.prompt);
-            if (typeof savedWorkspace.task?.guidelines === 'string') setGuidelines(savedWorkspace.task.guidelines);
-            if (typeof savedWorkspace.task?.correction === 'string') setCorrection(savedWorkspace.task.correction);
-            if (['observe', 'suggest', 'assist', 'autopilot'].includes(String(savedWorkspace.task?.mode))) setAgentMode(savedWorkspace.task?.mode as AgentMode);
-          }
-        }
-      } catch {
-        setAnnotations(demoAnnotations);
-        setConsistencyIssues([]);
-      }
+      restoreRunHistory(nextDocument.fileName, nextDocument.sourceHash);
+      const restored = await restoreDocumentWorkspace(nextDocument.fileName, nextDocument.pageCount, true, nextDocument.sourceHash);
+      if (!restored.foundWorkspace && nextDocument.demo) setAnnotations(demoAnnotations);
+      if (restored.sourceChanged) setMessage('同名文書の内容が前回の作業時から変わったため、旧注釈と承認待ち状態を混ぜずに外しました。保存した指示は引き継いでいます。');
+      else if (restored.continuationInvalid) setMessage('文書の版を確認できなかったため、古い承認待ちRunは再開しませんでした。候補は残しています。');
     }).catch((error: unknown) => {
       if (live) setMessage(error instanceof Error ? error.message : 'サンプルを読み込めませんでした。');
     }).finally(() => {
@@ -1152,11 +1180,15 @@ function App() {
       setSpreadsheetChanges([]);
       setDocumentData(next);
       if (next.fileType.toLowerCase() === 'xlsx') void refreshWorkbookSummary(next.documentId).catch((error) => setMessage(error instanceof Error ? error.message : 'Excelブックを読み込めませんでした。'));
-      restoreRunHistory(next.fileName);
+      restoreRunHistory(next.fileName, next.sourceHash);
       setPageNumber(1);
-      restoreDocumentWorkspace(next.fileName, next.pageCount, true);
+      const restoredWorkspace = await restoreDocumentWorkspace(next.fileName, next.pageCount, true, next.sourceHash);
       setAiMode(null);
-      setMessage(`${next.fileName} を読み込みました。${next.pageCount}ページを変換しました。`);
+      setMessage(restoredWorkspace.sourceChanged
+        ? `${next.fileName} は同名の前回ファイルと内容が異なるため、古い注釈を表示せず新しい作業として開きました。`
+        : restoredWorkspace.continuationInvalid
+          ? `${next.fileName} を読み込みましたが、元の文書版を確認できない承認待ちRunは再開しませんでした。`
+          : `${next.fileName} を読み込みました。${next.pageCount}ページを変換しました。`);
       setActiveTab('annotations');
     } catch (error) {
       setMessage(error instanceof Error ? error.message : '変換に失敗しました。');
@@ -1229,7 +1261,7 @@ function App() {
         connected: true,
         documents: documents.map((entry) => {
           const old = oldDocuments.get(entry.relativePath);
-          return old ? { ...entry, selected: old.selected, status: old.status, ...(old.error ? { error: old.error } : {}) } : entry;
+          return old ? { ...entry, selected: old.selected, status: old.status, ...(old.error ? { error: old.error } : {}), ...(old.sourceHash ? { sourceHash: old.sourceHash } : {}) } : entry;
         }),
       };
       setWorkspaceSessionIds({});
@@ -1266,6 +1298,7 @@ function App() {
         size: file.size,
         lastModified: file.lastModified,
         ...(old?.error ? { error: old.error } : {}),
+        ...(old?.sourceHash ? { sourceHash: old.sourceHash } : {}),
       };
       workspaceBrowserFilesRef.current.set(entry.id, file);
       return entry;
@@ -1300,6 +1333,8 @@ function App() {
       if (!response.ok) throw new Error(result.error ?? `${entry.relativePath} を変換できませんでした。`);
       const next = parseDocument(result as Record<string, unknown>);
       setWorkspaceSessionIds((current) => ({ ...current, [entry.id]: next.documentId }));
+      const sourceChangedInProject = Boolean(entry.sourceHash && next.sourceHash && entry.sourceHash !== next.sourceHash);
+      updateWorkspaceDocument(entry.id, { sourceHash: next.sourceHash, ...(sourceChangedInProject ? { status: 'ready', error: undefined } : {}) });
       activeDocumentIdRef.current = next.documentId;
       activeFileTypeRef.current = next.fileType;
       setWorkbookSummary(null);
@@ -1307,11 +1342,15 @@ function App() {
       setDocumentData(next);
       if (next.fileType.toLowerCase() === 'xlsx') await refreshWorkbookSummary(next.documentId);
       setPageNumber(1);
-      restoreDocumentWorkspace(next.fileName, next.pageCount, restoreTask);
-      restoreRunHistory(next.fileName);
+      const restoredWorkspace = await restoreDocumentWorkspace(next.fileName, next.pageCount, restoreTask, next.sourceHash);
+      restoreRunHistory(next.fileName, next.sourceHash);
       setAiMode(null);
       setActiveTab('ai');
-      setMessage(`${entry.relativePath} を開きました。${next.pageCount}ページ。`);
+      setMessage(restoredWorkspace.sourceChanged
+        ? `${entry.relativePath} は前回処理したファイルから変更されています。古い注釈は引き継がず、新しい内容に再実行してください。`
+        : restoredWorkspace.continuationInvalid
+          ? `${entry.relativePath} を開きましたが、元の文書版を確認できない承認待ちRunは再開しませんでした。`
+          : `${entry.relativePath} を開きました。${next.pageCount}ページ。`);
       await waitForRender();
       return next;
     } finally {
@@ -1437,9 +1476,11 @@ function App() {
     const approvedCandidate = { ...candidate };
     delete approvedCandidate.approvalRunId;
     delete approvedCandidate.approvalId;
-    setAnnotations((items) => [...items.filter((item) => item.id !== candidate.id), { ...approvedCandidate, source: 'ai', requiresReview: false, reviewedByHuman: true }]);
-    setCandidates((items) => items.filter((item) => item.id !== candidate.id));
+    updateDocumentAnnotationRecords((current) => resolveCandidateReview(current, candidate.id, {
+      type: 'approve', annotation: { ...approvedCandidate, source: 'ai', requiresReview: false, reviewedByHuman: true },
+    }));
     setCandidateCorrections((items) => { const next = { ...items }; delete next[candidate.id]; return next; });
+    setCandidateCorrectionScopes((items) => { const next = { ...items }; delete next[candidate.id]; return next; });
     addAgentActivity('Annotating', `人が承認: ${candidate.label}`, 'complete', candidate.pageNumber);
     setAgentStatus(candidates.length > 1 ? 'waiting' : 'complete');
     setSelectedId(candidate.id);
@@ -1468,22 +1509,23 @@ function App() {
     };
     delete (corrected as AnnotationCandidate).approvalRunId;
     delete (corrected as AnnotationCandidate).approvalId;
-    setAnnotations((items) => [...items.filter((item) => item.id !== candidate.id), corrected]);
-    setCandidates((items) => items.filter((item) => item.id !== candidate.id));
+    updateDocumentAnnotationRecords((current) => resolveCandidateReview(current, candidate.id, { type: 'correct', annotation: corrected }));
     setCandidateCorrections((items) => { const next = { ...items }; delete next[candidate.id]; return next; });
+    setCandidateCorrectionScopes((items) => { const next = { ...items }; delete next[candidate.id]; return next; });
     addAgentActivity('Annotating', `人が候補を修正して確定: ${candidate.label} → ${label}`, 'complete', candidate.pageNumber);
     setAgentStatus(candidates.length > 1 ? 'waiting' : 'complete');
     setSaved(false);
     setMessage(`P.${candidate.pageNumber}の候補を「${label}」に修正しました。`);
     if (documentData) autoSaveDocumentWorkspace(documentData.fileName);
-    const decisionText = `人が候補を修正して確定。P.${candidate.pageNumber} ${candidate.label} → ${label}: ${note}`.slice(0, 500);
-    continueAfterHumanDecision(candidate, 'approved', { decisionText, sdkApproved: false });
+    const scope = candidateCorrectionScopes[candidate.id] ?? 'item';
+    const decisionText = `P.${candidate.pageNumber} ${candidate.label} → ${label}: ${note}`.slice(0, 500);
+    continueAfterHumanDecision(candidate, 'approved', { decisionText, sdkApproved: false, scope });
   };
 
   const rejectCandidate = (candidate: AnnotationCandidate) => {
-    setCandidates((items) => items.filter((item) => item.id !== candidate.id));
+    updateDocumentAnnotationRecords((current) => resolveCandidateReview(current, candidate.id, { type: 'reject', candidate }));
     setCandidateCorrections((items) => { const next = { ...items }; delete next[candidate.id]; return next; });
-    setRejectedCandidates((items) => [...items.filter((item) => item.id !== candidate.id), candidate]);
+    setCandidateCorrectionScopes((items) => { const next = { ...items }; delete next[candidate.id]; return next; });
     addAgentActivity('Reviewing', `人が却下: ${candidate.label}`, 'complete', candidate.pageNumber);
     setAgentStatus(candidates.length > 1 ? 'waiting' : 'complete');
     setSaved(false);
@@ -1492,35 +1534,58 @@ function App() {
     continueAfterHumanDecision(candidate, 'rejected');
   };
 
-  function continueAfterHumanDecision(candidate: AnnotationCandidate, decision: 'approved' | 'rejected', options?: { decisionText?: string; sdkApproved?: boolean }) {
+  function continueAfterHumanDecision(candidate: AnnotationCandidate, decision: 'approved' | 'rejected', options?: { decisionText?: string; sdkApproved?: boolean; scope?: HumanDecisionScope }) {
     const continuation = agentContinuation;
-    if (!continuation || candidate.pageNumber !== continuation.blockedPage) return;
+    if (!continuation) {
+      if (candidates.some((item) => item.id !== candidate.id)
+        || spreadsheetChanges.some((change) => change.requiresReview && !change.approved && !change.rejected)
+        || annotationOperations.some((operation) => operation.status === 'needs_review')) return;
+      const latestWaiting = agentRunHistoryRef.current.find((run) => run.status === 'waiting' && run.fileName === documentData?.fileName && run.sourceHash === documentData?.sourceHash);
+      if (latestWaiting) {
+        const targets = latestWaiting.pageCoverageTargets ?? [];
+        const covered = new Map((latestWaiting.pageCoverage ?? []).map((item) => [item.pageNumber, item]));
+        const coverageStillNeedsReview = targets.some((page) => {
+          const item = covered.get(page);
+          return !item || item.status !== 'checked' || item.warningCount > 0;
+        });
+        persistRunHistoryEntry({
+          ...latestWaiting,
+          status: coverageStillNeedsReview ? 'waiting' : 'complete',
+          endedAt: Date.now(),
+          summary: coverageStillNeedsReview ? 'Human review is resolved; the page coverage list still has items to inspect.' : 'Human review is complete.',
+        });
+      }
+      return;
+    }
+    if (candidate.pageNumber !== continuation.blockedPage) return;
     const actionLabel = options?.sdkApproved === false ? '修正' : decision === 'approved' ? '承認' : '却下';
     const anotherCandidateOnBlockedPage = candidates.some((item) => item.id !== candidate.id && item.pageNumber === continuation.blockedPage);
+    const scope = options?.scope ?? 'item';
     const decisionText = options?.decisionText ?? `人が${decision === 'approved' ? '確定' : '却下'}: P.${candidate.pageNumber} ${candidate.label}: ${candidate.excerpt || candidate.note}`;
+    const decisionContexts = recordHumanDecision(continuation, decisionText, scope);
     const currentApprovalDecision = candidate.approvalId && candidate.approvalRunId === continuation.approvalRunId
-      ? { approved: options?.sdkApproved ?? decision === 'approved', note: decisionText.slice(0, 500) }
+      ? { approved: options?.sdkApproved ?? decision === 'approved', note: decisionContexts.pageDecisionContext }
       : continuation.pendingApprovalDecision;
     const updatedContinuation = {
       ...continuation,
+      ...decisionContexts,
       pendingApprovalDecision: currentApprovalDecision,
       ...(options?.sdkApproved === false ? { humanCorrections: (continuation.humanCorrections ?? 0) + 1 } : {}),
     };
     if (anotherCandidateOnBlockedPage) {
-      if (currentApprovalDecision) setAgentContinuation(updatedContinuation);
+      setAgentContinuation(updatedContinuation);
       setAgentStatus('waiting');
       return;
     }
-    const decisionContext = [`${continuation.decisionContext}`, decisionText].filter(Boolean).join('\n');
     if (continuation.approvalRunId && continuation.approvalId && currentApprovalDecision) {
       addAgentActivity('Continuing', `人の${actionLabel}を反映し、Agent SDKの同じRunを再開します。`, 'complete', candidate.pageNumber);
       setAgentContinuation(null);
       setAgentStatus('running');
-      void resumeAgentRef.current?.({ ...updatedContinuation, decisionContext }, {
+      void resumeAgentRef.current?.(updatedContinuation, {
         runId: continuation.approvalRunId,
         approvalId: continuation.approvalId,
         approved: currentApprovalDecision.approved,
-        note: currentApprovalDecision.note,
+        note: decisionContexts.pageDecisionContext,
       });
       return;
     }
@@ -1528,7 +1593,7 @@ function App() {
       addAgentActivity('Continuing', `人の${actionLabel}を反映し、P.${continuation.remainingPages[0]}から残りのページを再開します。`, 'complete', candidate.pageNumber);
       setAgentContinuation(null);
       setAgentStatus('running');
-      void resumeAgentRef.current?.({ ...updatedContinuation, decisionContext });
+      void resumeAgentRef.current?.(updatedContinuation);
     } else {
       setAgentContinuation(null);
       setAgentStatus(candidates.some((item) => item.id !== candidate.id) ? 'waiting' : 'complete');
@@ -1569,7 +1634,7 @@ function App() {
   const exportAnnotatedWorkbook = async () => {
     if (!documentData || documentData.fileType.toLowerCase() !== 'xlsx') return;
     try {
-      const documentAnnotations = normalizeDocumentAnnotationRecords({ documentId: documentData.documentId, fileType: documentData.fileType, ...documentAnnotationView });
+      const documentAnnotations = normalizeDocumentAnnotationRecords({ documentId: documentData.documentId, sourceHash: documentData.sourceHash, fileType: documentData.fileType, ...documentAnnotationView });
       const response = await apiFetch(`/api/documents/${encodeURIComponent(documentData.documentId)}/export`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ format: 'native-annotated', documentAnnotations }),
@@ -1586,11 +1651,14 @@ function App() {
 
   const workspaceDocumentAnnotations = (entry: WorkspaceDocumentEntry, documentId: string) => {
     const fileType = entry.relativePath.split('.').at(-1)?.toUpperCase() ?? 'PDF';
+    const sourceHash = workspaceProjectRef.current?.documents.find((item) => item.id === entry.id)?.sourceHash
+      ?? (documentData?.fileName === entry.relativePath ? documentData.sourceHash : undefined);
     if (documentData?.documentId === documentId && documentData.fileName === entry.relativePath) {
-      return normalizeDocumentAnnotationRecords({ documentId, fileType, ...documentAnnotationView });
+      return normalizeDocumentAnnotationRecords({ documentId, sourceHash, fileType, ...documentAnnotationView });
     }
     try {
-      return readStoredDocumentAnnotationRecords(window.localStorage.getItem(annotationStorageKey(entry.relativePath)), documentId, fileType);
+      const raw = readWorkspaceState(window.localStorage, entry.relativePath, sourceHash).raw;
+      return readStoredDocumentAnnotationRecords(raw, documentId, fileType, sourceHash);
     } catch {
       return [];
     }
@@ -1605,7 +1673,7 @@ function App() {
   const preparedExportsForDocument = (sourceDocumentName: string) => {
     let saved: PreparedDocumentExport[] = [];
     try {
-      const raw = window.localStorage.getItem(annotationStorageKey(sourceDocumentName));
+      const raw = readWorkspaceState(window.localStorage, sourceDocumentName).raw;
       if (raw) saved = restorePreparedDocumentExports((JSON.parse(raw) as { preparedExports?: unknown }).preparedExports, sourceDocumentName);
     } catch { /* Ignore a damaged local workspace record; current in-memory exports remain available. */ }
     return mergePreparedDocumentExports(saved, restorePreparedDocumentExports(preparedDocumentExports, sourceDocumentName));
@@ -1743,6 +1811,9 @@ function App() {
     const useAgentNavigation = effectiveScope === 'all' && configuredForThisSession && settings.provider !== 'codex-app-server' && !continuation?.visitedPages?.length;
     let pages = continuation?.remainingPages ?? (isWorkbook ? [1] : useAgentNavigation ? [1] : effectiveScope === 'all' ? documentData.pages.map((page) => page.pageNumber) : [pageNumber]);
     const runTotalPages = effectiveScope === 'all' ? documentData.pageCount : pages.length;
+    const coverageTargetPages = effectiveScope === 'all'
+      ? documentData.pages.map((page) => page.pageNumber)
+      : [...new Set(continuation?.remainingPages ?? pages)];
     if (!pages.length) return;
     const runStartedAt = Date.now();
     const resumedRun = continuation?.runHistoryId
@@ -1764,6 +1835,7 @@ function App() {
       activeAgentRunRef.current = {
         id: crypto.randomUUID(),
         fileName: documentData.fileName,
+        ...(documentData.sourceHash ? { sourceHash: documentData.sourceHash } : {}),
         startedAt: runStartedAt,
         instruction: taskInstruction.trim(),
         mode: selectedMode,
@@ -1771,6 +1843,8 @@ function App() {
         totalPages: runTotalPages,
         completedPages: 0,
         events: [],
+        pageCoverageTargets: coverageTargetPages,
+        pageCoverage: [],
         ...(selectedMode === 'observe' ? { observationFindings: [] } : {}),
       };
     }
@@ -1789,12 +1863,22 @@ function App() {
     let reviewCount = 0;
     let spreadsheetReviewCount = 0;
     const runFindings: AnnotationCandidate[] = [];
-    const processedPages = new Set<number>();
+    const processedPages = new Set<number>(continuation?.visitedPages ?? []);
     let pausedContinuation: AgentContinuation | null = null;
     let runMode: 'live' | 'demo' = configuredForThisSession ? 'live' : 'demo';
     const runUsage: TokenUsage = { inputTokens: 0, outputTokens: 0, reasoningTokens: 0, cachedInputTokens: 0, totalTokens: 0 };
     let structuredTaskPlan = '';
     const agentVisitedPages = new Set<number>(continuation?.visitedPages ?? []);
+    const mergePageCoverage = (updates: AgentPageCoverage[]) => {
+      if (!updates.length || !activeAgentRunRef.current) return;
+      const byPage = new Map((activeAgentRunRef.current.pageCoverage ?? []).map((item) => [item.pageNumber, item]));
+      for (const update of updates) byPage.set(update.pageNumber, update);
+      activeAgentRunRef.current = {
+        ...activeAgentRunRef.current,
+        pageCoverage: [...byPage.values()].sort((left, right) => left.pageNumber - right.pageNumber),
+      };
+      persistRunHistoryEntry(activeAgentRunRef.current);
+    };
     const annotationSnapshot = new Map<string, {
       id: string; pageNumber: number; x: number; y: number; width: number; height: number;
       label: string; note: string; excerpt?: string; reviewPriority?: AnnotationReviewPriority; status: 'active' | 'needs_review';
@@ -1842,15 +1926,17 @@ function App() {
       const acceptedDecisionText = annotations
         .filter((annotation) => annotation.reviewedByHuman || annotation.source === 'manual')
         .slice(0, 20)
-        .map((annotation) => `人が確定: P.${annotation.pageNumber} ${annotation.label}: ${annotation.note}`);
+        .map((annotation) => `[THIS ITEM ONLY; DO NOT GENERALIZE] 人が確定: P.${annotation.pageNumber} ${annotation.label}: ${annotation.note}`);
       const rejectedDecisionText = rejectedCandidates
         .slice(-20)
-        .map((candidate) => `人が却下: P.${candidate.pageNumber} ${candidate.label}: ${candidate.excerpt || candidate.note}`);
+        .map((candidate) => `[THIS ITEM ONLY; DO NOT GENERALIZE] 人が却下: P.${candidate.pageNumber} ${candidate.label}: ${candidate.excerpt || candidate.note}`);
       const humanDecisions = [...acceptedDecisionText, ...rejectedDecisionText, continuation?.decisionContext ?? ''].filter(Boolean).join('\n').slice(0, 4000);
 
       for (const [index, targetPage] of pages.entries()) {
         if (useAgentNavigation && navigationUsed && agentVisitedPages.has(targetPage)) continue;
         const navigateThisCall = useAgentNavigation && !navigationUsed;
+        let pageTextBlockCount: number | undefined;
+        let pageToolEvents: Array<{ toolName: string; phase: AgentActivityPhase; detail: string; status: 'active' | 'complete' | 'waiting' | 'error'; pageNumber?: number; textBlockCount?: number; warningCount?: number }> = [];
         setScanProgress({ current: useAgentNavigation ? Math.max(1, completedPages) : index + 1, total: runTotalPages, scope: effectiveScope });
         const navigationId = addAgentActivity('Navigating', `navigate_page({ page: ${targetPage} }) → opening page ${targetPage} of ${documentData.pageCount}.`, 'active', targetPage);
         setPageNumber(targetPage);
@@ -1860,6 +1946,7 @@ function App() {
           let workbookApproval: SpreadsheetCellChange | undefined;
           const readingId = addAgentActivity('Reading', 'Loading the page image and extracting visible text and layout positions.', 'active', targetPage);
           const pageInspection = await inspectDocumentPage(targetPage);
+          pageTextBlockCount = pageInspection.textBlockCount;
           updateAgentActivity(navigationId, { status: 'complete', detail: `navigate_page → page ${targetPage} is visible in the viewer.` });
           updateAgentActivity(readingId, { status: 'complete', detail: `inspect_page → read ${pageInspection.textBlockCount} text blocks with positions and rendered the page image.`, pageNumber: targetPage });
 
@@ -1886,7 +1973,7 @@ function App() {
                 agentMode: selectedMode,
                 requireToolApproval: !workspaceBatchActiveRef.current,
                 existingAnnotations: [...annotationSnapshot.values()].slice(-500),
-                documentAnnotations: normalizeDocumentAnnotationRecords({ documentId: documentData.documentId, fileType: documentData.fileType, ...documentAnnotationView }),
+                documentAnnotations: normalizeDocumentAnnotationRecords({ documentId: documentData.documentId, sourceHash: documentData.sourceHash, fileType: documentData.fileType, ...documentAnnotationView }),
                 settings: { ...settings, apiKey },
               }, settings.apiServerUrl, (toolEvent) => {
                 if (toolEvent.toolName === 'navigate_page' && toolEvent.pageNumber !== undefined) setPageNumber(toolEvent.pageNumber);
@@ -1902,10 +1989,14 @@ function App() {
               }
             } else {
               pageCandidates = (Array.isArray(result.annotations) ? result.annotations : []) as AnnotationCandidate[];
-              const toolEvents = (Array.isArray(result.toolEvents) ? result.toolEvents : []) as Array<{ toolName: string; phase: AgentActivityPhase; detail: string; status: 'active' | 'complete' | 'waiting'; pageNumber?: number }>;
+              const toolEvents = (Array.isArray(result.toolEvents) ? result.toolEvents : []) as typeof pageToolEvents;
+              pageToolEvents = toolEvents;
               if (navigateThisCall) navigationUsed = true;
               if (Array.isArray(result.visitedPages)) {
                 for (const visitedPage of result.visitedPages.map(Number).filter((value:number)=>Number.isFinite(value)&&value>=1&&value<=documentData.pageCount)) agentVisitedPages.add(visitedPage);
+              }
+              for (const toolEvent of toolEvents) {
+                if (toolEvent.toolName === 'inspect_page' && Number.isInteger(toolEvent.pageNumber)) agentVisitedPages.add(Number(toolEvent.pageNumber));
               }
               if (streamedActivityCount === 0) {
                 for (const toolEvent of toolEvents) {
@@ -1955,6 +2046,7 @@ function App() {
             if (existingDecisions.some((annotation) => sameRegion(annotation, candidate))) return false;
             return !humanRejected.some((rejected) => rejected.label.trim().toLocaleLowerCase() === candidate.label.trim().toLocaleLowerCase() && ((rejected.excerpt && candidate.excerpt && rejected.excerpt === candidate.excerpt) || rejected.note.trim() === candidate.note.trim()));
           });
+          agentVisitedPages.add(targetPage);
           runFindings.push(...eligible);
           foundCount += eligible.length;
           if (selectedMode === 'observe') {
@@ -1993,7 +2085,36 @@ function App() {
           const newlyVisited = navigateThisCall
             ? [...agentVisitedPages].filter((visitedPage) => !processedPages.has(visitedPage))
             : [targetPage];
-          const pagesProcessedThisPass = newlyVisited.length ? newlyVisited : [targetPage];
+          const pagesProcessedThisPass = [...new Set([targetPage, ...newlyVisited])].filter((visitedPage) => !processedPages.has(visitedPage));
+          const openedOnlyPages = pageToolEvents
+            .filter((event) => event.toolName === 'navigate_page' && Number.isInteger(event.pageNumber))
+            .map((event) => Number(event.pageNumber))
+            .filter((visitedPage) => !pagesProcessedThisPass.includes(visitedPage));
+          const coveragePageNumbers = [...new Set([...pagesProcessedThisPass, ...openedOnlyPages])];
+          const pageCoverageUpdates: AgentPageCoverage[] = coveragePageNumbers.map((coveragePage) => {
+            const pageEvents = pageToolEvents.filter((event) => event.pageNumber === coveragePage);
+            const hasInspection = coveragePage === targetPage || pageEvents.some((event) => event.toolName === 'inspect_page');
+            const eventTextCount = pageEvents.find((event) => event.textBlockCount !== undefined)?.textBlockCount;
+            const textBlockCount = coveragePage === targetPage ? pageTextBlockCount : eventTextCount;
+            const documentWarningCount = documentData.pages.find((item) => item.pageNumber === coveragePage)?.warningCount ?? 0;
+            const eventWarningCount = pageEvents.reduce((maximum, event) => Math.max(maximum, Number(event.warningCount ?? 0)), 0);
+            const warningCount = Math.max(documentWarningCount, eventWarningCount);
+            const status: AgentPageCoverage['status'] = runMode === 'demo'
+              ? 'demo_only'
+              : !hasInspection ? 'opened'
+                : textBlockCount === 0 ? 'image_only' : 'checked';
+            const findingCount = eligible.filter((candidate) => candidate.pageNumber === coveragePage).length;
+            const reviewCount = needsReview.filter((candidate) => candidate.pageNumber === coveragePage).length;
+            const detail = status === 'opened'
+              ? 'Page opened, but no explicit inspect_page result was recorded.'
+              : status === 'image_only'
+                ? 'No positioned text was extracted; the page image was supplied for visual review.'
+                : warningCount > 0
+                  ? `The converter reported ${warningCount} warning${warningCount === 1 ? '' : 's'} for this page.`
+                  : status === 'demo_only' ? 'Fixed demo output; this page was not analyzed by a live model.' : undefined;
+            return { pageNumber: coveragePage, status, findingCount, reviewCount, warningCount, ...(textBlockCount !== undefined ? { textBlockCount } : {}), ...(detail ? { detail } : {}) };
+          });
+          mergePageCoverage(pageCoverageUpdates);
           completedPages += pagesProcessedThisPass.length;
           if (activeAgentRunRef.current) {
             activeAgentRunRef.current = { ...activeAgentRunRef.current, completedPages };
@@ -2035,6 +2156,7 @@ function App() {
           if (!workspaceBatchActiveRef.current && (selectedMode === 'assist' || selectedMode === 'autopilot') && hasReviewWork && (index < pages.length - 1 || Boolean(toolApprovalCandidate) || hasPendingSheetApproval || hasPendingAnnotationApproval)) {
             const blockingPage = toolApprovalCandidate?.pageNumber ?? pendingAnnotationOperation?.pageNumber ?? targetPage;
             pausedContinuation = {
+              ...(documentData.sourceHash ? { sourceHash: documentData.sourceHash } : {}),
               remainingPages: navigateThisCall && effectiveScope === 'all'
                 ? documentData.pages.map((page) => page.pageNumber).filter((page) => !agentVisitedPages.has(page))
                 : pages.slice(index + 1).filter((page) => !agentVisitedPages.has(page)),
@@ -2069,6 +2191,8 @@ function App() {
           if (index < pages.length - 1) addAgentActivity('Continuing', `Moving on from page ${targetPage} to the next page.`, 'complete', targetPage);
         } catch (error) {
           failure = error instanceof Error ? error.message : `ページ ${targetPage} の解析に失敗しました。`;
+          const warningCount = documentData.pages.find((item) => item.pageNumber === targetPage)?.warningCount ?? 0;
+          mergePageCoverage([{ pageNumber: targetPage, status: 'failed', findingCount: 0, reviewCount: 0, warningCount, ...(pageTextBlockCount !== undefined ? { textBlockCount: pageTextBlockCount } : {}), detail: failure.slice(0, 500) }]);
           updateAgentActivity(navigationId, { status: 'error', detail: failure });
           addAgentActivity('Reviewing', failure, 'error', targetPage);
           break;
@@ -2110,16 +2234,29 @@ function App() {
       else if (!failure) setAgentContinuation(null);
       if (completedPages && selectedMode !== 'observe') setSaved(false);
       if (runUsage.totalTokens > 0) setLastUsage(runUsage);
+      const coverageByPage = new Map((activeAgentRunRef.current?.pageCoverage ?? []).map((item) => [item.pageNumber, item]));
+      const scopedCoverage = coverageTargetPages.map((target) => coverageByPage.get(target));
+      const checkedCoverageCount = scopedCoverage.filter((item) => item?.status === 'checked').length;
+      const noFindingCoverageCount = scopedCoverage.filter((item) => item?.status === 'checked' && item.findingCount === 0).length;
+      const imageOnlyCoverageCount = scopedCoverage.filter((item) => item?.status === 'image_only').length;
+      const openedCoverageCount = scopedCoverage.filter((item) => item?.status === 'opened').length;
+      const failedCoverageCount = scopedCoverage.filter((item) => item?.status === 'failed').length;
+      const warningCoverageCount = scopedCoverage.filter((item) => Boolean(item && item.warningCount > 0)).length;
+      const unprocessedCoverageCount = scopedCoverage.filter((item) => !item).length;
+      const coverageAttentionCount = scopedCoverage.filter((item) => !item || ['image_only', 'opened', 'failed'].includes(item.status) || item.warningCount > 0).length;
       const remainingReviewCount = selectedMode === 'observe'
         ? candidates.length
         : candidates.filter((candidate) => !processedPages.has(candidate.pageNumber)).length + reviewCount + spreadsheetReviewCount;
-      const finalStatus: AgentRunStatus = failure ? 'error' : remainingReviewCount ? 'waiting' : 'complete';
+      const finalStatus: AgentRunStatus = failure ? 'error' : remainingReviewCount || coverageAttentionCount ? 'waiting' : 'complete';
       setAgentStatus(finalStatus);
       const invocationCompletedPages = completedPages - completedPagesBeforeInvocation;
       if (failure) addAgentActivity('Reviewing', `Run stopped after ${invocationCompletedPages} of ${runTotalPages} pages in this pass. ${failure}`, 'error');
-      else if (remainingReviewCount) addAgentActivity('Asking', spreadsheetReviewCount
-        ? `${reviewCount} annotation candidate${reviewCount === 1 ? '' : 's'} and ${spreadsheetReviewCount} workbook change${spreadsheetReviewCount === 1 ? '' : 's'} need human review.`
-        : `${remainingReviewCount} regions need your review before they are finalized.`, 'waiting');
+      else if (remainingReviewCount || coverageAttentionCount) addAgentActivity('Asking', [
+        remainingReviewCount ? spreadsheetReviewCount
+          ? `${reviewCount} annotation candidate${reviewCount === 1 ? '' : 's'} and ${spreadsheetReviewCount} workbook change${spreadsheetReviewCount === 1 ? '' : 's'} need human review.`
+          : `${remainingReviewCount} regions need your review before they are finalized.` : '',
+        coverageAttentionCount ? `${coverageAttentionCount} page${coverageAttentionCount === 1 ? '' : 's'} still need coverage review.` : '',
+      ].filter(Boolean).join(' '), 'waiting');
       else addAgentActivity('Continuing', selectedMode === 'observe' ? `Finished reading ${completedPages} pages. No annotations were changed.` : pausedContinuation ? `Paused on page ${pausedContinuation.blockedPage}; waiting for human review before continuing.` : `Finished ${completedPages} page${completedPages === 1 ? '' : 's'} with no pending reviews.`, pausedContinuation ? 'waiting' : 'complete');
       const modeSummary = selectedMode === 'observe'
         ? `${foundCount}件の可能性のある範囲を読み取りました。文書は変更していません。`
@@ -2133,7 +2270,8 @@ function App() {
         ? ` 一貫性レビューで${nextConsistencyIssues.length}件の確認候補を検出しました。${modelValidationCount ? ` Validator Agentの独立指摘が${modelValidationCount}件あります。` : ''}`
         : '';
       const humanCorrectionText = continuation?.humanCorrections ? ` 人の修正を${continuation.humanCorrections}件後続ページに反映しました。` : '';
-      const runSummary = `${completedPages} / ${runTotalPages}ページを読みました。${modeSummary}${humanCorrectionText}${consistencyText}${usageText}${demoText}${partialText}`;
+      const coverageText = `確認範囲: ${checkedCoverageCount}/${coverageTargetPages.length}ページをテキスト付きで確認し、${noFindingCoverageCount}ページは該当なし。${imageOnlyCoverageCount ? ` 文字抽出なし ${imageOnlyCoverageCount}ページ。` : ''}${warningCoverageCount ? ` 変換警告 ${warningCoverageCount}ページ。` : ''}${openedCoverageCount ? ` 開いたが未確認 ${openedCoverageCount}ページ。` : ''}${failedCoverageCount ? ` 失敗 ${failedCoverageCount}ページ。` : ''}${unprocessedCoverageCount ? ` 未処理 ${unprocessedCoverageCount}ページ。` : ''}`;
+      const runSummary = `${completedPages} / ${runTotalPages}ページを処理しました。${coverageText}${modeSummary}${humanCorrectionText}${consistencyText}${usageText}${demoText}${partialText}`;
       setMessage(runSummary);
       setActiveTab('ai');
       if (activeAgentRunRef.current) {
@@ -2228,6 +2366,7 @@ function App() {
       const { ok, payload: result, streamedActivityCount } = await postAgentRequest('/api/ai/approve', {
         ...decision,
         ...(documentData?.documentId ? { documentId: documentData.documentId } : {}),
+        ...(documentData?.sourceHash ? { sourceHash: documentData.sourceHash } : {}),
         settings: { ...settings, apiKey },
       }, settings.apiServerUrl, (toolEvent) => {
         if (toolEvent.toolName === 'navigate_page' && toolEvent.pageNumber !== undefined) setPageNumber(toolEvent.pageNumber);
@@ -2287,7 +2426,7 @@ function App() {
           approvalRunId: result.approvalRunId,
           approvalId: result.approvalId,
           pendingApprovalDecision: undefined,
-          decisionContext: [pending.decisionContext, decision.note].filter(Boolean).join('\n'),
+          decisionContext: pending.decisionContext,
         };
         setAgentContinuation(nextContinuation);
         setAgentStatus('waiting');
@@ -2300,7 +2439,7 @@ function App() {
       }
 
       if (needsReview.length && (pending.mode === 'assist' || pending.mode === 'autopilot')) {
-        setAgentContinuation({ ...pending, blockedPage, remainingPages, visitedPages, approvalRunId: undefined, approvalId: undefined, pendingApprovalDecision: undefined, decisionContext: [pending.decisionContext, decision.note].filter(Boolean).join('\n') });
+        setAgentContinuation({ ...pending, blockedPage, remainingPages, visitedPages, approvalRunId: undefined, approvalId: undefined, pendingApprovalDecision: undefined, decisionContext: pending.decisionContext });
         setAgentStatus('waiting');
         addAgentActivity('Asking', `${needsReview.length} additional region${needsReview.length === 1 ? '' : 's'} need review before continuing.`, 'waiting', blockedPage);
         await waitForRender();
@@ -2310,7 +2449,7 @@ function App() {
         return;
       }
 
-      const decisionContext = [pending.decisionContext, decision.note].filter(Boolean).join('\n');
+      const decisionContext = pending.decisionContext;
       if (remainingPages.length) {
         const nextContinuation = { ...pending, blockedPage, remainingPages, visitedPages, approvalRunId: undefined, approvalId: undefined, pendingApprovalDecision: undefined, decisionContext };
         setAgentContinuation(null);
@@ -2375,7 +2514,7 @@ function App() {
       annotations,
       reviewQueue: candidates,
       humanRejected: rejectedCandidates,
-      documentAnnotations: normalizeDocumentAnnotationRecords({ documentId: documentData.documentId, fileType: documentData.fileType, annotations, candidates, rejectedCandidates, spreadsheetChanges }),
+      documentAnnotations: normalizeDocumentAnnotationRecords({ documentId: documentData.documentId, sourceHash: documentData.sourceHash, fileType: documentData.fileType, annotations, candidates, rejectedCandidates, spreadsheetChanges }),
       usage,
       exportedAt: new Date().toISOString(),
     };
@@ -2425,7 +2564,7 @@ function App() {
       const response = await apiFetch(`/api/documents/${encodeURIComponent(documentData.documentId)}/export`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ format: 'native-annotated', documentAnnotations: normalizeDocumentAnnotationRecords({ documentId: documentData.documentId, fileType: documentData.fileType, ...documentAnnotationView }) }),
+        body: JSON.stringify({ format: 'native-annotated', documentAnnotations: normalizeDocumentAnnotationRecords({ documentId: documentData.documentId, sourceHash: documentData.sourceHash, fileType: documentData.fileType, ...documentAnnotationView }) }),
       }, settings.apiServerUrl);
       if (!response.ok) throw new Error((await response.json()).error ?? 'Wordコメントを書き出せませんでした。');
       const commentCount = Number(response.headers.get('X-Word-Comments-Added') ?? 0);
@@ -2453,7 +2592,7 @@ function App() {
       const response = await apiFetch(`/api/documents/${encodeURIComponent(documentData.documentId)}/export`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ format: 'native-annotated', documentAnnotations: normalizeDocumentAnnotationRecords({ documentId: documentData.documentId, fileType: documentData.fileType, ...documentAnnotationView }) }),
+        body: JSON.stringify({ format: 'native-annotated', documentAnnotations: normalizeDocumentAnnotationRecords({ documentId: documentData.documentId, sourceHash: documentData.sourceHash, fileType: documentData.fileType, ...documentAnnotationView }) }),
       }, settings.apiServerUrl);
       if (!response.ok) throw new Error((await response.json()).error ?? 'PowerPoint注釈を書き出せませんでした。');
       const addedCount = Number(response.headers.get('X-PPTX-Annotations-Added') ?? 0);
@@ -2554,6 +2693,24 @@ function App() {
     setPageNumber(clamp(nextPage, 1, documentData.pageCount));
     setSelectedId(null);
     setDraft(null);
+  };
+
+  const recheckCoveragePage = (targetPage: number, sourceRun: AgentRunHistory) => {
+    if (!documentData || working) return;
+    const page = clamp(targetPage, 1, documentData.pageCount);
+    goToPage(page);
+    setMessage(`P.${page}を現在のガイドラインで新しい1ページ確認として実行します。`);
+    void analyzeDocument('current', {
+      remainingPages: [page],
+      blockedPage: page,
+      ...(documentData.sourceHash ? { sourceHash: documentData.sourceHash } : {}),
+      fullDocument: false,
+      mode: sourceRun.mode,
+      instruction: sourceRun.instruction,
+      guidelines,
+      correction,
+      decisionContext: '',
+    });
   };
 
   const pageStyle = currentPage ? ({ '--page-ratio': `${currentPage.width} / ${currentPage.height}`, '--zoom': zoom / 100 } as CSSProperties) : undefined;
@@ -2680,34 +2837,32 @@ function App() {
                       onPointerUp={onCanvasPointerUp}
                       onPointerCancel={() => { setDragStart(null); setDraft(null); }}
                     >
-                      {currentCandidates.map((candidate) => (
+                      {currentCandidates.flatMap((candidate) => visibleAnnotationFragments(candidate).map((fragment, fragmentIndex) => (
                         <button
-                          key={`candidate-${candidate.id}`}
+                          key={`candidate-${candidate.id}-${fragmentIndex}`}
                           type="button"
                           className="annotation-box annotation-candidate-box"
-                          style={{ left: `${candidate.x * 100}%`, top: `${candidate.y * 100}%`, width: `${candidate.width * 100}%`, height: `${candidate.height * 100}%`, '--annotation-color': candidate.color } as CSSProperties}
-                          aria-label={`${candidate.label}、確認候補、レビュー優先度 ${reviewPriorityLabel(candidate.reviewPriority, true)}、ページ ${candidate.pageNumber}`}
+                          style={{ left: `${fragment.x * 100}%`, top: `${fragment.y * 100}%`, width: `${fragment.width * 100}%`, height: `${fragment.height * 100}%`, '--annotation-color': candidate.color } as CSSProperties}
+                          aria-label={`${candidate.label}、確認候補${fragmentIndex ? `、位置 ${fragmentIndex + 1}` : ''}、レビュー優先度 ${reviewPriorityLabel(candidate.reviewPriority, true)}、ページ ${candidate.pageNumber}`}
                           onPointerDown={(event) => event.stopPropagation()}
                           onClick={(event) => { event.stopPropagation(); setActiveTab('ai'); }}
                         >
-                          <span className="annotation-index">?</span>
-                          <span className="annotation-tag">{candidate.label || '確認候補'}</span>
+                          {fragmentIndex === 0 && <><span className="annotation-index">?</span><span className="annotation-tag">{candidate.label || '確認候補'}</span></>}
                         </button>
-                      ))}
-                      {currentAnnotations.map((annotation, index) => (
+                      )))}
+                      {currentAnnotations.flatMap((annotation, index) => visibleAnnotationFragments(annotation).map((fragment, fragmentIndex) => (
                         <button
-                          key={annotation.id}
+                          key={`${annotation.id}-${fragmentIndex}`}
                           type="button"
                           className={`annotation-box${selectedId === annotation.id ? ' is-current' : ''}`}
-                          style={{ left: `${annotation.x * 100}%`, top: `${annotation.y * 100}%`, width: `${annotation.width * 100}%`, height: `${annotation.height * 100}%`, '--annotation-color': annotation.color } as CSSProperties}
-                          aria-label={`${annotation.label}、ページ ${annotation.pageNumber}`}
+                          style={{ left: `${fragment.x * 100}%`, top: `${fragment.y * 100}%`, width: `${fragment.width * 100}%`, height: `${fragment.height * 100}%`, '--annotation-color': annotation.color } as CSSProperties}
+                          aria-label={`${annotation.label}、${fragmentIndex ? `位置 ${fragmentIndex + 1}、` : ''}ページ ${annotation.pageNumber}`}
                           onPointerDown={(event) => event.stopPropagation()}
                           onClick={(event) => { event.stopPropagation(); setSelectedId(annotation.id); setActiveTab('annotations'); }}
                         >
-                          <span className="annotation-index">{String(index + 1).padStart(2, '0')}</span>
-                          <span className="annotation-tag">{annotation.label || 'ラベルなし'}</span>
+                          {fragmentIndex === 0 && <><span className="annotation-index">{String(index + 1).padStart(2, '0')}</span><span className="annotation-tag">{annotation.label || 'ラベルなし'}</span></>}
                         </button>
-                      ))}
+                      )))}
                       {draft && <div className="annotation-box annotation-draft" style={{ left: `${draft.x * 100}%`, top: `${draft.y * 100}%`, width: `${Math.max(0.03, draft.width) * 100}%`, height: `${Math.max(0.025, draft.height) * 100}%` }} />}
                     </div>
                   </div>
@@ -2848,6 +3003,28 @@ function App() {
                           </summary>
                           <p className="run-history-instruction">{run.instruction}</p>
                           {run.summary && <p className="run-history-summary">{run.summary}</p>}
+                          {run.pageCoverage?.length || run.pageCoverageTargets?.length ? <section className="run-page-coverage" aria-label="Page coverage">
+                            <div className="run-page-coverage-heading"><strong>ページ確認範囲</strong><span>{(run.pageCoverage ?? []).filter((item) => item.status === 'checked').length}/{run.pageCoverageTargets?.length ?? run.totalPages} テキスト確認</span></div>
+                            <p className="run-page-coverage-summary">
+                              該当なし {(run.pageCoverage ?? []).filter((item) => item.status === 'checked' && item.findingCount === 0 && item.reviewCount === 0).length}ページ
+                              {(run.pageCoverage ?? []).some((item) => item.warningCount > 0) ? ` · 変換警告 ${(run.pageCoverage ?? []).filter((item) => item.warningCount > 0).length}ページ` : ''}
+                              {(run.pageCoverage ?? []).some((item) => item.status === 'image_only') ? ` · 画像のみ ${(run.pageCoverage ?? []).filter((item) => item.status === 'image_only').length}ページ` : ''}
+                              {(run.pageCoverage ?? []).some((item) => item.status === 'failed') ? ` · 失敗 ${(run.pageCoverage ?? []).filter((item) => item.status === 'failed').length}ページ` : ''}
+                            </p>
+                            <ol className="run-page-coverage-list">
+                              {(run.pageCoverage ?? []).map((coverage) => <li className={`run-page-coverage-entry is-${coverage.status}`} key={`${run.id}-coverage-${coverage.pageNumber}`}>
+                                <button type="button" className="candidate-page" onClick={() => goToPage(coverage.pageNumber)}>P.{coverage.pageNumber}</button>
+                                <span className="run-page-coverage-status">{PAGE_COVERAGE_LABELS[coverage.status]}</span>
+                                <span className="run-page-coverage-counts">{coverage.findingCount}件該当{coverage.reviewCount ? ` · ${coverage.reviewCount}件確認待ち` : ''}{coverage.warningCount ? ` · 警告${coverage.warningCount}` : ''}{coverage.textBlockCount !== undefined ? ` · テキスト${coverage.textBlockCount}ブロック` : ''}</span>
+                                {coverage.detail && <small>{coverage.detail}</small>}
+                                {(coverage.status !== 'checked' || coverage.warningCount > 0) && <button type="button" className="candidate-recheck" disabled={working || !documentData} onClick={() => recheckCoveragePage(coverage.pageNumber, run)}>このページを再確認</button>}
+                              </li>)}
+                            </ol>
+                            {run.pageCoverageTargets && run.pageCoverageTargets.filter((page) => !run.pageCoverage?.some((coverage) => coverage.pageNumber === page)).length > 0 && <div className="run-page-coverage-unprocessed">
+                              <strong>未処理ページ</strong>
+                              {run.pageCoverageTargets.filter((page) => !run.pageCoverage?.some((coverage) => coverage.pageNumber === page)).map((page) => <span className="run-page-unprocessed-entry" key={`${run.id}-unprocessed-${page}`}><button type="button" className="candidate-page" onClick={() => goToPage(page)}>P.{page}</button><button type="button" className="candidate-recheck" disabled={working || !documentData} onClick={() => recheckCoveragePage(page, run)}>再確認</button></span>)}
+                            </div>}
+                          </section> : null}
                           {run.observationFindings?.length ? <section className="run-history-observation-findings" aria-label="Saved read-only findings">
                             <strong>読み取り結果（{run.observationFindings.length + (run.observationFindingOverflow ?? 0)}件）</strong>
                             <div className="candidate-list">
@@ -2957,6 +3134,8 @@ function App() {
                           <summary>変更して確定</summary>
                           <label>修正ラベル<input value={candidateCorrections[candidate.id]?.label ?? candidate.label} onChange={(event) => setCandidateCorrections((items) => ({ ...items, [candidate.id]: { label: event.target.value, note: items[candidate.id]?.note ?? candidate.note } }))} maxLength={60} /></label>
                           <label>修正メモ<textarea value={candidateCorrections[candidate.id]?.note ?? candidate.note} onChange={(event) => setCandidateCorrections((items) => ({ ...items, [candidate.id]: { label: items[candidate.id]?.label ?? candidate.label, note: event.target.value } }))} maxLength={500} /></label>
+                          <label>修正の適用範囲<select value={candidateCorrectionScopes[candidate.id] ?? 'item'} onChange={(event) => setCandidateCorrectionScopes((items) => ({ ...items, [candidate.id]: event.target.value as HumanDecisionScope }))}><option value="item">この候補だけ（初期設定）</option><option value="remaining_pages">残りのページにも適用するルール</option></select></label>
+                          <small>「この候補だけ」は他の候補の判断基準に使いません。</small>
                           <button type="button" className="candidate-add" disabled={working} onClick={() => correctCandidate(candidate)}><Check size={14} /> 変更を反映して続行</button>
                         </details>
                         <div className="candidate-actions"><button type="button" className="candidate-add" onClick={() => addCandidate(candidate)}><Check size={14} /> 確認して追加</button><button type="button" className="candidate-reject" onClick={() => rejectCandidate(candidate)}>却下</button></div>

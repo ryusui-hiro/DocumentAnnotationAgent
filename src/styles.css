@@ -250,6 +250,20 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .run-history-item > summary span:first-child { width: 100%; color: #7a888e; font-weight: 500; }
 .run-history-instruction, .run-history-summary { margin: 6px 0; color: #627178; font-size: 8px; line-height: 1.45; overflow-wrap: anywhere; }
 .run-history-summary { color: #32827a; }
+.run-page-coverage { display: grid; gap: 5px; margin: 8px 0; padding: 7px; border: 1px solid #e2e9e8; border-radius: 5px; background: #f9fbfb; }
+.run-page-coverage-heading { display: flex; align-items: center; justify-content: space-between; color: #52636a; font-size: 8px; }
+.run-page-coverage-heading span { color: #68827f; font-variant-numeric: tabular-nums; }
+.run-page-coverage-summary { margin: 0; color: #78868b; font-size: 7px; line-height: 1.4; }
+.run-page-coverage-list { display: grid; max-height: 130px; gap: 3px; overflow: auto; margin: 0; padding: 0; list-style: none; }
+.run-page-coverage-entry { display: grid; grid-template-columns: auto auto minmax(0, 1fr); align-items: center; gap: 3px 5px; padding: 3px 4px; border-radius: 4px; background: #fff; color: #67767c; font-size: 7px; }
+.run-page-coverage-entry.is-failed { background: #fff2f1; color: #915454; }
+.run-page-coverage-entry.is-image_only, .run-page-coverage-entry.is-opened { background: #fff9ed; color: #876b35; }
+.run-page-coverage-status { font-weight: 650; }
+.run-page-coverage-counts { color: #8a969b; text-align: right; }
+.run-page-coverage-entry small { grid-column: 2 / 4; color: inherit; font-size: 6px; line-height: 1.35; }
+.run-page-coverage-entry .candidate-recheck { grid-column: 2 / 4; justify-self: start; }
+.run-page-coverage-unprocessed { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; color: #956f2d; font-size: 7px; }
+.run-page-unprocessed-entry { display: inline-flex; align-items: center; gap: 3px; }
 .run-history-events { max-height: 145px; }
 .activity-copy { min-width: 0; }
 .activity-copy > div { display: flex; align-items: center; gap: 6px; }
@@ -301,6 +315,8 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .candidate-color { width: 7px; height: 7px; border-radius: 50%; background: var(--annotation-color); }
 .candidate-label { color: #36444d; font-size: 10px; font-weight: 600; }
 .candidate-page { margin-left: auto; padding: 0; border: 0; background: transparent; color: #27817b; cursor: pointer; font-size: 9px; }
+.candidate-recheck { padding: 2px 5px; border: 1px solid #d6e4e1; border-radius: 4px; background: #fff; color: #367a74; cursor: pointer; font-size: 7px; line-height: 1.3; }
+.candidate-recheck:disabled { cursor: not-allowed; opacity: .55; }
 .review-priority-badge { color: #9a712c; font-size: 8px; white-space: nowrap; }
 .candidate-card p { margin: 8px 0; color: #78858d; font-size: 9px; line-height: 1.55; }
 .candidate-reason { margin: 7px 0; color: #738087; font-size: 9px; line-height: 1.5; }
@@ -309,7 +325,8 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .candidate-correction-editor { display: grid; gap: 6px; margin-top: 8px; padding: 6px; border: 1px solid #e7eceb; border-radius: 5px; background: #fbfcfc; }
 .candidate-correction-editor > summary { color: #55706f; cursor: pointer; font-size: 8px; font-weight: 600; }
 .candidate-correction-editor label { display: grid; gap: 3px; color: #748188; font-size: 8px; }
-.candidate-correction-editor input, .candidate-correction-editor textarea { width: 100%; min-width: 0; padding: 5px 6px; border: 1px solid #dfe6e6; border-radius: 4px; background: #fff; color: #46575f; font: inherit; font-size: 8px; }
+.candidate-correction-editor input, .candidate-correction-editor textarea, .candidate-correction-editor select { width: 100%; min-width: 0; padding: 5px 6px; border: 1px solid #dfe6e6; border-radius: 4px; background: #fff; color: #46575f; font: inherit; font-size: 8px; }
+.candidate-correction-editor > small { color: #7a888d; font-size: 7px; line-height: 1.4; }
 .candidate-correction-editor textarea { min-height: 46px; resize: vertical; }
 .candidate-correction-editor .candidate-add { justify-self: start; }
 .candidate-actions { display: flex; align-items: center; gap: 8px; margin-top: 7px; }

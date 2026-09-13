@@ -31,6 +31,7 @@ function readDocument(value: unknown): WorkspaceDocumentEntry | null {
     ...(typeof record.error === 'string' ? { error: record.error.slice(0, 500) } : {}),
     ...(Number.isFinite(record.size) ? { size: Math.max(0, Number(record.size)) } : {}),
     ...(Number.isFinite(record.lastModified) ? { lastModified: Math.max(0, Number(record.lastModified)) } : {}),
+    ...(typeof record.sourceHash === 'string' && /^[\da-f]{64}$/i.test(record.sourceHash) ? { sourceHash: record.sourceHash.toLowerCase() } : {}),
     ...(typeof record.nativePath === 'string' ? { nativePath: record.nativePath.slice(0, 4000) } : {}),
   };
 }
@@ -59,9 +60,9 @@ export function loadWorkspaceProject(storage: WorkspaceStorage): WorkspaceProjec
 
 export function saveWorkspaceProject(storage: WorkspaceStorage, project: WorkspaceProject) {
   try {
-    const documents = project.documents.slice(0, maxWorkspaceDocuments).map(({ id, relativePath, selected, status, error, size, lastModified, nativePath }) => ({
+    const documents = project.documents.slice(0, maxWorkspaceDocuments).map(({ id, relativePath, selected, status, error, size, lastModified, sourceHash, nativePath }) => ({
       id, relativePath, selected, status, ...(error ? { error } : {}), ...(size !== undefined ? { size } : {}),
-      ...(lastModified !== undefined ? { lastModified } : {}), ...(nativePath ? { nativePath } : {}),
+      ...(lastModified !== undefined ? { lastModified } : {}), ...(sourceHash ? { sourceHash } : {}), ...(nativePath ? { nativePath } : {}),
     }));
     storage.setItem(workspaceProjectStorageKey, JSON.stringify({
       id: project.id,

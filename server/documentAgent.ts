@@ -3,13 +3,13 @@ import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type OpenAI from 'openai';
 import sharp from 'sharp';
-import type { DocumentAnnotationOperation, DocumentAnnotationRecord, PreparedDocumentExport } from '../src/types';
+import type { DocumentAnnotationOperation, DocumentAnnotationRecord, NormalizedTextBox, PreparedDocumentExport, TextAnchor } from '../src/types';
 import { createDocumentReaderAgent, documentReaderOutputSchema } from './documentReader';
 import { documentExportStore } from './documentExportStore';
 import { SpreadsheetDocumentAdapter, type SpreadsheetCellChange, type SpreadsheetValue } from './spreadsheetAdapter';
 import { PagedDocumentAdapter, type DocumentAdapter } from './documentAdapter';
 import { privateRecordStore } from './privateRecordStore';
-import { findPositionedTextTargets } from './textTarget';
+import { findPositionedTextTargets, parsePositionedTextLines, type PositionedTextBlock, type PositionedTextTarget } from './textTarget';
 
 type Candidate = {
   id: string;
@@ -21,6 +21,8 @@ type Candidate = {
   note: string;
   reason: string;
   excerpt?: string;
+  fragments?: NormalizedTextBox[];
+  textAnchor?: TextAnchor;
   confidence?: number;
   reviewPriority: 'low' | 'medium' | 'high';
   requiresReview: boolean;
@@ -51,9 +53,11 @@ type ToolActivity = {
   detail: string;
   status: 'active' | 'complete' | 'waiting';
   pageNumber?: number;
+  textBlockCount?: number;
+  warningCount?: number;
 };
 type ToolActivitySink = { current?: (event: ToolActivity) => void };
-type AgentNavigationState = { startingPage: number; currentPage: number; currentPageTextLines: string[]; currentPageImageDataUrl?: string; visitedPages: Set<number>; inspectedPages: Set<number> };
+type AgentNavigationState = { startingPage: number; currentPage: number; currentPageTextLines: string[]; currentPagePositionedText: PositionedTextBlock[]; selectedTextTarget?: PositionedTextTarget; currentPageImageDataUrl?: string; visitedPages: Set<number>; inspectedPages: Set<number> };
 type DocumentAgentMode = 'observe' | 'suggest' | 'assist' | 'autopilot';
 type AgentTokenUsage = { requests: number; inputTokens: number; outputTokens: number; reasoningTokens: number; cachedInputTokens: number; totalTokens: number };
 type PendingAgentRun = {
@@ -105,6 +109,7 @@ type PendingAgentRunConfiguration = {
   requestedScope?: 'current' | 'all';
   existingAnnotations: ExistingAnnotation[];
   documentId?: string;
+  sourceHash?: string;
   allowNavigation: boolean;
   mode: DocumentAgentMode;
   requireToolApproval: boolean;
@@ -192,6 +197,7 @@ export async function getPendingAgentRunInfo(runId: string) {
     providerName: inMemory.configuration.providerName,
     reasoningEffort: inMemory.configuration.reasoningEffort,
     ...(inMemory.configuration.documentId ? { documentId: inMemory.configuration.documentId } : {}),
+    ...(inMemory.configuration.sourceHash ? { sourceHash: inMemory.configuration.sourceHash } : {}),
     createdAt: inMemory.createdAt,
   };
   const snapshot = await pendingRunRecordStore.get<PendingAgentRunSnapshot>('pending-agent-runs', runId);
@@ -206,6 +212,7 @@ export async function getPendingAgentRunInfo(runId: string) {
     providerName: snapshot.configuration.providerName,
     reasoningEffort: snapshot.configuration.reasoningEffort,
     ...(snapshot.configuration.documentId ? { documentId: snapshot.configuration.documentId } : {}),
+    ...(snapshot.configuration.sourceHash ? { sourceHash: snapshot.configuration.sourceHash } : {}),
     createdAt: snapshot.createdAt,
   };
 }
@@ -308,7 +315,12 @@ function prunePendingAgentRuns() {
   }
 }
 
-function candidateFromApproval(runId: string, approvalId: string, input: z.infer<typeof regionParameters>, pageNumber: number): Candidate {
+function candidateFromApproval(runId: string, approvalId: string, input: z.infer<typeof regionParameters>, pageNumber: number, fallbackTextTarget?: PositionedTextTarget): Candidate {
+  const useTextTarget = fallbackTextTarget &&
+    Math.max(Math.abs(input.x - fallbackTextTarget.boundingBox.x), Math.abs(input.y - fallbackTextTarget.boundingBox.y),
+      Math.abs(input.width - fallbackTextTarget.boundingBox.width), Math.abs(input.height - fallbackTextTarget.boundingBox.height)) <= 0.01
+    ? fallbackTextTarget
+    : undefined;
   return {
     id: approvalId,
     x: Math.min(0.98, Math.max(0, input.x)),
@@ -325,19 +337,21 @@ function candidateFromApproval(runId: string, approvalId: string, input: z.infer
     color: '#278779',
     pageNumber,
     source: 'ai',
+    ...((input.fragments?.length || useTextTarget) ? { fragments: input.fragments?.length ? input.fragments : useTextTarget?.fragments } : {}),
+    ...((input.textAnchor && input.textAnchor.position.end >= input.textAnchor.position.start || useTextTarget) ? { textAnchor: input.textAnchor && input.textAnchor.position.end >= input.textAnchor.position.start ? input.textAnchor : useTextTarget?.textAnchor } : {}),
     approvalRunId: runId,
     approvalId,
   };
 }
 
-function documentRecordFromCandidate(candidate: Candidate, documentId: string, sourceFormat: string): DocumentAnnotationRecord {
+function documentRecordFromCandidate(candidate: Candidate, documentId: string, sourceFormat: string, sourceHash?: string): DocumentAnnotationRecord {
   const boundingBox = { x: candidate.x, y: candidate.y, width: candidate.width, height: candidate.height };
   const target = sourceFormat.toLowerCase() === 'pptx'
-    ? { kind: 'slide' as const, slide: candidate.pageNumber, boundingBox }
-    : { kind: 'page' as const, page: candidate.pageNumber, boundingBox };
+    ? { kind: 'slide' as const, slide: candidate.pageNumber, boundingBox, ...(candidate.fragments?.length ? { fragments: candidate.fragments } : {}), ...(candidate.textAnchor ? { textAnchor: candidate.textAnchor } : {}) }
+    : { kind: 'page' as const, page: candidate.pageNumber, boundingBox, ...(candidate.fragments?.length ? { fragments: candidate.fragments } : {}), ...(candidate.textAnchor ? { textAnchor: candidate.textAnchor } : {}) };
   const status = candidate.reviewedByHuman ? 'corrected' : candidate.requiresReview ? 'needs_review' : 'auto';
   return {
-    id: candidate.id, documentId, target, label: candidate.label,
+    id: candidate.id, documentId, ...(sourceHash ? { sourceHash } : {}), target, label: candidate.label,
     evidence: candidate.excerpt ?? '', explanation: [candidate.reason, candidate.note].filter(Boolean).join('\n'),
     reviewPriority: candidate.reviewPriority, status,
     ...(candidate.confidence !== undefined ? { confidence: candidate.confidence } : {}),
@@ -348,6 +362,14 @@ function documentRecordFromCandidate(candidate: Candidate, documentId: string, s
   };
 }
 
+const normalizedTextBoxParameters = z.object({
+  x: z.number().min(0).max(1), y: z.number().min(0).max(1),
+  width: z.number().min(0.001).max(1), height: z.number().min(0.001).max(1),
+}).strict();
+const textAnchorParameters = z.object({
+  quote: z.object({ exact: z.string().min(1).max(1000), prefix: z.string().max(100), suffix: z.string().max(100) }).strict(),
+  position: z.object({ start: z.number().int().min(0), end: z.number().int().min(0), unit: z.literal('normalized-page-text') }).strict(),
+}).strict();
 const regionParameters = z.object({
   x: z.number().min(0).max(1),
   y: z.number().min(0).max(1),
@@ -357,6 +379,8 @@ const regionParameters = z.object({
   note: z.string().max(500),
   reason: z.string().min(1).max(500),
   excerpt: z.string().max(1000).optional(),
+  fragments: z.array(normalizedTextBoxParameters).max(32).optional(),
+  textAnchor: textAnchorParameters.optional(),
   confidence: z.number().min(0).max(1).nullable(),
   reviewPriority: z.enum(['low', 'medium', 'high']),
   requiresReview: z.boolean(),
@@ -395,7 +419,7 @@ function subtractUsage(current: AgentTokenUsage, previous: AgentTokenUsage): Age
 function collectVisitedPages(events: ToolActivity[], startingPage: number) {
   const visited = new Set<number>([startingPage]);
   for (const event of events) {
-    if ((event.toolName === 'inspect_page' || event.toolName === 'navigate_page') && event.pageNumber !== undefined) visited.add(event.pageNumber);
+    if (event.toolName === 'inspect_page' && event.pageNumber !== undefined) visited.add(event.pageNumber);
   }
   return [...visited];
 }
@@ -408,6 +432,8 @@ function addApprovalCandidates(args: {
   pageNumber: number;
   pagedAdapter?: PagedDocumentAdapter;
   documentId?: string;
+  sourceHash?: string;
+  textTarget?: PositionedTextTarget;
   onToolEvent?: (event: ToolActivity) => void;
 }) {
   const added: Candidate[] = [];
@@ -419,10 +445,10 @@ function addApprovalCandidates(args: {
     try { raw = JSON.parse(interruption.arguments); } catch { continue; }
     const parsed = regionParameters.safeParse(raw);
     if (!parsed.success || args.annotations.some((candidate) => candidate.id === approvalId)) continue;
-    const candidate = candidateFromApproval(args.runId, approvalId, parsed.data, args.pageNumber);
+    const candidate = candidateFromApproval(args.runId, approvalId, parsed.data, args.pageNumber, args.textTarget);
     if (args.annotations.filter((candidate) => candidate.pageNumber === args.pageNumber).length >= 12) break;
     args.annotations.push(candidate);
-    if (args.pagedAdapter) args.pagedAdapter.annotate(documentRecordFromCandidate(candidate, args.documentId ?? args.pagedAdapter.documentId, args.pagedAdapter.report.sourceFormat));
+    if (args.pagedAdapter) args.pagedAdapter.annotate(documentRecordFromCandidate(candidate, args.documentId ?? args.pagedAdapter.documentId, args.pagedAdapter.report.sourceFormat, args.sourceHash));
     added.push(candidate);
     const activity: ToolActivity = {
       toolName: 'request_review',
@@ -594,6 +620,7 @@ export async function runDocumentAgent(args: {
   documentAdapters?: DocumentAdapter[];
   spreadsheet?: SpreadsheetDocumentAdapter;
   documentId?: string;
+  sourceHash?: string;
   allowNavigation?: boolean;
   onToolEvent?: (event: ToolActivity) => void;
   mode?: DocumentAgentMode;
@@ -627,16 +654,25 @@ export async function runDocumentAgent(args: {
     toolActivity.push(event);
     activitySink.current?.(event);
   };
+  const pagedAdapter = args.documentAdapters?.find((adapter): adapter is PagedDocumentAdapter => adapter instanceof PagedDocumentAdapter);
+  const initialPage = restoreSnapshot?.navigation.currentPage ?? args.pageNumber;
+  const adapterText = pagedAdapter?.getPositionedPageTextBlocks(initialPage) ?? [];
+  const pagePositionedText = restoreSnapshot?.navigation.currentPagePositionedText?.length
+    ? restoreSnapshot.navigation.currentPagePositionedText
+    : adapterText.length
+      ? adapterText
+      : parsePositionedTextLines(args.pageText.split('\n').map((line) => line.trim()).filter(Boolean));
   const navigation: AgentNavigationState = {
     startingPage: restoreSnapshot?.navigation.startingPage ?? args.pageNumber,
-    currentPage: restoreSnapshot?.navigation.currentPage ?? args.pageNumber,
-    currentPageTextLines: restoreSnapshot?.navigation.currentPageTextLines ?? args.pageText.split('\n').map((line) => line.trim()).filter(Boolean),
+    currentPage: initialPage,
+    currentPageTextLines: restoreSnapshot?.navigation.currentPageTextLines ?? (pagedAdapter ? pagedAdapter.getPositionedPageText(initialPage) : args.pageText.split('\n').map((line) => line.trim()).filter(Boolean)),
+    currentPagePositionedText: pagePositionedText,
+    ...(restoreSnapshot?.navigation.selectedTextTarget ? { selectedTextTarget: restoreSnapshot.navigation.selectedTextTarget } : {}),
     ...(restoreSnapshot?.navigation.currentPageImageDataUrl ? { currentPageImageDataUrl: restoreSnapshot.navigation.currentPageImageDataUrl } : {}),
     visitedPages: new Set(restoreSnapshot?.navigation.visitedPages ?? [args.pageNumber]),
     inspectedPages: new Set(restoreSnapshot?.navigation.inspectedPages ?? restoreSnapshot?.toolActivity.filter((event) => event.toolName === 'inspect_page' && event.pageNumber !== undefined).map((event) => event.pageNumber!) ?? []),
   };
-  const pagedAdapter = args.documentAdapters?.find((adapter): adapter is PagedDocumentAdapter => adapter instanceof PagedDocumentAdapter);
-  const toDocumentRecord = (candidate: Candidate) => documentRecordFromCandidate(candidate, args.documentId ?? pagedAdapter?.documentId ?? '', pagedAdapter?.report.sourceFormat ?? 'PDF');
+  const toDocumentRecord = (candidate: Candidate) => documentRecordFromCandidate(candidate, args.documentId ?? pagedAdapter?.documentId ?? '', pagedAdapter?.report.sourceFormat ?? 'PDF', args.sourceHash);
   const syncAnnotationsToAdapter = (items: Candidate[]) => {
     if (!pagedAdapter) return;
     for (const candidate of items) pagedAdapter.annotate(toDocumentRecord(candidate));
@@ -658,7 +694,7 @@ export async function runDocumentAgent(args: {
     }
     syncAnnotationsToAdapter(annotations);
   }
-  const pushCandidate = (input: z.infer<typeof regionParameters>, forceReview: boolean, options?: { approvalRunId?: string; approvalId?: string; approved?: boolean; syncToAdapter?: boolean }) => {
+  const pushCandidate = (input: z.infer<typeof regionParameters>, forceReview: boolean, options?: { approvalRunId?: string; approvalId?: string; approved?: boolean; syncToAdapter?: boolean; textTarget?: PositionedTextTarget }) => {
     const existingIndex = options?.approvalId ? annotations.findIndex((item) => item.id === options.approvalId) : -1;
     if (annotations.filter((candidate) => candidate.pageNumber === navigation.currentPage).length >= 12 && existingIndex < 0) return null;
     const x = Math.min(0.98, Math.max(0, input.x));
@@ -678,6 +714,8 @@ export async function runDocumentAgent(args: {
       color: '#278779',
       pageNumber: navigation.currentPage,
       source: 'ai',
+      ...((input.fragments?.length || options?.textTarget) ? { fragments: input.fragments?.length ? input.fragments : options?.textTarget?.fragments } : {}),
+      ...((input.textAnchor && input.textAnchor.position.end >= input.textAnchor.position.start || options?.textTarget) ? { textAnchor: input.textAnchor && input.textAnchor.position.end >= input.textAnchor.position.start ? input.textAnchor : options?.textTarget?.textAnchor } : {}),
       ...(options?.approved ? { reviewedByHuman: true } : {}),
       ...(options?.approvalRunId ? { approvalRunId: options.approvalRunId } : {}),
       ...(options?.approvalId ? { approvalId: options.approvalId } : {}),
@@ -709,8 +747,11 @@ export async function runDocumentAgent(args: {
     parameters: z.object({}).strict(),
     execute: async () => {
       navigation.inspectedPages.add(navigation.currentPage);
-      recordToolActivity({ toolName: 'inspect_page', phase: 'Reading', detail: `Inspected page ${navigation.currentPage}: ${navigation.currentPageTextLines.length} extracted text lines plus page image.`, status: 'complete', pageNumber: navigation.currentPage });
-      return JSON.stringify({ pageNumber: navigation.currentPage, totalPages: args.totalPages, textBlockCount: navigation.currentPageTextLines.length, extractedText: navigation.currentPageTextLines.slice(0, 60).join('\n').slice(0, 8000) });
+      const pageView = pagedAdapter?.inspect({ kind: 'page', pageNumber: navigation.currentPage });
+      const warningCount = pageView?.kind === 'page' ? pageView.warnings.length : 0;
+      const textBlockCount = navigation.currentPagePositionedText.length;
+      recordToolActivity({ toolName: 'inspect_page', phase: 'Reading', detail: `Inspected page ${navigation.currentPage}: ${textBlockCount} positioned text blocks plus page image.`, status: 'complete', pageNumber: navigation.currentPage, textBlockCount, warningCount });
+      return JSON.stringify({ pageNumber: navigation.currentPage, totalPages: args.totalPages, textBlockCount, warningCount, extractedText: navigation.currentPageTextLines.slice(0, 60).join('\n').slice(0, 8000) });
     },
   });
 
@@ -818,9 +859,11 @@ export async function runDocumentAgent(args: {
         .toBuffer();
       navigation.currentPage = pageNumber;
       navigation.currentPageTextLines = pagedAdapter.getPositionedPageText(pageNumber);
+      navigation.currentPagePositionedText = pagedAdapter.getPositionedPageTextBlocks(pageNumber);
+      navigation.selectedTextTarget = undefined;
       navigation.currentPageImageDataUrl = pageNumber === navigation.startingPage ? undefined : `data:image/png;base64,${image.toString('base64')}`;
       navigation.visitedPages.add(pageNumber);
-      recordToolActivity({ toolName: 'navigate_page', phase: 'Navigating', detail: `Opened page ${pageNumber} because ${reason}.`, status: 'complete', pageNumber });
+      recordToolActivity({ toolName: 'navigate_page', phase: 'Navigating', detail: `Opened page ${pageNumber} because ${reason}.`, status: 'complete', pageNumber, textBlockCount: navigation.currentPagePositionedText.length, warningCount: view.warnings.length });
       return [
         { type: 'text' as const, text: JSON.stringify({ pageNumber, totalPages: args.totalPages, reason, textBlockCount: navigation.currentPageTextLines.length, extractedText: navigation.currentPageTextLines.slice(0, 60).join('\n').slice(0, 8000), warnings: view.warnings }) },
         { type: 'image' as const, image: { data: image, mediaType: 'image/png' }, detail: 'high' as const },
@@ -842,11 +885,12 @@ export async function runDocumentAgent(args: {
 
   const selectText = tool({
     name: 'select_text',
-    description: 'Find an exact phrase in positioned, selectable text on the currently open page. Returns normalized region bounds; repeated matches are marked ambiguous. This tool is read-only.',
+    description: 'Find an exact phrase in positioned, selectable text on the currently open page. Returns per-line fragments, a normalized bounding box, and quote/position selectors; repeated matches are marked ambiguous. This tool is read-only.',
     parameters: z.object({ text: z.string().min(2).max(1000) }).strict(),
     execute: async ({ text }) => {
-      const matches = findPositionedTextTargets(navigation.currentPageTextLines, text, 8);
+      const matches = findPositionedTextTargets(navigation.currentPagePositionedText, text, 8);
       const unique = matches.length === 1 && matches[0]?.occurrences === 1;
+      navigation.selectedTextTarget = unique ? matches[0] : undefined;
       recordToolActivity({
         toolName: 'select_text',
         phase: 'Searching',
@@ -1072,15 +1116,19 @@ export async function runDocumentAgent(args: {
     description: 'Create a region annotation from an exact phrase on the currently open page. The tool derives bounds from positioned text and succeeds only for one unique match. Use select_text first; for zero or multiple matches, inspect the image and use region tools without guessing.',
     parameters: textAnnotationParameters,
     execute: async (input) => {
-      const matches = findPositionedTextTargets(navigation.currentPageTextLines, input.text, 8);
+      const matches = findPositionedTextTargets(navigation.currentPagePositionedText, input.text, 8);
       if (matches.length !== 1 || matches[0]?.occurrences !== 1) {
+        navigation.selectedTextTarget = undefined;
         recordToolActivity({ toolName: 'annotate_text', phase: 'Reviewing', detail: `Could not resolve “${input.text.slice(0, 80)}” to one unique text region; no annotation was created.`, status: 'complete', pageNumber: navigation.currentPage });
         return JSON.stringify({ created: false, reason: matches.length ? 'Text appears in more than one region; choose a match from select_text or inspect the page image.' : 'No positioned text match was found; inspect the page image and use annotate_region if supported.', matches });
       }
 
       const match = matches[0]!;
+      navigation.selectedTextTarget = match;
       const region = {
         ...match.boundingBox,
+        fragments: match.fragments,
+        textAnchor: match.textAnchor,
         label: input.label,
         note: input.note,
         reason: input.reason,
@@ -1091,7 +1139,7 @@ export async function runDocumentAgent(args: {
       };
       if ((mode === 'assist' || mode === 'autopilot') && (input.requiresReview || input.reviewPriority === 'high')) {
         recordToolActivity({ toolName: 'annotate_text', phase: 'Asking', detail: `${input.label} matches visible text but needs human review; use request_review with the returned text region.`, status: 'complete', pageNumber: navigation.currentPage });
-        return JSON.stringify({ created: false, requiresReview: true, reason: 'This item needs human review; use request_review with this text-derived region.', region: match.boundingBox, excerpt: match.excerpt });
+        return JSON.stringify({ created: false, requiresReview: true, reason: 'This item needs human review; use request_review with this text-derived region, fragments, and selectors.', region: match.boundingBox, fragments: match.fragments, textAnchor: match.textAnchor, excerpt: match.excerpt });
       }
 
       const forceReview = mode === 'suggest';
@@ -1100,20 +1148,28 @@ export async function runDocumentAgent(args: {
       const phase = mode === 'observe' ? 'Searching' : mode === 'suggest' ? 'Reviewing' : 'Annotating';
       const status = mode === 'suggest' ? 'waiting' : 'complete';
       recordToolActivity({ toolName: 'annotate_text', phase, detail: `${candidate.label} matched positioned text on page ${navigation.currentPage}.`, status, pageNumber: navigation.currentPage });
-      return JSON.stringify({ created: true, id: candidate.id, label: candidate.label, requiresReview: candidate.requiresReview, region: match.boundingBox, excerpt: match.excerpt });
+      return JSON.stringify({ created: true, id: candidate.id, label: candidate.label, requiresReview: candidate.requiresReview, region: match.boundingBox, fragments: match.fragments, textAnchor: match.textAnchor, excerpt: match.excerpt });
     },
   });
 
   const requestReview = tool({
     name: 'request_review',
-    description: 'Mark an ambiguous visible region for human review and explain the uncertainty.',
+    description: 'Mark an ambiguous visible region for human review and explain the uncertainty. If a preceding annotate_text result supplies fragments and selectors, include them when requesting review.',
     isEnabled: mode === 'assist' || mode === 'autopilot',
     ...(args.requireToolApproval === false ? {} : { needsApproval: mode === 'assist' || mode === 'autopilot' }),
     parameters: regionParameters,
     execute: async (input, _context, details) => {
       const approvalId = details?.toolCall?.callId;
       const approved = Boolean(approvalId && approvedCallIds.delete(approvalId));
-      const candidate = pushCandidate({ ...input, requiresReview: true }, !approved, { ...(approved ? { approved: true, approvalId } : {}) });
+      const selectedTextTarget = navigation.selectedTextTarget;
+      const selectedRegionMatches = selectedTextTarget && Math.max(
+        Math.abs(input.x - selectedTextTarget.boundingBox.x), Math.abs(input.y - selectedTextTarget.boundingBox.y),
+        Math.abs(input.width - selectedTextTarget.boundingBox.width), Math.abs(input.height - selectedTextTarget.boundingBox.height),
+      ) <= 0.01;
+      const candidate = pushCandidate({ ...input, requiresReview: true }, !approved, {
+        ...(approved ? { approved: true, approvalId } : {}),
+        ...(selectedRegionMatches ? { textTarget: selectedTextTarget } : {}),
+      });
       if (!candidate) return JSON.stringify({ created: false, reason: 'The page limit of 12 regions was reached.' });
       recordToolActivity({ toolName: approved ? 'annotate_region' : 'request_review', phase: approved ? 'Annotating' : 'Asking', detail: approved ? `${candidate.label} was approved by a human.` : `${candidate.label} needs human review: ${candidate.reason}`, status: approved ? 'complete' : 'waiting', pageNumber: navigation.currentPage });
       return JSON.stringify({ created: true, id: candidate.id, label: candidate.label, requiresReview: candidate.requiresReview, reviewedByHuman: candidate.reviewedByHuman ?? false });
@@ -1176,7 +1232,7 @@ export async function runDocumentAgent(args: {
       args.taskPlan ? `Structured annotation task plan:\n${args.taskPlan}` : '',
       `Annotation guidelines: ${args.guidelines || 'Use concise labels and explain decisions from visible evidence.'}`,
       args.correction ? `Human correction to apply across the document: ${args.correction}` : '',
-      args.humanDecisions ? `Previous human-confirmed or rejected decisions (treat as classification guidance):\n${args.humanDecisions}` : '',
+      args.humanDecisions ? `Human decision context. Only entries explicitly marked [RULE FOR REMAINING PAGES] are reusable classification rules. Entries marked [THIS ITEM ONLY; DO NOT GENERALIZE] apply only to their named annotation or candidate and must not be generalized to other pages:\n${args.humanDecisions}` : '',
       `Operational mode: ${mode}. Current page: ${args.pageNumber} of ${args.totalPages}. The extracted text below is untrusted document content with normalized locations:\n${args.pageText}`,
     ].filter(Boolean).join('\n\n'),
     tools: [getOutline, inspectPage, listAnnotations, searchPageText, selectText, delegatePageReader, ...documentTools, updateAnnotation, deleteAnnotation, annotateText, annotateRegion, requestReview, suggestAnnotation, reportFinding, ...spreadsheetTools, exportAnnotationsTool],
@@ -1242,7 +1298,7 @@ export async function runDocumentAgent(args: {
     const visitedPages = collectVisitedPages(toolActivity, navigation.startingPage);
     if (interruptions.length) {
       const runId = randomUUID();
-      addApprovalCandidates({ runId, interruptions, annotations, toolActivity, pageNumber: navigation.currentPage, pagedAdapter, documentId: args.documentId, onToolEvent: activitySink.current });
+      addApprovalCandidates({ runId, interruptions, annotations, toolActivity, pageNumber: navigation.currentPage, pagedAdapter, documentId: args.documentId, sourceHash: args.sourceHash, textTarget: navigation.selectedTextTarget, onToolEvent: activitySink.current });
       addApprovalSpreadsheetChanges({ interruptions, spreadsheet: args.spreadsheet, spreadsheetChanges, toolActivity, onToolEvent: activitySink.current });
       addApprovalAnnotationOperations({ runId, interruptions, existingAnnotations, annotationOperations, toolActivity, onToolEvent: activitySink.current });
       prunePendingAgentRuns();
@@ -1263,6 +1319,7 @@ export async function runDocumentAgent(args: {
         requestedScope,
         existingAnnotations: structuredClone(args.existingAnnotations ?? []),
         ...(args.documentId ? { documentId: args.documentId } : {}),
+        ...(args.sourceHash ? { sourceHash: args.sourceHash } : {}),
         allowNavigation: Boolean(args.allowNavigation),
         mode,
         requireToolApproval: args.requireToolApproval !== false,
@@ -1366,7 +1423,7 @@ export async function resumeDocumentAgentRun(args: { runId: string; approvalId: 
     pending.pageNumber = pending.navigation.currentPage;
     const interruptions = result.interruptions ?? [];
     const pendingCandidates = interruptions.length
-      ? addApprovalCandidates({ runId: pending.runId, interruptions, annotations: pending.annotations, toolActivity: pending.toolActivity, pageNumber: pending.navigation.currentPage, pagedAdapter: pending.documentAdapters?.find((adapter): adapter is PagedDocumentAdapter => adapter instanceof PagedDocumentAdapter), documentId: pending.configuration.documentId, onToolEvent: pending.activitySink.current })
+      ? addApprovalCandidates({ runId: pending.runId, interruptions, annotations: pending.annotations, toolActivity: pending.toolActivity, pageNumber: pending.navigation.currentPage, pagedAdapter: pending.documentAdapters?.find((adapter): adapter is PagedDocumentAdapter => adapter instanceof PagedDocumentAdapter), documentId: pending.configuration.documentId, sourceHash: pending.configuration.sourceHash, textTarget: pending.navigation.selectedTextTarget, onToolEvent: pending.activitySink.current })
       : [];
     if (interruptions.length) {
       addApprovalSpreadsheetChanges({ interruptions, spreadsheet: pending.spreadsheet, spreadsheetChanges: pending.spreadsheetChanges, toolActivity: pending.toolActivity, onToolEvent: pending.activitySink.current });

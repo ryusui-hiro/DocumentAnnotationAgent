@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, extname, join, resolve } from 'node:path';
@@ -79,13 +79,22 @@ const existingAnnotationsSchema = z.array(z.object({
   reviewPriority: z.enum(['low', 'medium', 'high']).optional(),
   status: z.enum(['active', 'needs_review']),
 }).strict()).max(500);
+const normalizedTextBoxSchema = z.object({
+  x: z.number().min(0).max(1), y: z.number().min(0).max(1),
+  width: z.number().min(0).max(1), height: z.number().min(0).max(1),
+}).strict();
+const textAnchorSchema = z.object({
+  quote: z.object({ exact: z.string().min(1).max(1000), prefix: z.string().max(100), suffix: z.string().max(100) }).strict(),
+  position: z.object({ start: z.number().int().min(0), end: z.number().int().min(0), unit: z.literal('normalized-page-text') }).strict(),
+}).strict().refine((anchor) => anchor.position.end >= anchor.position.start, { message: 'Text selector end must follow its start.' });
 const documentAnnotationTargetSchema = z.discriminatedUnion('kind', [
-  z.object({ kind: z.literal('page'), page: z.number().int().min(1).max(120), boundingBox: z.object({ x: z.number().min(0).max(1), y: z.number().min(0).max(1), width: z.number().min(0).max(1), height: z.number().min(0).max(1) }).strict() }).strict(),
-  z.object({ kind: z.literal('slide'), slide: z.number().int().min(1).max(120), boundingBox: z.object({ x: z.number().min(0).max(1), y: z.number().min(0).max(1), width: z.number().min(0).max(1), height: z.number().min(0).max(1) }).strict() }).strict(),
+  z.object({ kind: z.literal('page'), page: z.number().int().min(1).max(120), boundingBox: normalizedTextBoxSchema, fragments: z.array(normalizedTextBoxSchema).max(32).optional(), textAnchor: textAnchorSchema.optional() }).strict(),
+  z.object({ kind: z.literal('slide'), slide: z.number().int().min(1).max(120), boundingBox: normalizedTextBoxSchema, fragments: z.array(normalizedTextBoxSchema).max(32).optional(), textAnchor: textAnchorSchema.optional() }).strict(),
   z.object({ kind: z.literal('sheet'), sheet: z.string().min(1).max(120), cellRange: z.string().min(1).max(30) }).strict(),
 ]);
 const documentAnnotationRecordSchema = z.object({
   id: z.string().min(1).max(100), documentId: z.string().min(1).max(100), target: documentAnnotationTargetSchema,
+  sourceHash: z.string().regex(/^[\da-f]{64}$/i).optional(),
   label: z.string().min(1).max(120), evidence: z.string().max(2000), explanation: z.string().max(2000),
   reviewPriority: z.enum(['low', 'medium', 'high']), status: z.enum(['auto', 'needs_review', 'approved', 'corrected', 'rejected']),
   confidence: z.number().min(0).max(1).optional(), note: z.string().max(500).optional(), reason: z.string().max(500).optional(),
@@ -107,11 +116,12 @@ const validationAnnotationsSchema = z.array(z.object({
 }).strict()).max(500);
 const modelIds: ModelId[] = ['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'];
 const reasoningEfforts: ReasoningEffort[] = ['none', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
-type DocumentSession = { id: string; fileName: string; report: PreviewReport; pageAdapter: PagedDocumentAdapter; createdAt: number; sourceBuffer?: Buffer; workbookBuffer?: Buffer; wordBuffer?: Buffer; presentationBuffer?: Buffer; spreadsheet?: SpreadsheetDocumentAdapter };
+type DocumentSession = { id: string; fileName: string; sourceHash: string; report: PreviewReport; pageAdapter: PagedDocumentAdapter; createdAt: number; sourceBuffer?: Buffer; workbookBuffer?: Buffer; wordBuffer?: Buffer; presentationBuffer?: Buffer; spreadsheet?: SpreadsheetDocumentAdapter };
 type PersistedDocumentSession = {
   version: 1;
   id: string;
   fileName: string;
+  sourceHash?: string;
   createdAt: number;
   report: PreviewReport;
   sourceBuffer: string;
@@ -178,9 +188,14 @@ function configuredModel(model: ModelId, settings?: AISettings): { client: OpenA
   };
 }
 
-function pagePayload(id: string, fileName: string, report: PreviewReport, demo: boolean) {
+function sourceHash(buffer: Buffer) {
+  return createHash('sha256').update(buffer).digest('hex');
+}
+
+function pagePayload(id: string, fileName: string, sourceHashValue: string, report: PreviewReport, demo: boolean) {
   return {
     documentId: id,
+    sourceHash: sourceHashValue,
     fileName,
     fileType: report.sourceFormat,
     pageCount: report.pageCount,
@@ -201,9 +216,11 @@ function pagePayload(id: string, fileName: string, report: PreviewReport, demo: 
 function storeDocument(fileName: string, report: PreviewReport, demo: boolean, sourceBuffer?: Buffer) {
   pruneDocumentSessions();
   const id = randomUUID();
+  const documentHash = sourceBuffer ? sourceHash(sourceBuffer) : '';
   documentSessions.set(id, {
     id,
     fileName,
+    sourceHash: documentHash,
     report,
     pageAdapter: new PagedDocumentAdapter(fileName, report, id, sourceBuffer),
     createdAt: Date.now(),
@@ -218,7 +235,7 @@ function storeDocument(fileName: string, report: PreviewReport, demo: boolean, s
     documentSessions.delete(oldestId);
     if (demoSessionId === oldestId) demoSessionId = undefined;
   }
-  return pagePayload(id, fileName, report, demo);
+  return pagePayload(id, fileName, documentHash, report, demo);
 }
 
 async function getSpreadsheet(session: DocumentSession) {
@@ -235,6 +252,7 @@ async function persistDocumentSession(session: DocumentSession) {
     version: 1,
     id: session.id,
     fileName: session.fileName,
+    sourceHash: session.sourceHash,
     createdAt: Date.now(),
     report: session.report,
     sourceBuffer: session.sourceBuffer.toString('base64'),
@@ -308,6 +326,11 @@ async function restorePersistedDocumentSessions() {
   for (const record of restoredRecords) {
     try {
       const sourceBuffer = Buffer.from(record.sourceBuffer, 'base64');
+      const computedSourceHash = sourceHash(sourceBuffer);
+      if (record.sourceHash && record.sourceHash !== computedSourceHash) {
+        await privateRecordStore.delete('document-sessions', record.id);
+        continue;
+      }
       const extension = extname(record.fileName).toLowerCase();
       const spreadsheet = record.spreadsheetState
         ? await SpreadsheetDocumentAdapter.fromSavedState(record.fileName, Buffer.from(record.spreadsheetState.buffer, 'base64'), record.spreadsheetState.changes, record.id)
@@ -315,6 +338,7 @@ async function restorePersistedDocumentSessions() {
       documentSessions.set(record.id, {
         id: record.id,
         fileName: record.fileName,
+        sourceHash: computedSourceHash,
         report: record.report,
         pageAdapter: new PagedDocumentAdapter(record.fileName, record.report, record.id, sourceBuffer),
         createdAt: record.createdAt,
@@ -381,7 +405,7 @@ app.get('/api/demo', async (_request, response, next) => {
       currentDemo = documentSessions.get(payload.documentId);
     }
     if (!currentDemo) throw new Error('サンプル文書を準備できませんでした。');
-    response.json(pagePayload(currentDemo.id, currentDemo.fileName, currentDemo.report, true));
+    response.json(pagePayload(currentDemo.id, currentDemo.fileName, currentDemo.sourceHash, currentDemo.report, true));
   } catch (error) {
     next(error);
   }
@@ -404,6 +428,13 @@ app.get('/api/documents/:documentId/pages/:pageNumber.svg', (request, response) 
     .set('Content-Security-Policy', "default-src 'none'; img-src data:; style-src 'unsafe-inline'")
     .set('Cache-Control', 'private, max-age=300')
     .send(page.svg);
+});
+
+app.get('/api/documents/:documentId/identity', (request, response) => {
+  pruneDocumentSessions();
+  const session = documentSessions.get(request.params.documentId);
+  if (!session) { response.status(410).json({ error: '文書セッションの有効期限が切れました。文書を開き直してください。' }); return; }
+  response.set('Cache-Control', 'no-store').json({ documentId: session.id, fileName: session.fileName, sourceHash: session.sourceHash });
 });
 
 app.get('/api/health', (_request, response) => {
@@ -512,6 +543,7 @@ app.post('/api/documents/:documentId/export', async (request, response, next) =>
       const parsed = documentAnnotationRecordsSchema.safeParse(body.documentAnnotations);
       if (!parsed.success) { response.status(400).json({ error: 'Document annotations are invalid or exceed 500 items.' }); return; }
       if (parsed.data.some((record) => record.documentId !== session.id)) { response.status(409).json({ error: 'An annotation belongs to another document session.' }); return; }
+      if (parsed.data.some((record) => record.sourceHash && record.sourceHash !== session.sourceHash)) { response.status(409).json({ error: 'An annotation belongs to a different source-file version.' }); return; }
       if (new Set(parsed.data.map((record) => record.id)).size !== parsed.data.length) { response.status(400).json({ error: 'Document annotation IDs must be unique within one export.' }); return; }
       records = parsed.data as DocumentAnnotationRecord[];
     }
@@ -890,14 +922,20 @@ app.post('/api/ai/annotate', async (request, response, next) => {
     const selectedPage = Math.max(1, Math.min(120, Number(pageNumber) || 1));
     let spreadsheet: SpreadsheetDocumentAdapter | undefined;
     const documentAdapters: DocumentAdapter[] = [];
+    let documentSourceHash: string | undefined;
     if (documentId) {
       pruneDocumentSessions();
       const session = documentSessions.get(documentId);
       if (!session) { response.status(410).json({ error: '文書セッションの有効期限が切れました。文書を開き直してください。' }); return; }
+      documentSourceHash = session.sourceHash;
       documentAdapters.push(session.pageAdapter);
       spreadsheet = await getSpreadsheet(session);
       if (spreadsheet) documentAdapters.push(spreadsheet);
       if (canonicalAnnotations) {
+        if (canonicalAnnotations.some((annotation) => annotation.sourceHash && annotation.sourceHash !== session.sourceHash)) {
+          response.status(409).json({ error: 'An annotation belongs to a different source-file version.' });
+          return;
+        }
         const isWorkbook = extname(session.fileName).toLowerCase() === '.xlsx';
         const visualRecords = canonicalAnnotations.filter((annotation) => annotation.target.kind === 'page' || annotation.target.kind === 'slide');
         const sheetRecords = canonicalAnnotations.filter((annotation) => annotation.target.kind === 'sheet');
@@ -1010,6 +1048,7 @@ app.post('/api/ai/annotate', async (request, response, next) => {
       documentAdapters,
       ...(spreadsheet ? { spreadsheet } : {}),
       ...(typeof documentId === 'string' ? { documentId } : {}),
+      ...(documentSourceHash ? { sourceHash: documentSourceHash } : {}),
       imageDataUrl,
       pageNumber: selectedPage,
       totalPages: boundedTotalPages,
@@ -1089,8 +1128,21 @@ app.post('/api/ai/approve', async (request, response, next) => {
       response.status(400).json({ error: 'Human review note must be under 500 characters.' });
       return;
     }
+    const pendingRunInfo = await getPendingAgentRunInfo(body.runId);
+    if (pendingRunInfo?.documentId) {
+      const pendingSession = documentSessions.get(pendingRunInfo.documentId);
+      if (pendingSession && pendingRunInfo.sourceHash && pendingSession.sourceHash !== pendingRunInfo.sourceHash) {
+        response.status(409).json({ error: '承認待ちRunの文書内容と保存済み文書セッションが一致しません。' });
+        return;
+      }
+      const expectedSourceHash = pendingRunInfo.sourceHash ?? pendingSession?.sourceHash;
+      if (!expectedSourceHash || typeof body.sourceHash !== 'string' || body.sourceHash !== expectedSourceHash) {
+        response.status(409).json({ error: '承認対象の文書がRun開始時の内容と一致しません。文書を再読み込みして確認してください。' });
+        return;
+      }
+    }
     if (!hasLivePendingAgentRun(body.runId)) {
-      const info = await getPendingAgentRunInfo(body.runId);
+      const info = pendingRunInfo;
       if (info) {
         const suppliedSettings = body.settings && typeof body.settings === 'object' && !Array.isArray(body.settings)
           ? body.settings as AISettings
@@ -1129,7 +1181,6 @@ app.post('/api/ai/approve', async (request, response, next) => {
         });
       }
     }
-    const pendingRunInfo = await getPendingAgentRunInfo(body.runId);
     if (body.stream === true) {
       response.status(200)
         .set('Content-Type', 'text/event-stream; charset=utf-8')

@@ -167,8 +167,10 @@ test('select_text and annotate_text map a unique positioned phrase to a read-onl
   assert.equal(result.annotations.length, 1);
   assert.equal(result.annotations[0]?.label, 'SAFETY WARNING');
   assert.deepEqual({ x: result.annotations[0]?.x, y: result.annotations[0]?.y, width: result.annotations[0]?.width, height: result.annotations[0]?.height }, {
-    x: 0.1, y: 0.1, width: 0.35, height: 0.07,
+    x: 0.1, y: 0.1, width: 0.30000000000000004, height: 0.07,
   });
+  assert.equal(result.annotations[0]?.fragments?.length, 2);
+  assert.equal(result.annotations[0]?.textAnchor?.quote.exact, 'power supply before servicing');
   assert.match(result.annotations[0]?.excerpt ?? '', /power supply before servicing/);
   assert.equal(result.annotations[0]?.requiresReview, true);
   assert.deepEqual(adapter.listAnnotations(), [], 'Observe findings must not enter the document annotation adapter');
@@ -305,9 +307,11 @@ test('restores an encrypted pending RunState and continues after a worker restar
     model: 'gpt-6-astra', reasoningEffort: 'medium', instruction: 'Find statements needing review.',
     guidelines: '', correction: '', humanDecisions: '', pageText: 'A statement with an unclear qualification.',
     imageDataUrl: 'data:image/png;base64,AA==', pageNumber: 1, totalPages: 1, mode: 'assist',
+    documentId: 'versioned-document-session', sourceHash: 'a'.repeat(64),
   }, model);
   assert.equal(paused.status, 'interrupted');
   assert.ok(paused.approvalRunId);
+  assert.equal((await getPendingAgentRunInfo(paused.approvalRunId!))?.sourceHash, 'a'.repeat(64));
 
   const restored = await restorePendingAgentRun({
     runId: paused.approvalRunId!, providerName: 'openai-api', forceRestore: true, testModel: model,
@@ -318,6 +322,45 @@ test('restores an encrypted pending RunState and continues after a worker restar
   assert.equal(resumed.status, 'complete');
   assert.equal(resumed.annotations.length, 0);
   assert.equal(await getPendingAgentRunInfo(paused.approvalRunId!), null, 'completed restored runs remove their durable checkpoint');
+});
+
+test('concurrent duplicate approvals cannot apply the same workbook mutation twice', async () => {
+  const workbook = new ExcelJS.Workbook();
+  workbook.addWorksheet('Customers').addRows([['Name', 'Risk'], ['Aki', null]]);
+  const adapter = await SpreadsheetDocumentAdapter.fromBuffer('customers.xlsx', Buffer.from(await workbook.xlsx.writeBuffer()));
+  const model = new ScriptedModel([
+    modelResponse([functionCall('get_document_outline', {}, { callId: 'duplicate-outline' })]),
+    modelResponse([functionCall('inspect_page', {}, { callId: 'duplicate-inspect' })]),
+    modelResponse([functionCall('get_workbook_outline', {}, { callId: 'duplicate-workbook' })]),
+    modelResponse([functionCall('inspect_sheet', { sheetName: 'Customers' }, { callId: 'duplicate-sheet' })]),
+    modelResponse([functionCall('read_range', { sheetName: 'Customers', range: 'A1:B2' }, { callId: 'duplicate-range' })]),
+    modelResponse([functionCall('write_cell', {
+      sheetName: 'Customers', address: 'B2', value: 'HIGH', reason: 'The evidence supports a high-risk label.', confidence: 0.9, reviewPriority: 'medium',
+    }, { callId: 'duplicate-write' })]),
+    modelResponse([assistantMessage('The approved cell update is complete.')]),
+  ]);
+  const paused = await runDocumentAgent({
+    model: 'gpt-6-astra', reasoningEffort: 'medium', instruction: 'Classify the customer.',
+    guidelines: '', correction: '', humanDecisions: '', pageText: 'Customer table.',
+    imageDataUrl: 'data:image/png;base64,AA==', pageNumber: 1, totalPages: 1, mode: 'assist',
+    spreadsheet: adapter, documentAdapters: [adapter],
+  }, model);
+  assert.equal(paused.status, 'interrupted');
+  const decision = { runId: paused.approvalRunId!, approvalId: paused.approvalId!, approved: true };
+  const results = await Promise.allSettled([
+    resumeDocumentAgentRun(decision),
+    resumeDocumentAgentRun(decision),
+  ]);
+  const completed = results.find((result) => result.status === 'fulfilled');
+  const duplicate = results.find((result) => result.status === 'rejected');
+  assert.equal(completed?.status, 'fulfilled');
+  assert.equal(duplicate?.status, 'rejected');
+  assert.equal((duplicate as PromiseRejectedResult | undefined)?.reason?.status, 409);
+  assert.equal(adapter.readRange('Customers', 'B2').rows[0]?.[0]?.value, 'HIGH');
+  assert.equal(adapter.getChanges().length, 1);
+  await assert.rejects(resumeDocumentAgentRun(decision), (error: unknown) => error instanceof Error && 'status' in error && (error as Error & { status: number }).status === 410);
+  assert.equal(adapter.getChanges().length, 1);
+  model.assertComplete();
 });
 
 test('the workbook tools inspect and edit a sheet, pausing and resuming the same RunState for each write', async () => {

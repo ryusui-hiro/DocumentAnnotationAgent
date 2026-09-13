@@ -23,9 +23,21 @@ export interface AnnotationTaskPlanSpec {
   workflow: string[];
 }
 
+export type PageCoverageStatus = 'checked' | 'image_only' | 'opened' | 'failed' | 'demo_only';
+export interface AgentPageCoverage {
+  pageNumber: number;
+  status: PageCoverageStatus;
+  findingCount: number;
+  reviewCount: number;
+  warningCount: number;
+  textBlockCount?: number;
+  detail?: string;
+}
+
 export interface AgentRunHistory {
   id: string;
   fileName: string;
+  sourceHash?: string;
   startedAt: number;
   endedAt?: number;
   instruction: string;
@@ -37,6 +49,8 @@ export interface AgentRunHistory {
   taskPlan?: AnnotationTaskPlanSpec;
   observationFindings?: AnnotationCandidate[];
   observationFindingOverflow?: number;
+  pageCoverageTargets?: number[];
+  pageCoverage?: AgentPageCoverage[];
   events: AgentActivityEvent[];
 }
 
@@ -50,6 +64,7 @@ export interface WorkspaceDocumentEntry {
   error?: string;
   size?: number;
   lastModified?: number;
+  sourceHash?: string;
   nativePath?: string;
 }
 
@@ -111,6 +126,7 @@ export interface ConvertedPage {
 
 export interface ConvertedDocument {
   documentId: string;
+  sourceHash?: string;
   fileName: string;
   fileType: string;
   pageCount: number;
@@ -120,6 +136,12 @@ export interface ConvertedDocument {
   pages: ConvertedPage[];
   demo: boolean;
 }
+
+export type NormalizedTextBox = { x: number; y: number; width: number; height: number };
+export type TextAnchor = {
+  quote: { exact: string; prefix: string; suffix: string };
+  position: { start: number; end: number; unit: 'normalized-page-text' };
+};
 
 export type SpreadsheetValue = string | number | boolean | null;
 
@@ -169,6 +191,8 @@ export interface Annotation {
   reason?: string;
   requiresReview?: boolean;
   excerpt?: string;
+  fragments?: NormalizedTextBox[];
+  textAnchor?: TextAnchor;
   reviewedByHuman?: boolean;
 }
 
@@ -178,8 +202,8 @@ export interface AnnotationCandidate extends Annotation {
 }
 
 export type AnnotationTarget =
-  | { kind: 'page'; page: number; boundingBox: { x: number; y: number; width: number; height: number } }
-  | { kind: 'slide'; slide: number; boundingBox: { x: number; y: number; width: number; height: number } }
+  | { kind: 'page'; page: number; boundingBox: NormalizedTextBox; fragments?: NormalizedTextBox[]; textAnchor?: TextAnchor }
+  | { kind: 'slide'; slide: number; boundingBox: NormalizedTextBox; fragments?: NormalizedTextBox[]; textAnchor?: TextAnchor }
   | { kind: 'sheet'; sheet: string; cellRange: string };
 
 export type AnnotationReviewPriority = 'low' | 'medium' | 'high';
@@ -188,6 +212,7 @@ export type DocumentAnnotationStatus = 'auto' | 'needs_review' | 'approved' | 'c
 export interface DocumentAnnotationRecord {
   id: string;
   documentId: string;
+  sourceHash?: string;
   target: AnnotationTarget;
   label: string;
   evidence: string;
