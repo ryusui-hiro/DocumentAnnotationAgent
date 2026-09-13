@@ -30,6 +30,7 @@ type Candidate = {
   pageNumber: number;
   source: 'ai';
   reviewedByHuman?: boolean;
+  reviewOutcome?: 'approved' | 'corrected';
   approvalRunId?: string;
   approvalId?: string;
 };
@@ -366,7 +367,7 @@ function documentRecordFromCandidate(candidate: Candidate, documentId: string, s
   const target = sourceFormat.toLowerCase() === 'pptx'
     ? { kind: 'slide' as const, slide: candidate.pageNumber, boundingBox, ...(candidate.fragments?.length ? { fragments: candidate.fragments } : {}), ...(candidate.textAnchor ? { textAnchor: candidate.textAnchor } : {}) }
     : { kind: 'page' as const, page: candidate.pageNumber, boundingBox, ...(candidate.fragments?.length ? { fragments: candidate.fragments } : {}), ...(candidate.textAnchor ? { textAnchor: candidate.textAnchor } : {}) };
-  const status = candidate.reviewedByHuman ? 'corrected' : candidate.requiresReview ? 'needs_review' : 'auto';
+  const status = candidate.reviewOutcome ?? (candidate.reviewedByHuman ? 'approved' : candidate.requiresReview ? 'needs_review' : 'auto');
   return {
     id: candidate.id, documentId, ...(sourceHash ? { sourceHash } : {}), target, label: candidate.label,
     evidence: candidate.excerpt ?? '', explanation: [candidate.reason, candidate.note].filter(Boolean).join('\n'),
@@ -740,6 +741,7 @@ export async function runDocumentAgent(args: {
       ...((input.fragments?.length || options?.textTarget) ? { fragments: input.fragments?.length ? input.fragments : options?.textTarget?.fragments } : {}),
       ...((input.textAnchor && input.textAnchor.position.end >= input.textAnchor.position.start || options?.textTarget) ? { textAnchor: input.textAnchor && input.textAnchor.position.end >= input.textAnchor.position.start ? input.textAnchor : options?.textTarget?.textAnchor } : {}),
       ...(options?.approved ? { reviewedByHuman: true } : {}),
+      ...(options?.approved ? { reviewOutcome: 'approved' as const } : {}),
       ...(options?.approvalRunId ? { approvalRunId: options.approvalRunId } : {}),
       ...(options?.approvalId ? { approvalId: options.approvalId } : {}),
     };
@@ -910,7 +912,7 @@ export async function runDocumentAgent(args: {
       else annotationOperations.push(operation);
       target.label = input.label;
       target.note = input.note;
-      pagedAdapter?.annotate(toDocumentRecord({ ...target, reason: '', color: '#278779', source: 'ai', requiresReview: false, reviewedByHuman: true, reviewPriority: target.reviewPriority ?? 'medium' }));
+      pagedAdapter?.annotate(toDocumentRecord({ ...target, reason: '', color: '#278779', source: 'ai', requiresReview: false, reviewedByHuman: true, reviewOutcome: 'approved', reviewPriority: target.reviewPriority ?? 'medium' }));
       recordToolActivity({ toolName: 'update_annotation', phase: 'Annotating', detail: `Updated ${target.label} to ${input.label} after human approval.`, status: 'complete', pageNumber: target.pageNumber });
       return JSON.stringify({ updated: true, annotationId: target.id, label: input.label });
     },

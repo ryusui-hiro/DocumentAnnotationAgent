@@ -28,10 +28,12 @@ APIキーは現在のブラウザータブのメモリにのみ保持し、ブ�
 ```bash
 npm run build
 npm test
+npx playwright-cli install-browser chromium --only-shell
+npm run test:browser-e2e
 npm start
 ```
 
-`npm test` はスクリプトモデルでAgents SDKのTool実行を確認し、外部APIは呼び出しません。
+`npm test` はスクリプトモデルでAgents SDKのTool実行を確認し、外部APIは呼び出しません。`npm run test:browser-e2e` は内蔵のデモPDFを使い、Providerに接続せず計画、確認、修正、却下、JSON出力をブラウザーで検証します。固定バージョンのPlaywright CLIでChromiumを操作します。
 
 ## 今の範囲
 
@@ -63,7 +65,7 @@ npm start
 - 選択した最大200文書の全ページへ同じAgent指示を順番に実行。曖昧な箇所は文書ごとの確認キューに残したまま次の文書へ進み、注釈と履歴を文書別に保存。
 - フォルダー情報は端末に保存。アプリ再起動後はフォルダーへ再接続してアクセスを許可。Web版のファイル本体は現在のセッション中に保持。
 - 注釈と確認待ちの構造化JSON / CSV、ページ画像に注釈枠を重ねたPDF、選択範囲PNGを出力。
-- 構造化JSONにはページ領域とシートセル変更を共通形式で含め、文書ID、対象位置、根拠、説明、レビュー優先度、状態を記録。
+- 構造化JSONにはページ領域とシートセル変更を共通形式で含め、文書ID、対象位置、根拠、説明、レビュー優先度、状態を記録。状態は自動追加・確認待ち・提案どおりの承認・人の修正・却下を区別します。
 - OpenAI Responses APIでページ画像から注釈候補を生成し、GPT-6 Astra / GPT-5.6 Sol / Terra / Lunaと推論レベルを選択。
 - Azure OpenAI / OpenAI互換APIは設定画面のendpointとkeyで接続。Azure deployment名にも対応。
 - Codex App ServerはローカルCodex CLIのモデルカタログ、推論レベル、thread単位token usageに接続。

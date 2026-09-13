@@ -375,7 +375,8 @@ export class PagedDocumentAdapter implements DocumentAdapter {
           reviewPriority: annotation.reviewPriority,
           color: annotation.color ?? '#278779',
           requiresReview: false,
-          reviewedByHuman: annotation.status === 'corrected' || annotation.reviewedByHuman,
+          reviewedByHuman: annotation.status === 'approved' || annotation.status === 'corrected' || annotation.reviewedByHuman,
+          reviewOutcome: annotation.status === 'approved' || annotation.status === 'corrected' ? annotation.status : undefined,
           source: annotation.source ?? 'ai',
         } satisfies Annotation];
       }));

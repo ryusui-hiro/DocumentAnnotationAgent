@@ -10,7 +10,8 @@ function visualTarget(annotation: Annotation, fileType: string): DocumentAnnotat
 }
 
 function visualStatus(annotation: Annotation): DocumentAnnotationRecord['status'] {
-  if (annotation.reviewedByHuman) return 'corrected';
+  if (annotation.reviewOutcome) return annotation.reviewOutcome;
+  if (annotation.reviewedByHuman) return annotation.source === 'ai' ? 'approved' : 'corrected';
   if (annotation.requiresReview || annotation.reviewPriority === 'high') return 'needs_review';
   if (annotation.source === 'manual') return 'approved';
   return 'auto';
@@ -160,7 +161,8 @@ export function restoreDocumentAnnotationRecords(value: unknown) {
         excerpt: typeof raw.excerpt === 'string' ? raw.excerpt.slice(0, 1000) : typeof raw.evidence === 'string' ? raw.evidence.slice(0, 1000) : '',
         ...(fragments.length ? { fragments } : {}),
         ...(textAnchor ? { textAnchor } : {}),
-        reviewedByHuman: Boolean(raw.reviewedByHuman) || status === 'corrected',
+        reviewedByHuman: Boolean(raw.reviewedByHuman) || status === 'approved' || status === 'corrected',
+        ...(status === 'approved' || status === 'corrected' ? { reviewOutcome: status } : {}),
         ...(typeof raw.approvalRunId === 'string' ? { approvalRunId: raw.approvalRunId.slice(0, 100) } : {}),
         ...(typeof raw.approvalId === 'string' ? { approvalId: raw.approvalId.slice(0, 200) } : {}),
       };

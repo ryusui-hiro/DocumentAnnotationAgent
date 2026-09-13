@@ -957,7 +957,7 @@ test('the Agent waits for the full scope and review before exporting through its
   model.assertComplete();
   assert.equal(result.status, 'complete');
   assert.deepEqual(result.visitedPages, [2], 'resume reports the newly inspected page only');
-  assert.equal(adapter.listAnnotations()[0]?.status, 'corrected');
+  assert.equal(adapter.listAnnotations()[0]?.status, 'approved');
   assert.equal(result.exports.length, 1);
   const artifact = result.exports[0]!;
   assert.equal(artifact.fileName, 'review-annotated.pdf');

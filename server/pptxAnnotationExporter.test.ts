@@ -105,7 +105,7 @@ test('writes editable annotation shapes to the correct slide relationship withou
   assert.deepEqual(JSON.parse(values.get('AnnotationStudio.Categories') ?? '[]'), ['HIGH RISK']);
   assert.equal(values.get('AnnotationStudio.HighestReviewPriority'), 'high');
   const findings = JSON.parse(values.get('AnnotationStudio.Findings') ?? '[]');
-  assert.deepEqual(findings, [{ id: 'slide-region', category: 'HIGH RISK', evidence: 'Either party may terminate.', explanation: 'Either party can terminate without cause.', reviewPriority: 'high', status: 'corrected', source: 'ai' }]);
+  assert.deepEqual(findings, [{ id: 'slide-region', category: 'HIGH RISK', evidence: 'Either party may terminate.', explanation: 'Either party can terminate without cause.', reviewPriority: 'high', status: 'approved', source: 'ai' }]);
   const contentTypes = new DOMParser().parseFromString(await output.file('[Content_Types].xml')!.async('string'), 'application/xml');
   assert.equal(Array.from(contentTypes.getElementsByTagNameNS(TYPES, 'Override')).some((item) => item.getAttribute('PartName') === '/ppt/tags/annotation-studio-tags1.xml' && item.getAttribute('ContentType') === TAGS_TYPE), true);
 });

@@ -54,7 +54,7 @@ function readToolResult(call: RecordedModelCall, toolName: string): Record<strin
   return JSON.parse(outputText) as Record<string, unknown>;
 }
 
-test('provider-free Agent opens its bound document, pauses for review, resumes the same run, and exports corrected JSON', async () => {
+test('provider-free Agent opens its bound document, pauses for review, resumes the same run, and exports approved JSON', async () => {
   let planRequest: Record<string, unknown> | undefined;
   const plannerClient = {
     responses: {
@@ -254,12 +254,12 @@ test('provider-free Agent opens its bound document, pauses for review, resumes t
   model.assertComplete();
   assert.equal(resumed.status, 'complete');
   assert.deepEqual(resumed.annotations, [], 'the already reported review candidate is not duplicated on resume');
-  const correctedRecord = adapter.listAnnotations()[0];
-  assert.ok(correctedRecord);
-  assert.equal(correctedRecord.id, paused.approvalId, 'approval resumes the same reviewed candidate');
-  assert.equal(correctedRecord.reviewedByHuman, true);
-  assert.equal(correctedRecord.requiresReview, false);
-  assert.equal(correctedRecord.status, 'corrected');
+  const approvedRecord = adapter.listAnnotations()[0];
+  assert.ok(approvedRecord);
+  assert.equal(approvedRecord.id, paused.approvalId, 'approval resumes the same reviewed candidate');
+  assert.equal(approvedRecord.reviewedByHuman, true);
+  assert.equal(approvedRecord.requiresReview, false);
+  assert.equal(approvedRecord.status, 'approved');
   assert.equal(resumed.exports.length, 1);
 
   const prepared = resumed.exports[0]!;
@@ -271,16 +271,16 @@ test('provider-free Agent opens its bound document, pauses for review, resumes t
   assert.equal(artifact.descriptor.fileName, 'demo-specification-annotations.json');
   assert.equal(artifact.contentType, 'application/json');
   const payload = JSON.parse(artifact.buffer.toString('utf8')) as { documentAnnotations: DocumentAnnotationRecord[] };
-  const corrected = payload.documentAnnotations.find((record) => record.id === paused.approvalId);
-  assert.ok(corrected, 'the downloaded JSON contains the approved candidate');
-  assert.equal(corrected.documentId, documentId);
-  assert.equal(corrected.sourceHash, sourceHash);
-  assert.equal(corrected.label, 'AMBIGUOUS LIMIT');
-  assert.equal(corrected.status, 'corrected');
-  assert.equal(corrected.evidence, evidence);
-  assert.equal(corrected.reviewPriority, 'high');
-  assert.equal(corrected.reviewedByHuman, true);
-  assert.equal(corrected.requiresReview, false);
+  const approved = payload.documentAnnotations.find((record) => record.id === paused.approvalId);
+  assert.ok(approved, 'the downloaded JSON contains the approved candidate');
+  assert.equal(approved.documentId, documentId);
+  assert.equal(approved.sourceHash, sourceHash);
+  assert.equal(approved.label, 'AMBIGUOUS LIMIT');
+  assert.equal(approved.status, 'approved');
+  assert.equal(approved.evidence, evidence);
+  assert.equal(approved.reviewPriority, 'high');
+  assert.equal(approved.reviewedByHuman, true);
+  assert.equal(approved.requiresReview, false);
 });
 
 test('open_document fails closed when a run has no user-bound document session', async () => {

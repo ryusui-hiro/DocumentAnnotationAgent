@@ -30,10 +30,12 @@ Build and run the production app:
 ```bash
 npm run build
 npm test
+npx playwright-cli install-browser chromium --only-shell
+npm run test:browser-e2e
 npm start
 ```
 
-`npm test` exercises the Agents SDK tool loop with a scripted model and does not call an external API.
+`npm test` exercises the Agents SDK tool loop with a scripted model and does not call an external API. `npm run test:browser-e2e` uses the built-in demo PDF to verify planning, review, corrections, rejections, and JSON export without a provider; it runs Chromium through the pinned Playwright CLI.
 
 ## Features
 
@@ -64,7 +66,7 @@ npm start
 - Run one Agent instruction across every selected document and all of its pages. Batch mode continues to the next document while ambiguous regions remain in that document's review queue; each document's annotations and run history are stored separately.
 - Project file metadata is saved locally. After restarting the app or reloading the web page, reconnect the folder to grant access again; web browser file handles remain in the current session only.
 - Export structured JSON / CSV, an annotated PDF, and selected regions as PNG.
-- Structured JSON includes normalized records for page regions and sheet-cell changes with document ID, target, evidence, explanation, review priority, and status.
+- Structured JSON includes normalized records for page regions and sheet-cell changes with document ID, target, evidence, explanation, review priority, and status. Status distinguishes automatic findings, items needing review, approval as proposed, human corrections, and rejection.
 - Use GPT-6 Astra / GPT-5.6 Sol / Terra / Luna with OpenAI Responses API, Azure OpenAI, an OpenAI-compatible endpoint, or Codex App Server. Select the reasoning level in Settings.
 - Use the local Codex CLI model catalog, reasoning settings, and per-thread token usage through Codex App Server.
 - Review input, output, reasoning, cached-input, and total token usage by model in Settings.

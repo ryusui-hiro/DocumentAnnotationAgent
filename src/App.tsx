@@ -814,7 +814,7 @@ function App() {
       }
       if (operation.operation === 'update') {
         setAnnotations((items) => items.map((annotation) => annotation.id === operation.annotationId
-          ? { ...annotation, label: operation.proposedLabel ?? annotation.label, note: operation.proposedNote ?? annotation.note, reason: operation.reason, requiresReview: false, reviewedByHuman: true }
+          ? { ...annotation, label: operation.proposedLabel ?? annotation.label, note: operation.proposedNote ?? annotation.note, reason: operation.reason, requiresReview: false, reviewedByHuman: true, reviewOutcome: 'approved' }
           : annotation));
         addAgentActivity('Annotating', `update_annotation → ${operation.existingLabel}を「${operation.proposedLabel ?? operation.existingLabel}」に変更しました。`, 'complete', operation.pageNumber);
       } else {
@@ -954,9 +954,10 @@ function App() {
       excerpt: (annotation.excerpt ?? '').slice(0, 1000),
       explanation: [annotation.reason, annotation.note].filter(Boolean).join('\n').slice(0, 1000),
       reviewPriority: annotation.reviewPriority ?? (annotation.requiresReview ? 'high' as const : 'medium' as const),
-      status: annotation.reviewedByHuman ? 'corrected' as const
+      status: annotation.reviewOutcome ?? (annotation.reviewedByHuman
+        ? annotation.source === 'ai' ? 'approved' as const : 'corrected' as const
         : annotation.requiresReview || annotation.reviewPriority === 'high' ? 'needs_review' as const
-          : annotation.source === 'manual' ? 'approved' as const : 'auto' as const,
+          : annotation.source === 'manual' ? 'approved' as const : 'auto' as const),
     }));
     const issues = findInconsistentRepeatedExcerpts(uniqueAnnotations);
     if (!summaries.length) return { issues, usage: undefined as TokenUsage | undefined, modelFindingCount: 0 };
@@ -1605,7 +1606,7 @@ function App() {
       id: crypto.randomUUID(), pageNumber, x, y,
       width: Math.min(width, 1 - x), height: Math.min(height, 1 - y),
       label: activeTool === 'note' ? 'テキスト注釈' : '要確認',
-      note: '', color: activeTool === 'note' ? '#557ec2' : '#178b87', source: 'manual', reviewPriority: 'low', reason: '人がページ上で追加しました。', requiresReview: false, reviewedByHuman: true,
+      note: '', color: activeTool === 'note' ? '#557ec2' : '#178b87', source: 'manual', reviewPriority: 'low', reason: '人がページ上で追加しました。', requiresReview: false, reviewedByHuman: true, reviewOutcome: 'approved',
     };
     setAnnotations((items) => [...items, next]);
     setSelectedId(next.id);
@@ -1621,7 +1622,7 @@ function App() {
     delete approvedCandidate.approvalRunId;
     delete approvedCandidate.approvalId;
     updateDocumentAnnotationRecords((current) => resolveCandidateReview(current, candidate.id, {
-      type: 'approve', annotation: { ...approvedCandidate, source: 'ai', requiresReview: false, reviewedByHuman: true },
+      type: 'approve', annotation: { ...approvedCandidate, source: 'ai', requiresReview: false, reviewedByHuman: true, reviewOutcome: 'approved' },
     }));
     setCandidateCorrections((items) => { const next = { ...items }; delete next[candidate.id]; return next; });
     setCandidateCorrectionScopes((items) => { const next = { ...items }; delete next[candidate.id]; return next; });
@@ -1649,6 +1650,7 @@ function App() {
       source: 'manual',
       requiresReview: false,
       reviewedByHuman: true,
+      reviewOutcome: 'corrected',
       reason: `人が内容を修正して確定。AIの提案理由: ${candidate.reason}`.slice(0, 500),
     };
     delete (corrected as AnnotationCandidate).approvalRunId;
@@ -2711,7 +2713,7 @@ function App() {
 
   const updateSelected = (patch: Partial<Annotation>) => {
     if (!selectedAnnotation) return;
-    setAnnotations((items) => items.map((item) => item.id === selectedAnnotation.id ? { ...item, ...patch, source: 'manual', requiresReview: false, reviewedByHuman: true } : item));
+    setAnnotations((items) => items.map((item) => item.id === selectedAnnotation.id ? { ...item, ...patch, source: 'manual', requiresReview: false, reviewedByHuman: true, reviewOutcome: 'corrected' } : item));
     setSaved(false);
   };
 

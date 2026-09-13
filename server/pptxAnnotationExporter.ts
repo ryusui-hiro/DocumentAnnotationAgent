@@ -216,11 +216,11 @@ function annotationSemanticTags(items: Array<{ annotation: Annotation }>): PptxS
     evidence: xmlSafe(annotation.excerpt ?? '').slice(0, 1000),
     explanation: xmlSafe(annotation.reason || annotation.note).slice(0, 1000),
     reviewPriority: annotation.reviewPriority ?? (annotation.requiresReview ? 'high' : 'medium'),
-    status: annotation.reviewedByHuman
-      ? 'corrected'
+    status: annotation.reviewOutcome ?? (annotation.reviewedByHuman
+      ? annotation.source === 'ai' ? 'approved' : 'corrected'
       : annotation.requiresReview || annotation.reviewPriority === 'high'
         ? 'needs_review'
-        : annotation.source === 'manual' ? 'approved' : 'auto',
+        : annotation.source === 'manual' ? 'approved' : 'auto'),
     source: annotation.source,
   }));
   const priorities = findings.map((finding) => finding.reviewPriority);

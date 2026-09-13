@@ -30,10 +30,12 @@ API 密钥仅保存在当前浏览器标签页的内存中，不会写入浏览�
 ```bash
 npm run build
 npm test
+npx playwright-cli install-browser chromium --only-shell
+npm run test:browser-e2e
 npm start
 ```
 
-`npm test` 使用脚本模型验证 Agents SDK 工具调用，不会请求外部 API。
+`npm test` 使用脚本模型验证 Agents SDK 工具调用，不会请求外部 API。`npm run test:browser-e2e` 使用内置示例 PDF，在不连接模型提供方的情况下，通过浏览器验证计划、审核、人工更正、拒绝和 JSON 导出；它使用固定版本的 Playwright CLI 操作 Chromium。
 
 ## 功能
 
@@ -64,7 +66,7 @@ npm start
 - 对所有选中的文档及其页面依次执行同一条 Agent 指令。有歧义的区域会留在该文档的审核队列中，Agent 随后继续处理下一份文档；注释和运行记录按文档分别保存。
 - 项目文件夹信息保存在本机。重启桌面应用或刷新网页后，需要重新连接文件夹以授予访问权限；Web 文件仅在当前会话中可用。
 - 导出结构化 JSON / CSV、注释版 PDF，以及选定区域的 PNG。
-- 结构化 JSON 将页面区域和工作表单元格变更归一为同一格式，记录文档 ID、目标位置、证据、说明、审核优先级和状态。
+- 结构化 JSON 将页面区域和工作表单元格变更归一为同一格式，记录文档 ID、目标位置、证据、说明、审核优先级和状态。状态区分自动结果、待审核、按建议批准、人工更正和拒绝。
 - 通过 OpenAI Responses API、Azure OpenAI、兼容 OpenAI 的 endpoint 或 Codex App Server 使用 GPT-6 Astra / GPT-5.6 Sol / Terra / Luna，并设置推理级别。
 - 通过 Codex App Server 使用本机 Codex CLI 的模型列表、推理设置和 thread token 用量。
 - 在 Settings 中按模型查看输入、输出、推理、缓存输入和总 token 用量。

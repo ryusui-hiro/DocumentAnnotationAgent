@@ -212,6 +212,7 @@ export interface Annotation {
   fragments?: NormalizedTextBox[];
   textAnchor?: TextAnchor;
   reviewedByHuman?: boolean;
+  reviewOutcome?: 'approved' | 'corrected';
 }
 
 export interface AnnotationCandidate extends Annotation {

@@ -158,6 +158,23 @@ test('moves a reviewed candidate to a confirmed record atomically without losing
   assert.equal(restoreDocumentAnnotationRecords(rejectedRecords).rejectedCandidates[0]?.id, 'same-id');
 });
 
+test('keeps unchanged approval, correction, and human-created annotation statuses distinct', () => {
+  const records = normalizeDocumentAnnotationRecords({
+    documentId: 'review-outcomes', fileType: 'PDF',
+    annotations: [
+      { id: 'approved-ai', pageNumber: 1, x: 0.1, y: 0.2, width: 0.3, height: 0.1, label: 'LIMIT', note: 'Approved as proposed.', color: '#178b87', source: 'ai', reviewedByHuman: true, reviewOutcome: 'approved' },
+      { id: 'corrected-ai', pageNumber: 1, x: 0.1, y: 0.4, width: 0.3, height: 0.1, label: 'HIGH RISK', note: 'Human changed this label.', color: '#178b87', source: 'manual', reviewedByHuman: true, reviewOutcome: 'corrected' },
+      { id: 'human-created', pageNumber: 1, x: 0.1, y: 0.6, width: 0.3, height: 0.1, label: 'NOTE', note: 'Added directly by a human.', color: '#178b87', source: 'manual', reviewedByHuman: true, reviewOutcome: 'approved' },
+      { id: 'legacy-ai-approval', pageNumber: 1, x: 0.1, y: 0.8, width: 0.3, height: 0.1, label: 'SAFETY', note: 'Legacy approved result.', color: '#178b87', source: 'ai', reviewedByHuman: true },
+    ],
+    candidates: [], rejectedCandidates: [], spreadsheetChanges: [],
+  });
+
+  assert.deepEqual(records.map((record) => record.status), ['approved', 'corrected', 'approved', 'approved']);
+  const restored = restoreDocumentAnnotationRecords(records);
+  assert.deepEqual(restored.annotations.map((annotation) => annotation.reviewOutcome), ['approved', 'corrected', 'approved', 'approved']);
+});
+
 test('rebinds saved workspace annotations to a live session and tolerates malformed local state', () => {
   const saved = normalizeDocumentAnnotationRecords({
     documentId: 'expired-session', fileType: 'XLSX', annotations: [], candidates: [], rejectedCandidates: [],
