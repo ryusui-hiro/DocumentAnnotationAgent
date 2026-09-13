@@ -17,7 +17,8 @@ const debPathArg = process.argv[2];
 assert.ok(debPathArg, 'Pass the installed .deb path as the first argument.');
 const debPath = resolve(debPathArg);
 const packageName = execFileSync('dpkg-deb', ['-f', debPath, 'Package'], { encoding: 'utf8' }).trim();
-const installedFiles = execFileSync('dpkg', ['-L', packageName], { encoding: 'utf8' }).split('\n').filter(Boolean);
+// The bundled runtime contains enough files for dpkg -L to exceed Node's 1 MiB default.
+const installedFiles = execFileSync('dpkg', ['-L', packageName], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 }).split('\n').filter(Boolean);
 const appBinaryCandidate = installedFiles.find((path) => basename(path) === 'annotation-studio');
 assert.ok(appBinaryCandidate, `Installed package ${packageName} does not contain the annotation-studio executable.`);
 const appBinary = await realpath(appBinaryCandidate);
