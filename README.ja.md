@@ -35,6 +35,8 @@ npm start
 
 `npm test` はスクリプトモデルでAgents SDKのTool実行を確認し、外部APIは呼び出しません。`npm run test:browser-e2e` は内蔵のデモPDFを使い、Providerに接続せず計画、確認、修正、却下、JSON出力をブラウザーで検証します。固定バージョンのPlaywright CLIでChromiumを操作します。
 
+CIではUbuntu用の本番`.deb`もインストールし、`tauri-driver` / WebKitWebDriverでパッケージ版Tauriアプリを操作します。確認・JSON出力と、アプリ終了時に同梱APIが停止することを検証します。このテストはLinux専用で、他のOSではスキップします。
+
 ## 今の範囲
 
 - PDF / DOCX / PPTX / XLSX / PNG / JPEG / WebP / TIFFの1ファイルを選択するか、画面にドラッグ＆ドロップして開く。PDF / Office文書は`document-svg`でページごとのSVGに変換し、画像は1ページとして表示。

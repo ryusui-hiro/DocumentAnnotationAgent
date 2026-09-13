@@ -37,6 +37,8 @@ npm start
 
 `npm test` 使用脚本模型验证 Agents SDK 工具调用，不会请求外部 API。`npm run test:browser-e2e` 使用内置示例 PDF，在不连接模型提供方的情况下，通过浏览器验证计划、审核、人工更正、拒绝和 JSON 导出；它使用固定版本的 Playwright CLI 操作 Chromium。
 
+CI 还会安装生产版 Ubuntu `.deb`，并通过 `tauri-driver` / WebKitWebDriver 操作打包后的 Tauri 应用，验证审核、JSON 导出以及关闭应用时随包 API 是否退出。此安装包测试仅支持 Linux，其他平台会跳过。
+
 ## 功能
 
 - 可选择一个 PDF、DOCX、PPTX、XLSX、PNG、JPEG、WebP 或 TIFF 文件，也可将其拖放到工作区打开。PDF / Office 文档通过 `document-svg` 转换为逐页 SVG；图片作为单页预览加载。

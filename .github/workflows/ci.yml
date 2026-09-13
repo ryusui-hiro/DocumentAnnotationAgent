@@ -108,6 +108,15 @@ jobs:
         if: runner.os == 'Linux'
         run: test -n "$(find src-tauri/target/release/bundle/deb -maxdepth 1 -type f -name '*.deb' -print -quit)"
 
+      - name: Upload x86_64 Debian package for installed-app E2E
+        if: matrix.platform == 'ubuntu-22.04'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: annotation-studio-linux-deb
+          path: src-tauri/target/release/bundle/deb/*.deb
+          if-no-files-found: error
+          retention-days: 1
+
       - name: Verify Windows installer
         if: runner.os == 'Windows'
         shell: pwsh
@@ -142,3 +151,59 @@ jobs:
 
       - name: Run provider-free browser workflow
         run: npm run test:browser-e2e
+
+  desktop-package-acceptance:
+    name: installed Tauri package (Linux/WebDriver)
+    runs-on: ubuntu-22.04
+    needs: desktop-bundles
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - name: Install Linux runtime and WebDriver dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential \
+            file \
+            libayatana-appindicator3-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            webkit2gtk-driver \
+            xvfb \
+            xdg-utils
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Install official Tauri WebDriver
+        run: cargo install tauri-driver --locked
+
+      - name: Download the normal production Debian package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: annotation-studio-linux-deb
+          path: ${{ runner.temp }}/annotation-studio-linux-deb
+
+      - name: Install and exercise the packaged app
+        run: |
+          deb="$(find "${RUNNER_TEMP}/annotation-studio-linux-deb" -maxdepth 1 -type f -name '*.deb' -print -quit)"
+          test -n "$deb"
+          package_name="$(dpkg-deb -f "$deb" Package)"
+          sudo dpkg -i "$deb"
+          test -n "$(dpkg -L "$package_name" | grep -E '^/usr/bin/annotation-studio$')"
+          xvfb-run -a npm run test:installed-desktop-e2e -- "$deb"

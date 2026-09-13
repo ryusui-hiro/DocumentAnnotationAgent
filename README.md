@@ -37,6 +37,8 @@ npm start
 
 `npm test` exercises the Agents SDK tool loop with a scripted model and does not call an external API. `npm run test:browser-e2e` uses the built-in demo PDF to verify planning, review, corrections, rejections, and JSON export without a provider; it runs Chromium through the pinned Playwright CLI.
 
+CI also installs the production Ubuntu `.deb` and drives the packaged Tauri app through `tauri-driver`/WebKitWebDriver, verifying review exports and that the bundled API exits when the app closes. This installed-package test requires Linux; it skips on other platforms.
+
 ## Features
 
 - Choose or drag one PDF, DOCX, PPTX, XLSX, PNG, JPEG, WebP, or TIFF file into the workspace to open it; PDFs and Office documents convert to page SVGs with `document-svg`, while images appear as single-page previews.

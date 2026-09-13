@@ -14,6 +14,7 @@
     "lint": "tsc --noEmit",
     "test": "tsx --test server/*.test.ts src/*.test.ts scripts/*.test.mjs",
     "test:browser-e2e": "node scripts/test-browser-e2e.mjs",
+    "test:installed-desktop-e2e": "node scripts/test-installed-desktop-e2e.mjs",
     "test:desktop-runtime": "node scripts/test-desktop-runtime.mjs",
     "start": "tsx server/index.ts --serve-frontend",
     "create:demo": "tsx scripts/create-demo-pdf.ts",
