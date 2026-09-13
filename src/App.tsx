@@ -199,6 +199,15 @@ function clamp(value: number, min = 0, max = 1) {
   return Math.min(max, Math.max(min, value));
 }
 
+function scrollAreaContentSize(area: HTMLElement) {
+  const style = window.getComputedStyle(area);
+  const pixels = (value: string) => Number.parseFloat(value) || 0;
+  return {
+    width: Math.max(1, area.clientWidth - pixels(style.paddingLeft) - pixels(style.paddingRight)),
+    height: Math.max(1, area.clientHeight - pixels(style.paddingTop) - pixels(style.paddingBottom)),
+  };
+}
+
 function parseDocument(payload: Record<string, unknown>): ConvertedDocument {
   return {
     documentId: String(payload.documentId ?? ''),
@@ -371,6 +380,7 @@ function App() {
     : [];
   const [agentStatus, setAgentStatus] = useState<AgentRunStatus>('ready');
   const [agentViewport, setAgentViewport] = useState<NormalizedTextBox | null>(null);
+  const [agentViewportScale, setAgentViewportScale] = useState<number | null>(null);
   const [agentActivity, setAgentActivity] = useState<AgentActivityEvent[]>([]);
   const [agentRunHistory, setAgentRunHistory] = useState<AgentRunHistory[]>([]);
   const [agentContinuation, setAgentContinuation] = useState<AgentContinuation | null>(null);
@@ -727,26 +737,38 @@ function App() {
   const syncViewerToToolEvent = (event: LiveToolActivity) => {
     if (event.toolName === 'navigate_page' && event.pageNumber !== undefined) {
       setAgentViewport(null);
+      setAgentViewportScale(null);
       setPageNumber(event.pageNumber);
       window.requestAnimationFrame(() => pageScrollAreaRef.current?.scrollTo({ left: 0, top: 0 }));
       return;
     }
     if (event.toolName !== 'scroll_document' || !event.viewport) return;
     const viewport = event.viewport;
+    const targetPage = event.pageNumber ?? pageNumber;
     if (event.pageNumber !== undefined) setPageNumber(event.pageNumber);
+    const page = documentData?.pages.find((item) => item.pageNumber === targetPage);
+    const area = pageScrollAreaRef.current;
+    let scale = 1 / Math.max(viewport.width, viewport.height);
+    if (page && page.width > 0 && page.height > 0 && area) {
+      const visible = scrollAreaContentSize(area);
+      const pageAspect = page.width / page.height;
+      const displayedWidth = targetPage === pageNumber ? pageFrameRef.current?.offsetWidth ?? 0 : 0;
+      const displayedHeight = targetPage === pageNumber ? pageFrameRef.current?.offsetHeight ?? 0 : 0;
+      const heightLimit = Math.max(1, window.innerHeight - (window.matchMedia('(max-width: 560px)').matches ? 310 : 205));
+      const baseWidth = displayedWidth > 0 ? displayedWidth : Math.min(visible.width, heightLimit * pageAspect);
+      const baseHeight = displayedHeight > 0 ? displayedHeight : baseWidth / pageAspect;
+      scale = Math.min(
+        visible.width / (baseWidth * viewport.width),
+        visible.height / (baseHeight * viewport.height),
+      );
+    }
+    setAgentViewportScale(Number.isFinite(scale) && scale > 0 ? scale : 1 / Math.max(viewport.width, viewport.height));
     setAgentViewport(viewport);
-    window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
-      const area = pageScrollAreaRef.current;
-      if (!area) return;
-      const horizontalRange = Math.max(0, 1 - viewport.width);
-      const verticalRange = Math.max(0, 1 - viewport.height);
-      area.scrollLeft = horizontalRange ? Math.round((area.scrollWidth - area.clientWidth) * viewport.x / horizontalRange) : 0;
-      area.scrollTop = verticalRange ? Math.round((area.scrollHeight - area.clientHeight) * viewport.y / verticalRange) : 0;
-    }));
   };
 
   const clearAgentViewport = () => {
     setAgentViewport(null);
+    setAgentViewportScale(null);
     window.requestAnimationFrame(() => pageScrollAreaRef.current?.scrollTo({ left: 0, top: 0 }));
   };
 
@@ -1133,6 +1155,30 @@ function App() {
       if (objectUrl) revokeSvgPreviewUrl(objectUrl);
     };
   }, [documentData?.documentId, documentData?.pages, pageNumber, settings.apiServerUrl]);
+
+  useEffect(() => {
+    if (!agentViewport || !previewUrl) return;
+    let firstFrame = 0;
+    let secondFrame = 0;
+    firstFrame = window.requestAnimationFrame(() => {
+      secondFrame = window.requestAnimationFrame(() => {
+        const area = pageScrollAreaRef.current;
+        if (!area) return;
+        const horizontalRange = Math.max(0, 1 - agentViewport.width);
+        const verticalRange = Math.max(0, 1 - agentViewport.height);
+        area.scrollLeft = horizontalRange
+          ? Math.round((area.scrollWidth - area.clientWidth) * agentViewport.x / horizontalRange)
+          : 0;
+        area.scrollTop = verticalRange
+          ? Math.round((area.scrollHeight - area.clientHeight) * agentViewport.y / verticalRange)
+          : 0;
+      });
+    });
+    return () => {
+      window.cancelAnimationFrame(firstFrame);
+      window.cancelAnimationFrame(secondFrame);
+    };
+  }, [agentViewport, agentViewportScale, previewUrl]);
 
   const reopenDocument = async () => {
     if (!documentData?.demo) {
@@ -2096,6 +2142,9 @@ function App() {
               existingAnnotationsForRequest.unshift(selectedAnnotationSummary);
               if (existingAnnotationsForRequest.length > 500) existingAnnotationsForRequest.pop();
             }
+            const pageScrollArea = pageScrollAreaRef.current;
+            const visiblePageArea = pageScrollArea ? scrollAreaContentSize(pageScrollArea) : null;
+            const viewerAspectRatio = visiblePageArea ? visiblePageArea.width / visiblePageArea.height : undefined;
             const { ok, status, payload: result, streamedActivityCount } = await postAgentRequest('/api/ai/annotate', {
                 instruction: taskInstruction.trim(),
                 taskPlan: structuredTaskPlan,
@@ -2113,6 +2162,7 @@ function App() {
                 agentMode: selectedMode,
                 requireToolApproval: !workspaceBatchActiveRef.current,
                 selectedAnnotationId: selectedAnnotationSummary?.id,
+                viewerAspectRatio,
                 existingAnnotations: existingAnnotationsForRequest,
                 documentAnnotations: normalizeDocumentAnnotationRecords({ documentId: documentData.documentId, sourceHash: documentData.sourceHash, fileType: documentData.fileType, ...documentAnnotationView }),
                 settings: { ...settings, apiKey },
@@ -2857,7 +2907,7 @@ function App() {
     });
   };
 
-  const pageStyle = currentPage ? ({ '--page-ratio': `${currentPage.width} / ${currentPage.height}`, '--zoom': agentViewport ? 1 / agentViewport.width : zoom / 100 } as CSSProperties) : undefined;
+  const pageStyle = currentPage ? ({ '--page-ratio': `${currentPage.width} / ${currentPage.height}`, '--zoom': agentViewport ? agentViewportScale ?? 1 / Math.max(agentViewport.width, agentViewport.height) : zoom / 100 } as CSSProperties) : undefined;
   const envProviderMatches = (settings.provider === 'azure-openai' && health?.provider === 'azure') ||
     (settings.provider === 'openai-api' && health?.provider === 'openai');
   const apiConfiguredForSession = (settings.provider === 'openai-compatible' && Boolean(settings.endpoint.trim())) ||
@@ -2957,7 +3007,7 @@ function App() {
               <button type="button" aria-label="次のページ" disabled={!documentData || pageNumber >= documentData.pageCount} onClick={() => goToPage(pageNumber + 1)}><ArrowRight size={15} /></button>
               <span className="control-divider" />
               <button type="button" aria-label="ズームアウト" onClick={() => { clearAgentViewport(); setZoom((value) => Math.max(70, value - 10)); }}><ZoomOut size={15} /></button>
-              <span className="zoom-readout">{agentViewport ? `${Math.round(100 / agentViewport.width)}%` : `${zoom}%`}</span>
+              <span className="zoom-readout">{agentViewport ? `${Math.round(100 * (agentViewportScale ?? 1 / Math.max(agentViewport.width, agentViewport.height)))}%` : `${zoom}%`}</span>
               <button type="button" aria-label="ズームイン" onClick={() => { clearAgentViewport(); setZoom((value) => Math.min(130, value + 10)); }}><ZoomIn size={15} /></button>
               <span className="control-divider" />
               <button className="toolbar-help" type="button" title="使い方" aria-label="使い方" onClick={() => { setGuideTab('workflow'); setShowGuide(true); }}><CircleHelp size={16} /></button>
@@ -2968,7 +3018,7 @@ function App() {
 
           <section className="canvas-zone" aria-label="文書ページ">
             <div className="canvas-hint"><span><MousePointer2 size={14} /> 領域を選択するか、ツールを選んでドラッグ</span><span>{currentAnnotations.length} 件の注釈</span></div>
-            <div ref={pageScrollAreaRef} className={`page-scroll-area${agentViewport ? ' is-agent-viewport' : ''}`}>
+            <div ref={pageScrollAreaRef} className={`page-scroll-area${agentViewport ? ' is-agent-viewport' : ''}${working || agentViewport ? ' is-agent-scanning' : ''}`}>
               {loadingDemo ? (
                 <div className="loading-state"><LoaderCircle className="spin" size={26} /><span>サンプル文書を準備しています</span></div>
               ) : previewLoading ? (

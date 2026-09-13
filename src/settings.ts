@@ -11,16 +11,8 @@ export const modelCatalog: Array<{ id: ModelId; label: string }> = [
   { id: 'gpt-5.6-luna', label: 'GPT-5.6 Luna' },
 ];
 
-function isTauriRuntime() {
-  return typeof window !== 'undefined' && (
-    window.location.protocol === 'tauri:' ||
-    window.location.hostname.endsWith('.tauri.localhost') ||
-    '__TAURI_INTERNALS__' in window
-  );
-}
-
 export const defaultSettings: AppSettings = {
-  apiServerUrl: import.meta.env?.VITE_API_BASE_URL?.trim() || (isTauriRuntime() ? 'http://127.0.0.1:3001' : ''),
+  apiServerUrl: import.meta.env?.VITE_API_BASE_URL?.trim() || '',
   provider: 'openai-api',
   endpoint: 'https://api.openai.com/v1',
   azureDeployment: '',
@@ -56,6 +48,8 @@ export function loadSettings(): AppSettings {
   if (!raw || typeof raw !== 'object') return defaultSettings;
   const value = raw as Partial<AppSettings>;
   return {
+    // An empty desktop setting selects the bundled API. Saved explicit URLs,
+    // including the older default port, remain intact for existing users.
     apiServerUrl: typeof value.apiServerUrl === 'string' ? value.apiServerUrl : defaultSettings.apiServerUrl,
     provider: providerIds.includes(value.provider as ProviderId) ? value.provider as ProviderId : defaultSettings.provider,
     endpoint: typeof value.endpoint === 'string' ? value.endpoint : defaultSettings.endpoint,

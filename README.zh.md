@@ -71,7 +71,7 @@ npm start
 
 注释版 PDF 是页面渲染图的视觉副本，包含注释轮廓和编号标记。已批准的 Excel 更改可导出为新工作簿；已批准的 DOCX 注释可导出为新 Word 文件中的批注，均不会覆盖原文件。若段落结构受支持，Word 批注会锚定到唯一原文摘录的精确范围；同一段落中的多个注释共用段落锚点。缺少摘录、找不到摘录或匹配不唯一时会跳过并报告。已批准的 PowerPoint 注释会作为可编辑轮廓和标签形状添加到对应幻灯片，并写入幻灯片级用户定义标签。标签以机器可读的名称／值属性保存分类、证据摘录、说明、审核优先级和状态，同时保留无关的现有标签。标签不显示在幻灯片画布上，可通过 PowerPoint Tags API 或 Open XML 读取。标签、理由、审核优先级、坐标及可选数值估计会包含在 CSV / JSON 中。
 
-转换警告会显示在应用中。SVG 会以图片形式显示，不会直接插入 HTML。Codex App Server 使用运行服务的主机上的 Codex CLI 登录状态和模型列表。在 macOS 上，如果可用，会优先使用 ChatGPT 应用自带的 Codex 可执行文件；可通过 `CODEX_APP_SERVER_BIN` 覆盖。远程 Web 部署时，请在本地或公司主机上运行 API 服务和 Codex CLI。Tauri 软件包不包含 Node API，请在 Settings 中指定本地或公司 API URL。加密会话数据默认保存在 `~/.annotation-studio/session-state`；如需更换位置，请设置 `ANNOTATION_STUDIO_DATA_DIR`。
+转换警告会显示在应用中。SVG 会以图片形式显示，不会直接插入 HTML。Codex App Server 使用运行服务的主机上的 Codex CLI 登录状态和模型列表。在 macOS 上，如果可用，会优先使用 ChatGPT 应用自带的 Codex 可执行文件；可通过 `CODEX_APP_SERVER_BIN` 覆盖。远程 Web 部署时，请在本地或公司主机上运行 API 服务和 Codex CLI。Tauri 软件包会包含 Node API 和目标平台的生产依赖；桌面应用会在 loopback 上自动启动 API，并在退出时停止。服务器 URL 留空时使用内置 API，填写 URL 时则使用指定的本地或公司 API。桌面会话数据默认保存在系统应用数据目录，Web API 默认保存在 `~/.annotation-studio/session-state`；可通过 `ANNOTATION_STUDIO_DATA_DIR` 更改。
 
 ## 英文界面概念图
 
@@ -91,7 +91,7 @@ npm start
 - API 模式支持 endpoint、API key、GPT-6 Astra / GPT-5.6 Sol / Terra / Luna 和推理级别。Azure 还需要 deployment 名称。
 - API 密钥不会写入设备存储，仅保存在当前浏览器标签页的内存中。
 - Codex App Server 使用同一主机上的 Codex CLI，包括其登录账户、可用模型和推理设置。
-- Tauri 2 桌面版使用相同的文档处理 API。请在 Settings 中设置可访问的本地或公司 Annotation Studio API URL。
+- Tauri 2 桌面版会自动启动已打包的文档处理 API。服务器 URL 留空时使用内置 API，填写 URL 时连接本地或公司 Annotation Studio API。
 
 启动 Web 开发环境：
 
@@ -111,6 +111,6 @@ npm run tauri:dev
 npm run tauri:build
 ```
 
-Tauri 软件包不会自动启动 Node API。请在本地运行 API，或配置可访问的内部 API URL。本地 API 仅监听 `127.0.0.1`。公开部署时，请显式设置 `HOST`，通过带身份验证的反向代理和 HTTPS 提供服务，并将 `CORS_ALLOWED_ORIGINS` 限定为部署所需的来源。
+Tauri 构建钩子会下载固定版本 Node.js 24.21.0 LTS，根据官方 SHA-256 清单验证后，将 API 与生产依赖按目标平台打包。原生构建会启动打包后的 API 并检查健康状态，也会验证关闭父进程的 stdin 管道后子进程能退出；Tauri 被强制终止时，管道也会关闭。应用只监听 `127.0.0.1`，会等待健康检查、在端口冲突时选择其他端口，并在退出时停止 API 子进程。支持 macOS x64 / arm64、Windows x64 / arm64 和 Linux GNU x64 / arm64 原生构建。请在目标操作系统上运行 `npm run tauri:build`，Tauri CLI 会自动把目标 Rust triple 传给打包钩子。只有在 Tauri CLI 之外单独准备 runtime 时才需要设置 `ANNOTATION_STUDIO_TARGET_TRIPLE`。`tauri:dev` 仍由 `npm run dev` 启动 API。公开部署时，请显式设置 `HOST`，通过带身份验证的反向代理和 HTTPS 提供服务，并将 `CORS_ALLOWED_ORIGINS` 限定为部署所需的来源。
 
 Codex App Server 的 TypeScript wire schema 是根据此开发环境中的 Codex CLI 生成的。升级 CLI 后，使用 `codex app-server generate-ts --out server/codex-protocol` 重新生成，并验证模型发现、推理级别和 token 用量通知。

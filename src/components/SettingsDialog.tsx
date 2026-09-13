@@ -117,8 +117,8 @@ export default function SettingsDialog({
           <section className="settings-section settings-section-divider">
             <div className="settings-section-heading"><div><h3>文書/APIサーバー</h3><p>PDF / Office変換とAIリクエストを受け取るNode APIのURLです。</p></div></div>
             <label className="field-label" htmlFor="api-server-url">サーバーURL</label>
-            <input id="api-server-url" className="text-input settings-input" type="url" value={settings.apiServerUrl} onChange={(event) => onChange({ apiServerUrl: event.target.value })} placeholder={desktop ? 'http://127.0.0.1:3001' : '空欄なら同一オリジンを使用'} />
-            <span className="settings-help-text">Web開発時は空欄で利用できます。Tauriアプリでは起動中または社内で運用するAPIサーバーのURLを指定します。</span>
+            <input id="api-server-url" className="text-input settings-input" type="url" value={settings.apiServerUrl} onChange={(event) => onChange({ apiServerUrl: event.target.value })} placeholder={desktop ? '空欄なら内蔵APIを使用' : '空欄なら同一オリジンを使用'} />
+            <span className="settings-help-text">Web開発時は空欄で利用できます。Tauri版は空欄なら文書APIを自動起動します。別のローカルまたは社内APIを使う場合はURLを指定してください。</span>
           </section>
 
           <section className="settings-section settings-section-divider">

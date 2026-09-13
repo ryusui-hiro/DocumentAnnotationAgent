@@ -257,8 +257,8 @@ test('scroll_document moves a bounded viewport and returns the cropped page imag
   const adapter = new PagedDocumentAdapter('scroll.pdf', {
     sourceFormat: 'PDF', pageCount: 1,
     pages: [{
-      number: 1, widthPoints: 120, heightPoints: 160, warningCount: 0, warnings: [],
-      svg: '<svg xmlns="http://www.w3.org/2000/svg" width="120" height="160" viewBox="0 0 120 160"><rect width="120" height="160" fill="white"/><text x="8" y="20" font-size="10">Top of the page</text><text x="8" y="150" font-size="10">Bottom of the page</text></svg>',
+      number: 1, widthPoints: 120, heightPoints: 1200, warningCount: 0, warnings: [],
+      svg: '<svg xmlns="http://www.w3.org/2000/svg" width="120" height="1200" viewBox="0 0 120 1200"><rect width="120" height="1200" fill="white"/><text x="8" y="20" font-size="10">Top of the page</text><text x="8" y="1190" font-size="10">Bottom of the page</text></svg>',
     }],
   } as unknown as PreviewReport, 'scroll-document');
   const model = new ScriptedModel([
@@ -276,8 +276,8 @@ test('scroll_document moves a bounded viewport and returns the cropped page imag
       const imageOutput = rawOutput.find((item) => typeof item === 'object' && item.type === 'input_image');
       assert.ok(textOutput && 'text' in textOutput && typeof textOutput.text === 'string');
       assert.ok(imageOutput && 'image' in imageOutput && typeof imageOutput.image === 'string');
-      const state = JSON.parse(textOutput.text) as { moved: boolean; reachedBoundary: boolean; pageNumber: number; viewport: { y: number } };
-      assert.deepEqual(state, { pageNumber: 1, direction: 'down', moved: true, reachedBoundary: false, viewport: { x: 0, y: 0.2, width: 0.68, height: 0.68 } });
+      const state = JSON.parse(textOutput.text) as { moved: boolean; reachedBoundary: boolean; pageNumber: number; viewport: { x: number; y: number; width: number; height: number } };
+      assert.deepEqual(state, { pageNumber: 1, direction: 'down', moved: true, reachedBoundary: false, viewport: { x: 0, y: 0.2, width: 0.68, height: 0.68 / 15 } });
       return [assistantMessage('The lower part of page 1 is now visible.')];
     }),
   ]);
@@ -285,7 +285,7 @@ test('scroll_document moves a bounded viewport and returns the cropped page imag
     model: 'gpt-6-astra', reasoningEffort: 'low', instruction: 'Inspect the full page for key details.',
     guidelines: '', correction: '', humanDecisions: '', pageText: 'Top of the page. Bottom of the page.',
     imageDataUrl: 'data:image/png;base64,AA==', pageNumber: 1, totalPages: 1, mode: 'observe',
-    documentAdapters: [adapter],
+    documentAdapters: [adapter], viewerAspectRatio: 1.5,
   }, model);
 
   model.assertComplete();

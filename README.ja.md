@@ -72,7 +72,7 @@ npm start
 
 注釈入りPDFはページSVGの視覚的なコピーに枠と番号を付けて書き出します。承認済みのExcel変更は新しいブックへ、DOCX注釈は新しいWordファイルのコメントへ書き出せます。元ファイルは上書きしません。Wordコメントは段落構造が対応していれば一意な原文抜粋そのものにアンカーし、同じ段落に複数注釈がある場合は段落全体を共有アンカーにします。抜粋がない・見つからない・複数一致する場合はスキップ件数を報告します。承認済みPowerPoint注釈はスライド上に編集可能な枠・ラベルと、スライド単位のユーザー定義タグを追加します。タグには分類、根拠抜粋、説明、レビュー優先度、確定状態を名前／値の機械可読形式で保存し、既存の無関係なタグは保持します。タグはスライド上には表示せず、PowerPointのTags APIまたはOpen XMLから読み取れます。ラベル・理由・レビュー優先度・座標・任意の数値推定値はCSV / JSONに含まれます。
 
-変換警告は画面に表示します。SVG は直接 HTML に挿入せず、画像として表示します。Codex App Serverは実行ホスト上のCodex CLIログインとモデルカタログを使います。macOSでは利用可能な場合にChatGPTアプリ同梱のCodex実行ファイルを優先し、`CODEX_APP_SERVER_BIN`で変更できます。Webでリモート公開する場合は、ローカル/社内APIサーバー上のCodex CLIを運用してください。TauriパッケージにはNode APIを同梱しないため、設定画面でローカルまたは社内API URLを指定してください。暗号化されたセッションデータの既定保存先は`~/.annotation-studio/session-state`です。別の場所を使う場合は`ANNOTATION_STUDIO_DATA_DIR`を設定してください。
+変換警告は画面に表示します。SVG は直接 HTML に挿入せず、画像として表示します。Codex App Serverは実行ホスト上のCodex CLIログインとモデルカタログを使います。macOSでは利用可能な場合にChatGPTアプリ同梱のCodex実行ファイルを優先し、`CODEX_APP_SERVER_BIN`で変更できます。Webでリモート公開する場合は、ローカル/社内APIサーバー上のCodex CLIを運用してください。TauriパッケージにはNode APIと対象OS用の依存パッケージが含まれ、起動時にloopback上で自動起動して終了時に停止します。サーバーURLを空欄にすると同梱APIを使い、ローカルまたは社内APIのURLを入力するとそちらを使います。デスクトップ版の暗号化セッションデータはOSのアプリデータ領域に保存します。Webサーバーの既定保存先は`~/.annotation-studio/session-state`です。`ANNOTATION_STUDIO_DATA_DIR`で変更できます。
 
 ## 参考資料の境界
 
@@ -94,7 +94,7 @@ npm start
 - APIモードではエンドポイントとAPIキーを設定し、GPT-6 Astra / GPT-5.6 Sol / GPT-5.6 Terra / GPT-5.6 Luna、推論レベルを選べます。
 - APIキーは端末へ保存されません。現在のブラウザータブのメモリにのみ保持します。
 - Codex App Serverモードは同じホスト上のCodex CLIを使います。CLIのログイン済みアカウント、利用可能モデル、推論設定を引き継ぎます。
-- Tauri 2でデスクトップアプリをビルドできます。デスクトップ版は同じ文書処理APIを使うため、設定の「文書/APIサーバーURL」にローカルまたは社内で運用する Annotation Studio API を指定します。
+- Tauri 2デスクトップ版は文書処理APIを同梱して自動起動します。設定のサーバーURLを空欄にすると同梱APIを使い、URLを指定するとローカルまたは社内APIに接続します。
 
 Web開発:
 
@@ -114,6 +114,6 @@ Tauriパッケージ:
 npm run tauri:build
 ```
 
-Tauri配布版はNode APIサーバーを自動同梱しません。APIをローカルで起動するか、設定画面で到達可能な社内API URLを指定してください。ローカルAPIは127.0.0.1だけで待ち受けます。公開環境ではHOSTを明示した上で、認証付きリバースプロキシとHTTPSを設定し、CORS_ALLOWED_ORIGINSも配備先に限定してください。
+Tauriビルド時にNode.js 24.21.0 LTSとAPI、本番依存パッケージを対象OS向けに用意します。Node.js配布物は公式SHA-256マニフェストで検証します。ネイティブビルドでは同梱APIを起動して疎通を確認し、親プロセスとのstdinパイプを閉じたときに子プロセスも終了することを検証します。アプリは127.0.0.1だけで待ち受け、ヘルスチェックが通るまで待機し、ポート競合時は別ポートを選び、終了時にAPIプロセスを停止します。macOS x64 / arm64、Windows x64 / arm64、Linux GNU x64 / arm64のネイティブビルドに対応します。`npm run tauri:build`は配布対象OS上で実行してください。Tauri CLIは対象のRust target tripleをフックへ自動で渡します。Tauri CLIを介さずにRuntimeだけ用意する場合は、対象tripleを`ANNOTATION_STUDIO_TARGET_TRIPLE`に設定します。`tauri:dev`では従来通り`npm run dev`がAPIを起動します。公開Web環境ではHOSTを明示し、認証付きリバースプロキシとHTTPSを設定し、CORS_ALLOWED_ORIGINSも配備先に限定してください。
 
 Codex App Server用TypeScript wire schemaは、この開発環境のCodex CLIから生成しています。CLIを更新した場合は `codex app-server generate-ts --out server/codex-protocol` で再生成し、モデル一覧・reasoning effort・token usage通知を確認してください。

@@ -7,6 +7,7 @@
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://127.0.0.1:5173",
     "beforeBuildCommand": "npm run build",
+    "beforeBundleCommand": "npm run prepare:desktop-runtime && npm run test:desktop-runtime",
     "frontendDist": "../dist"
   },
   "app": {
@@ -17,7 +18,8 @@
         "height": 960,
         "minWidth": 960,
         "minHeight": 680,
-        "resizable": true
+        "resizable": true,
+        "dragDropEnabled": false
       }
     ]
   },
@@ -30,6 +32,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "targets": "all"
+    "targets": "all",
+    "resources": {
+      "resources/desktop-runtime/": "desktop-runtime/"
+    }
   }
 }

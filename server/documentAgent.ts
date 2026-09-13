@@ -61,6 +61,19 @@ type ToolActivitySink = { current?: (event: ToolActivity) => void };
 type AgentNavigationState = { startingPage: number; currentPage: number; currentPageTextLines: string[]; currentPagePositionedText: PositionedTextBlock[]; selectedTextTarget?: PositionedTextTarget; currentPageImageDataUrl?: string; viewport: NormalizedTextBox; visitedPages: Set<number>; inspectedPages: Set<number> };
 type DocumentAgentMode = 'observe' | 'suggest' | 'assist' | 'autopilot';
 type AgentTokenUsage = { requests: number; inputTokens: number; outputTokens: number; reasoningTokens: number; cachedInputTokens: number; totalTokens: number };
+
+function initialPageViewport(pagedAdapter: PagedDocumentAdapter | undefined, pageNumber: number, viewerAspectRatio?: number): NormalizedTextBox {
+  const page = pagedAdapter?.report.pages.find((item) => item.number === pageNumber);
+  const pageAspectRatio = page && page.widthPoints > 0 && page.heightPoints > 0 ? page.widthPoints / page.heightPoints : 1;
+  const aspect = Number.isFinite(viewerAspectRatio) && viewerAspectRatio! > 0
+    ? viewerAspectRatio!
+    : pageAspectRatio;
+  const cropAspectRatio = aspect / pageAspectRatio;
+  const longEdge = 0.68;
+  return cropAspectRatio >= 1
+    ? { x: 0, y: 0, width: longEdge, height: longEdge / cropAspectRatio }
+    : { x: 0, y: 0, width: longEdge * cropAspectRatio, height: longEdge };
+}
 type PendingAgentRun = {
   runId: string;
   runner: Runner;
@@ -110,6 +123,7 @@ type PendingAgentRunConfiguration = {
   requestedScope?: 'current' | 'all';
   existingAnnotations: ExistingAnnotation[];
   selectedAnnotationId?: string;
+  viewerAspectRatio?: number;
   documentId?: string;
   sourceHash?: string;
   allowNavigation: boolean;
@@ -618,6 +632,7 @@ export async function runDocumentAgent(args: {
   requestedScope?: 'current' | 'all';
   existingAnnotations?: ExistingAnnotation[];
   selectedAnnotationId?: string;
+  viewerAspectRatio?: number;
   exportRequested?: boolean;
   documentAdapters?: DocumentAdapter[];
   spreadsheet?: SpreadsheetDocumentAdapter;
@@ -671,7 +686,7 @@ export async function runDocumentAgent(args: {
     currentPagePositionedText: pagePositionedText,
     ...(restoreSnapshot?.navigation.selectedTextTarget ? { selectedTextTarget: restoreSnapshot.navigation.selectedTextTarget } : {}),
     ...(restoreSnapshot?.navigation.currentPageImageDataUrl ? { currentPageImageDataUrl: restoreSnapshot.navigation.currentPageImageDataUrl } : {}),
-    viewport: restoreSnapshot?.navigation.viewport ?? { x: 0, y: 0, width: 0.68, height: 0.68 },
+    viewport: restoreSnapshot?.navigation.viewport ?? initialPageViewport(pagedAdapter, initialPage, args.viewerAspectRatio),
     visitedPages: new Set(restoreSnapshot?.navigation.visitedPages ?? [args.pageNumber]),
     inspectedPages: new Set(restoreSnapshot?.navigation.inspectedPages ?? restoreSnapshot?.toolActivity.filter((event) => event.toolName === 'inspect_page' && event.pageNumber !== undefined).map((event) => event.pageNumber!) ?? []),
   };
@@ -864,7 +879,7 @@ export async function runDocumentAgent(args: {
       navigation.currentPageTextLines = pagedAdapter.getPositionedPageText(pageNumber);
       navigation.currentPagePositionedText = pagedAdapter.getPositionedPageTextBlocks(pageNumber);
       navigation.selectedTextTarget = undefined;
-      navigation.viewport = { x: 0, y: 0, width: 0.68, height: 0.68 };
+      navigation.viewport = initialPageViewport(pagedAdapter, pageNumber, args.viewerAspectRatio);
       navigation.currentPageImageDataUrl = pageNumber === navigation.startingPage ? undefined : `data:image/png;base64,${image.toString('base64')}`;
       navigation.visitedPages.add(pageNumber);
       recordToolActivity({ toolName: 'navigate_page', phase: 'Navigating', detail: `Opened page ${pageNumber} because ${reason}.`, status: 'complete', pageNumber, textBlockCount: navigation.currentPagePositionedText.length, warningCount: view.warnings.length });
@@ -1423,6 +1438,7 @@ export async function runDocumentAgent(args: {
         requestedScope,
         existingAnnotations: structuredClone(args.existingAnnotations ?? []),
         ...(args.selectedAnnotationId ? { selectedAnnotationId: args.selectedAnnotationId } : {}),
+        ...(args.viewerAspectRatio ? { viewerAspectRatio: args.viewerAspectRatio } : {}),
         ...(args.documentId ? { documentId: args.documentId } : {}),
         ...(args.sourceHash ? { sourceHash: args.sourceHash } : {}),
         allowNavigation: Boolean(args.allowNavigation),

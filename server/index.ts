@@ -837,7 +837,7 @@ app.post('/api/ai/annotate', async (request, response, next) => {
   };
   try {
     const { settings, model, effort } = readAIRequest(body);
-    const { instruction, taskPlan, guidelines, correction, humanDecisions, pageText, imageDataUrl, pageNumber, totalPages, agentMode, requireToolApproval, selectedAnnotationId, documentId, documentScope, exportScope } = body as {
+    const { instruction, taskPlan, guidelines, correction, humanDecisions, pageText, imageDataUrl, pageNumber, totalPages, agentMode, requireToolApproval, selectedAnnotationId, viewerAspectRatio, documentId, documentScope, exportScope } = body as {
       instruction?: string;
       taskPlan?: string;
       guidelines?: string;
@@ -850,6 +850,7 @@ app.post('/api/ai/annotate', async (request, response, next) => {
       agentMode?: string;
       requireToolApproval?: boolean;
       selectedAnnotationId?: string;
+      viewerAspectRatio?: number;
       documentId?: string;
       documentScope?: string;
       exportScope?: string;
@@ -890,6 +891,10 @@ app.post('/api/ai/annotate', async (request, response, next) => {
     }
     if (selectedAnnotationId !== undefined && (typeof selectedAnnotationId !== 'string' || selectedAnnotationId.length > 100)) {
       response.status(400).json({ error: 'Selected annotation ID is invalid.' });
+      return;
+    }
+    if (viewerAspectRatio !== undefined && (typeof viewerAspectRatio !== 'number' || !Number.isFinite(viewerAspectRatio) || viewerAspectRatio < 0.2 || viewerAspectRatio > 5)) {
+      response.status(400).json({ error: 'Viewer aspect ratio is invalid.' });
       return;
     }
     if (documentScope !== undefined && !['current', 'all'].includes(documentScope)) {
@@ -1064,6 +1069,7 @@ app.post('/api/ai/annotate', async (request, response, next) => {
       requestedScope: exportScope === 'all' ? 'all' : 'current',
       existingAnnotations: existingAnnotationsResult.data as ExistingAnnotation[],
       ...(selectedAnnotationId ? { selectedAnnotationId } : {}),
+      ...(viewerAspectRatio ? { viewerAspectRatio } : {}),
       allowNavigation: documentScope === 'all',
       ...(streamActive ? { onToolEvent: (event) => emit('activity', event) } : {}),
       mode: selectedMode,
@@ -1233,7 +1239,7 @@ app.post('/api/ai/approve', async (request, response, next) => {
   }
 });
 
-if (process.env.NODE_ENV === 'production' || process.argv.includes('--serve-frontend')) {
+if (process.env.ANNOTATION_STUDIO_API_ONLY !== 'true' && (process.env.NODE_ENV === 'production' || process.argv.includes('--serve-frontend'))) {
   const webRoot = resolve('dist');
   app.use(frontendRateLimit, express.static(webRoot));
   app.use(frontendRateLimit, (_request, response) => response.sendFile(join(webRoot, 'index.html')));
@@ -1254,4 +1260,6 @@ app.use((error: unknown, _request: express.Request, response: express.Response, 
 
 app.listen(port, host, () => {
   console.log(`Annotation Studio API listening on http://${host}:${port}`);
+  const startupToken = process.env.ANNOTATION_STUDIO_STARTUP_TOKEN;
+  if (startupToken) console.log(`ANNOTATION_STUDIO_READY:${startupToken}`);
 });

@@ -1,5 +1,8 @@
 node_modules/
 dist/
+src-tauri/resources/desktop-runtime/*
+!src-tauri/resources/desktop-runtime/.keep
+.cache/desktop-runtime/
 .env
 .env.*
 !.env.example
