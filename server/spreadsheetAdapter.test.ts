@@ -21,6 +21,7 @@ test('opens workbook outline, inspects sheets, and reads bounded cell ranges', a
   const source = await createSourceWorkbook();
   const adapter = await SpreadsheetDocumentAdapter.fromBuffer('customers.xlsx', source);
 
+  assert.equal(adapter.open().fileName, 'customers.xlsx');
   assert.equal(adapter.getStructure().kind, 'spreadsheet');
   assert.equal(adapter.inspect({ kind: 'sheet', sheetName: 'Customers' }).kind, 'sheet');
   const sheets = adapter.listSheets();

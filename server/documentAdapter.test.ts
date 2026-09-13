@@ -13,6 +13,7 @@ test('paged adapter exposes structure, inspects page SVG, and searches text acro
   } as unknown as PreviewReport;
   const adapter = new PagedDocumentAdapter('contract.pdf', report);
 
+  assert.equal(adapter.open().fileName, 'contract.pdf');
   assert.equal(adapter.getStructure().kind, 'paged');
   assert.equal(adapter.getStructure().pages?.length, 2);
   assert.equal(adapter.inspect({ kind: 'page', pageNumber: 2 }).kind, 'page');
@@ -63,6 +64,7 @@ test('search combines matches from paged and spreadsheet adapters without changi
     pages: [{ number: 1, widthPoints: 612, heightPoints: 792, warningCount: 0, warnings: [], svg: '<svg><text>Churn risk appears in this appendix.</text></svg>' }],
   } as unknown as PreviewReport);
   const spreadsheet: DocumentAdapter = {
+    open: () => ({ fileName: 'customers.xlsx', fileType: 'XLSX', kind: 'spreadsheet' }),
     getStructure: () => ({ fileName: 'customers.xlsx', fileType: 'XLSX', kind: 'spreadsheet' }),
     inspect: () => { throw new Error('not used in search test'); },
     search: (query: string) => query === 'churn' ? [{ location: { kind: 'sheet', sheetName: 'Customers', range: 'E2' }, excerpt: 'HIGH', matchType: 'cell' as const }] : [],

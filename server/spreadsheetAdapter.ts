@@ -280,6 +280,11 @@ export class SpreadsheetDocumentAdapter implements DocumentAdapter, SpreadsheetI
     return this.workbook.worksheets.slice(0, 50).map((worksheet) => this.inspectSheet(worksheet.name));
   }
 
+  open(): DocumentOutline {
+    if (!this.fileName.trim()) throw fail('The active workbook session is not ready to open.');
+    return this.getStructure();
+  }
+
   getStructure(): DocumentOutline {
     return {
       fileName: this.fileName,

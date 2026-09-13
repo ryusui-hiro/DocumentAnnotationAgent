@@ -44,6 +44,9 @@ export interface DocumentExportResult {
 }
 
 export interface DocumentAdapter {
+  readonly documentId?: string;
+  /** Activates the already user-opened document session and returns its bounded structure. */
+  open(): DocumentOutline;
   getStructure(): DocumentOutline;
   inspect(location: DocumentLocation): DocumentView;
   search(query: string, limit?: number): DocumentSearchResult[];
@@ -92,6 +95,13 @@ export class PagedDocumentAdapter implements DocumentAdapter {
   private readonly annotations = new Map<string, DocumentAnnotationRecord>();
 
   constructor(readonly fileName: string, readonly report: PreviewReport, readonly documentId = '', private readonly sourceBuffer?: Buffer) {}
+
+  open(): DocumentOutline {
+    if (!this.fileName.trim() || !Number.isInteger(this.report.pageCount) || this.report.pageCount < 1) {
+      throw fail('The active uploaded document session is not ready to open.');
+    }
+    return this.getStructure();
+  }
 
   getStructure(): DocumentOutline {
     return {
