@@ -35,7 +35,7 @@ npm start
 
 ## 今の範囲
 
-- PDF / DOCX / PPTX / XLSX のアップロードと、`document-svg` によるページごとのSVG変換。PNG / JPEG / WebP / TIFF画像も1ページとして読み込み。
+- PDF / DOCX / PPTX / XLSX / PNG / JPEG / WebP / TIFFの1ファイルを選択するか、画面にドラッグ＆ドロップして開く。PDF / Office文書は`document-svg`でページごとのSVGに変換し、画像は1ページとして表示。
 - 選択ツール、矩形領域注釈、色ラベル、注釈メモ、削除、一覧からの選択。
 - 注釈領域を PNG でダウンロード。
 - 自然言語のタスク例と編集可能なアノテーションガイドラインを使い、ページ単位または文書全体を順番に解析。

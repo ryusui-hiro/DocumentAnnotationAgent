@@ -37,7 +37,7 @@ npm start
 
 ## 功能
 
-- 上传 PDF、DOCX、PPTX 和 XLSX 文件，并通过 `document-svg` 转换为逐页 SVG；PNG、JPEG、WebP 和 TIFF 图片作为单页预览加载。
+- 可选择一个 PDF、DOCX、PPTX、XLSX、PNG、JPEG、WebP 或 TIFF 文件，也可将其拖放到工作区打开。PDF / Office 文档通过 `document-svg` 转换为逐页 SVG；图片作为单页预览加载。
 - 添加和编辑矩形注释、颜色标签及备注；选择、删除注释，或将选定区域提取为 PNG。
 - 使用任务模板和可编辑的注释指南，逐页或按顺序分析整份文档。
 - 将自然语言指令整理为可见的 Annotation Task，包含标签、操作、不确定时的处理方式和流程；连接 OpenAI、Azure、兼容 OpenAI 的 API 或 Codex App Server 时使用结构化输出，并把计划传给逐页 Agent。未连接时会标记为本地草稿。

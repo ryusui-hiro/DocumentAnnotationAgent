@@ -49,7 +49,11 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .export-popover button { display: flex; align-items: center; gap: 9px; padding: 10px 9px; border: 0; border-radius: 5px; background: transparent; color: #43515a; cursor: pointer; font-size: 11px; text-align: left; }
 .export-popover button:hover:not(:disabled) { background: #f3f7f7; }
 
-.workspace { display: grid; min-height: 0; flex: 1; grid-template-columns: 68px minmax(460px, 1fr) 352px; }
+.workspace { position: relative; display: grid; min-height: 0; flex: 1; grid-template-columns: 68px minmax(460px, 1fr) 352px; }
+.file-drop-overlay { position: absolute; z-index: 20; inset: 0; display: grid; place-items: center; padding: 20px; background: rgba(20, 127, 124, .12); backdrop-filter: blur(2px); pointer-events: none; }
+.file-drop-card { display: grid; justify-items: center; gap: 10px; max-width: min(520px, 90%); padding: 32px 40px; border: 2px dashed #168783; border-radius: 16px; background: rgba(255,255,255,.97); box-shadow: 0 16px 44px rgba(29,58,60,.18); color: #167b78; text-align: center; }
+.file-drop-card strong { color: #2e4148; font-size: 16px; }
+.file-drop-card span { color: #708087; font-size: 11px; }
 .rail { display: flex; flex-direction: column; align-items: center; gap: 7px; padding: 15px 7px 13px; border-right: 1px solid #e2e7ea; background: #fbfcfc; }
 .rail-button { position: relative; display: flex; width: 54px; height: 54px; flex-direction: column; align-items: center; justify-content: center; gap: 4px; border: 0; border-radius: 9px; background: transparent; color: #73808a; cursor: pointer; font-size: 9px; transition: background .15s ease, color .15s ease; }
 .rail-button:hover { background: #f1f6f5; color: #276d6b; }
@@ -101,6 +105,7 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .empty-icon { display: grid; width: 54px; height: 54px; place-items: center; margin-bottom: 15px; border: 1px solid #dce9e8; border-radius: 15px; background: #f7fbfa; color: #17817d; }
 .empty-state h2 { margin: 0 0 8px; color: #34424c; font-size: 15px; }
 .empty-state p { margin: 0 0 17px; color: #7a8790; font-size: 11px; line-height: 1.7; }
+.empty-state .empty-drop-hint { margin: -8px 0 15px; color: #167976; font-size: 10px; font-weight: 600; }
 .canvas-footer { display: flex; min-height: 27px; flex: 0 0 27px; align-items: center; justify-content: space-between; padding: 0 20px; border-top: 1px solid #e5e9ec; background: #f9fafb; color: #89949b; font-size: 9px; }
 .footer-separator { padding: 0 5px; color: #bbc3c8; }
 .tool-dock { min-height: 53px; flex: 0 0 53px; gap: 5px; padding: 0 14px; border-top: 1px solid #e2e7ea; background: white; }

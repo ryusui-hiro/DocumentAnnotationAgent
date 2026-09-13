@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent as ReactDragEvent, type PointerEvent } from 'react';
 import {
   ArrowLeft,
   ArrowRight,
@@ -387,6 +387,7 @@ function App() {
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState('');
   const [uploading, setUploading] = useState(false);
+  const [fileDragActive, setFileDragActive] = useState(false);
   const [message, setMessage] = useState('');
   const [showGuide, setShowGuide] = useState(false);
   const [saved, setSaved] = useState(true);
@@ -397,6 +398,7 @@ function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const workspaceFolderInputRef = useRef<HTMLInputElement>(null);
   const guidelineFileInputRef = useRef<HTMLInputElement>(null);
+  const fileDragDepthRef = useRef(0);
   const workspaceBrowserFilesRef = useRef(new Map<string, File>());
   const workspaceProjectRef = useRef<WorkspaceProject | null>(workspaceProject);
   const workspaceBatchActiveRef = useRef(false);
@@ -1311,6 +1313,48 @@ function App() {
     setMessage(`${rootName} をプロジェクトとして開きました。対応文書 ${documents.length} 件。`);
     if (files.length > maxWorkspaceDocuments) setMessage(`先頭の${maxWorkspaceDocuments}件を読み込みました。対象フォルダーを分けてください。`);
     if (workspaceFolderInputRef.current) workspaceFolderInputRef.current.value = '';
+  };
+
+  const handleFileDragEnter = (event: ReactDragEvent<HTMLDivElement>) => {
+    if (!Array.from(event.dataTransfer.types).includes('Files')) return;
+    event.preventDefault();
+    fileDragDepthRef.current += 1;
+    setFileDragActive(true);
+  };
+
+  const handleFileDragOver = (event: ReactDragEvent<HTMLDivElement>) => {
+    if (!Array.from(event.dataTransfer.types).includes('Files')) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+  };
+
+  const handleFileDragLeave = (event: ReactDragEvent<HTMLDivElement>) => {
+    if (!Array.from(event.dataTransfer.types).includes('Files')) return;
+    event.preventDefault();
+    fileDragDepthRef.current = Math.max(0, fileDragDepthRef.current - 1);
+    if (fileDragDepthRef.current === 0) setFileDragActive(false);
+  };
+
+  const handleFileDrop = (event: ReactDragEvent<HTMLDivElement>) => {
+    if (!Array.from(event.dataTransfer.types).includes('Files')) return;
+    event.preventDefault();
+    fileDragDepthRef.current = 0;
+    setFileDragActive(false);
+    if (uploading) {
+      setMessage('現在の文書処理が終わってから、次のファイルを開いてください。');
+      return;
+    }
+    const files = Array.from(event.dataTransfer.files);
+    const supportedFiles = files.filter((file) => isSupportedWorkspaceFile(file.webkitRelativePath || file.name));
+    if (!supportedFiles.length) {
+      setMessage('対応しているPDF、Office文書、画像ファイルをドロップしてください。');
+      return;
+    }
+    if (supportedFiles.length > 1) {
+      setMessage('複数文書の一括処理には、左側の「プロジェクト」からフォルダーを開いてください。');
+      return;
+    }
+    void onFileSelected(supportedFiles[0]);
   };
 
   const openWorkspaceDocument = async (entry: WorkspaceDocumentEntry, restoreTask = true) => {
@@ -2824,7 +2868,14 @@ function App() {
         </div>
       </header>
 
-      <div className="workspace">
+      <div className="workspace" onDragEnter={handleFileDragEnter} onDragOver={handleFileDragOver} onDragLeave={handleFileDragLeave} onDrop={handleFileDrop}>
+        {fileDragActive && <div className="file-drop-overlay" aria-live="polite">
+          <div className="file-drop-card">
+            <CloudUpload size={28} />
+            <strong>ここにドロップして文書を開く</strong>
+            <span>PDF · Word · PowerPoint · Excel · PNG · JPEG · WebP · TIFF</span>
+          </div>
+        </div>}
         <nav className="rail" aria-label="メインナビゲーション">
           <button className="rail-button is-active" type="button" aria-current="page" title="アノテーション"><ScanLine size={19} /><span>注釈</span></button>
           <button className="rail-button" type="button" title="文書を追加" onClick={() => fileInputRef.current?.click()}><Files size={19} /><span>文書</span></button>
@@ -2933,6 +2984,7 @@ function App() {
                   <div className="empty-icon"><CloudUpload size={28} /></div>
                   <h2>注釈する文書を読み込みましょう</h2>
                   <p>PDF、Word、PowerPoint、Excelに加え、PNG / JPEG / WebP / TIFF画像を読み込めます。</p>
+                  <p className="empty-drop-hint">ファイルをこの画面へドラッグ＆ドロップして開くこともできます。</p>
                   <button className="button button-primary" type="button" onClick={() => fileInputRef.current?.click()}><Upload size={16} /> 文書を選択</button>
                 </div>
               ) : (

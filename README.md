@@ -37,7 +37,7 @@ npm start
 
 ## Features
 
-- Upload PDF, DOCX, PPTX, and XLSX files and convert them to page SVGs with `document-svg`; upload PNG, JPEG, WebP, and TIFF images as single-page previews.
+- Choose or drag one PDF, DOCX, PPTX, XLSX, PNG, JPEG, WebP, or TIFF file into the workspace to open it; PDFs and Office documents convert to page SVGs with `document-svg`, while images appear as single-page previews.
 - Add and edit rectangular annotations, color labels, and notes; select, delete, or extract a region as PNG.
 - Use task presets and editable annotation guidelines to analyze one page or the whole document sequentially.
 - Convert a natural-language request into a visible Annotation Task plan with labels, actions, uncertainty policy, and workflow. With OpenAI, Azure, OpenAI-compatible, or Codex App Server configured, the planner uses strict structured output; the agent receives that plan on each page. Without a provider, a clearly marked local draft is used.
