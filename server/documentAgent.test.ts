@@ -874,8 +874,23 @@ test('the agent navigates to a searched page, receives its image, and targets th
     ],
   } as unknown as PreviewReport);
   const model = new ScriptedModel([
-    modelResponse([functionCall('get_document_outline', {}, { callId: 'nav-outline' })]),
-    modelResponse([functionCall('inspect_page', {}, { callId: 'nav-inspect-start' })]),
+    modelResponder((call) => {
+      const initialContext = JSON.stringify(call.request.input);
+      assert.match(initialContext, /This is a full-document run over 2 pages/);
+      assert.doesNotMatch(initialContext, /Current human-visible page bounds/);
+      return [functionCall('get_document_outline', {}, { callId: 'nav-outline' })];
+    }),
+    modelResponder((call) => {
+      const outline = Array.isArray(call.request.input)
+        ? call.request.input.find((item) => item.type === 'function_call_result' && item.name === 'get_document_outline')
+        : undefined;
+      assert.ok(outline, 'the full-document outline returns to the Agent');
+      const raw = 'output' in outline ? outline.output : undefined;
+      const text = typeof raw === 'string' ? raw : raw && typeof raw === 'object' && !Array.isArray(raw) && 'text' in raw ? String(raw.text) : '';
+      const result = JSON.parse(text) as { currentViewport: { x: number; y: number; width: number; height: number } };
+      assert.deepEqual(result.currentViewport, { x: 0, y: 0, width: 1, height: 1 });
+      return [functionCall('inspect_page', {}, { callId: 'nav-inspect-start' })];
+    }),
     modelResponse([functionCall('search_document', { query: 'termination' }, { callId: 'nav-search' })]),
     modelResponse([functionCall('navigate_page', { pageNumber: 2, reason: 'The termination clause search hit is on this page.' }, { callId: 'nav-open-page-2' })]),
     modelResponse([functionCall('inspect_page', {}, { callId: 'nav-inspect-page-2' })]),
@@ -891,7 +906,8 @@ test('the agent navigates to a searched page, receives its image, and targets th
     model: 'gpt-6-astra', reasoningEffort: 'medium', instruction: 'Find all termination clauses.',
     guidelines: '', correction: '', humanDecisions: '', pageText: 'Definitions.',
     imageDataUrl: 'data:image/png;base64,AA==', pageNumber: 1, totalPages: 2,
-    documentAdapters: [adapter], allowNavigation: true, mode: 'assist',
+    documentAdapters: [adapter], allowNavigation: true, mode: 'assist', viewerAspectRatio: 1.5,
+    viewerViewport: { x: 0.4, y: 0.4, width: 0.2, height: 0.2 },
   }, model);
 
   model.assertComplete();

@@ -758,6 +758,7 @@ function App() {
     if (event.toolName === 'navigate_page' && event.pageNumber !== undefined) {
       setAgentViewport(null);
       setAgentViewportScale(null);
+      if (event.pageNumber !== pageNumber) setSelectedId(null);
       setPageNumber(event.pageNumber);
       window.requestAnimationFrame(() => pageScrollAreaRef.current?.scrollTo({ left: 0, top: 0 }));
       return;
@@ -2000,6 +2001,7 @@ function App() {
       ? continuation.fullDocument === undefined ? continuation.remainingPages.length > 1 ? 'all' : 'current' : continuation.fullDocument ? 'all' : 'current'
       : selectedMode === 'autopilot' ? 'all' : scope;
     const startingPageNumber = pageNumber;
+    if (!continuation && effectiveScope === 'all') setZoom(100);
     const isWorkbook = documentData.fileType.toLowerCase() === 'xlsx';
     const envProviderMatches = (settings.provider === 'azure-openai' && health?.provider === 'azure') ||
       (settings.provider === 'openai-api' && health?.provider === 'openai');
@@ -2141,6 +2143,7 @@ function App() {
         let pageToolEvents: Array<{ toolName: string; phase: AgentActivityPhase; detail: string; status: 'active' | 'complete' | 'waiting' | 'error'; pageNumber?: number; textBlockCount?: number; warningCount?: number; viewport?: NormalizedTextBox }> = [];
         setScanProgress({ current: useAgentNavigation ? Math.max(1, completedPages) : index + 1, total: runTotalPages, scope: effectiveScope });
         const navigationId = addAgentActivity('Navigating', `navigate_page({ page: ${targetPage} }) → opening page ${targetPage} of ${documentData.pageCount}.`, 'active', targetPage);
+        if (targetPage !== startingPageNumber) setSelectedId(null);
         setPageNumber(targetPage);
         const preserveCurrentViewer = !continuation && effectiveScope === 'current' && targetPage === startingPageNumber && !isWorkbook;
         const viewerViewport = preserveCurrentViewer
@@ -2164,7 +2167,9 @@ function App() {
           } else {
             const searchId = addAgentActivity('Searching', 'search_document → checking extracted text, positions, and visual layout for task targets.', 'active', targetPage);
             const existingAnnotationsForRequest = [...annotationSnapshot.values()].slice(-500);
-            const selectedAnnotationSummary = selectedId ? annotationSnapshot.get(selectedId) : undefined;
+            const selectedAnnotationSummary = selectedId
+              ? annotationSnapshot.get(selectedId)?.pageNumber === targetPage ? annotationSnapshot.get(selectedId) : undefined
+              : undefined;
             if (selectedAnnotationSummary && !existingAnnotationsForRequest.some((item) => item.id === selectedAnnotationSummary.id)) {
               existingAnnotationsForRequest.unshift(selectedAnnotationSummary);
               if (existingAnnotationsForRequest.length > 500) existingAnnotationsForRequest.pop();
