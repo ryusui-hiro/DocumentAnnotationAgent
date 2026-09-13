@@ -42,3 +42,9 @@ jobs:
 
       - name: Build frontend
         run: npm run build
+
+      - name: Prepare bundled Linux runtime
+        run: npm run prepare:desktop-runtime
+
+      - name: Check bundled API startup and shutdown
+        run: npm run test:desktop-runtime
