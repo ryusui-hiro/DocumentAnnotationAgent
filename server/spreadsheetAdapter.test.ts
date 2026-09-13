@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import ExcelJS from 'exceljs';
+import JSZip from 'jszip';
 import { SpreadsheetDocumentAdapter } from './spreadsheetAdapter';
 
 async function createSourceWorkbook() {
@@ -70,4 +71,34 @@ test('stages cell and column edits, applies only approved changes, and exports a
   assert.deepEqual(restored.getChanges(), adapter.getChanges(), 'review and approval records are restored with the working workbook');
   assert.equal(restored.readRange('Customers', 'D1').rows[0]?.[0]?.value, 'Churn Risk');
   assert.deepEqual(restored.readRange('Customers', 'D2:D3').rows.map((row) => row[0]?.value), ['LOW', 'HIGH']);
+});
+
+test('opens default-namespace drawing XML and preserves embedded images when exporting edits', async () => {
+  const workbook = new ExcelJS.Workbook();
+  const sheet = workbook.addWorksheet('Report');
+  sheet.addRows([['Metric', 'Value'], ['Revenue', 1200]]);
+  const imageId = workbook.addImage({
+    buffer: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+cZl8AAAAASUVORK5CYII=', 'base64') as never,
+    extension: 'png',
+  });
+  sheet.addImage(imageId, 'D2:E5');
+  const generated = Buffer.from(await workbook.xlsx.writeBuffer());
+  const zip = await JSZip.loadAsync(generated);
+  const drawingParts = Object.keys(zip.files).filter((name) => name.startsWith('xl/drawings/') && name.endsWith('.xml') && !name.includes('/_rels/'));
+  assert.equal(drawingParts.length, 1);
+  for (const name of drawingParts) {
+    const xml = await zip.file(name)!.async('string');
+    zip.file(name, xml.replaceAll('<xdr:', '<').replaceAll('</xdr:', '</').replaceAll('xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"', 'xmlns="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"'));
+  }
+  const source = Buffer.from(await zip.generateAsync({ type: 'nodebuffer' }));
+  const originalSource = Buffer.from(source);
+  const adapter = await SpreadsheetDocumentAdapter.fromBuffer('image-report.xlsx', source);
+  assert.equal(adapter.workbook.worksheets[0]?.getImages().length, 1);
+
+  adapter.writeCell('Report', 'C2', 'Checked', 'Human-reviewed result.', undefined, false, 'image-sheet-cell');
+  const exported = await adapter.export({ format: 'native-annotated' });
+  const reopened = await SpreadsheetDocumentAdapter.fromBuffer('image-report-annotated.xlsx', exported.buffer);
+  assert.deepEqual(reopened.readRange('Report', 'C2').rows[0]?.[0]?.value, 'Checked');
+  assert.equal(reopened.workbook.worksheets[0]?.getImages().length, 1);
+  assert.deepEqual(source, originalSource, 'normalization and editing leave uploaded source bytes unchanged');
 });

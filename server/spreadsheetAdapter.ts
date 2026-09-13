@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import ExcelJS from 'exceljs';
+import JSZip from 'jszip';
 import type { DocumentAdapter, DocumentExportRequest, DocumentExportResult, DocumentLocation, DocumentOutline, DocumentSearchResult, DocumentView, SpreadsheetInspector } from './documentAdapter';
 import type { DocumentAnnotationRecord } from '../src/types';
 import { documentAnnotationsToCsv } from './annotationCsv';
@@ -7,6 +8,81 @@ import { documentAnnotationsToCsv } from './annotationCsv';
 const maxRangeCells = 500;
 const maxWorkbookRows = 1_000_000;
 const maxWorkbookColumns = 16_384;
+const spreadsheetDrawingNamespace = 'http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing';
+
+function prefixDefaultSpreadsheetDrawingElements(xml: string) {
+  if (!xml.includes('<wsDr') || !xml.includes(`xmlns="${spreadsheetDrawingNamespace}"`)) return xml;
+  let output = '';
+  let cursor = 0;
+  while (cursor < xml.length) {
+    const open = xml.indexOf('<', cursor);
+    if (open < 0) return output + xml.slice(cursor);
+    output += xml.slice(cursor, open);
+    const specialTerminator = xml.startsWith('<!--', open) ? '-->'
+      : xml.startsWith('<![CDATA[', open) ? ']]>'
+        : xml.startsWith('<?', open) ? '?>'
+          : '';
+    if (specialTerminator) {
+      const terminatorIndex = xml.indexOf(specialTerminator, open);
+      if (terminatorIndex < 0) return output + xml.slice(open);
+      const specialEnd = terminatorIndex + specialTerminator.length;
+      output += xml.slice(open, specialEnd);
+      cursor = specialEnd;
+      continue;
+    }
+    let end = open + 1;
+    let quote = '';
+    for (; end < xml.length; end += 1) {
+      const character = xml[end]!;
+      if (quote) {
+        if (character === quote) quote = '';
+      } else if (character === '"' || character === "'") {
+        quote = character;
+      } else if (character === '>') {
+        break;
+      }
+    }
+    if (end >= xml.length) return output + xml.slice(open);
+    const tag = xml.slice(open, end + 1);
+    if (tag.startsWith('<!')) {
+      output += tag;
+      cursor = end + 1;
+      continue;
+    }
+    let nameStart = open + 1 + (xml[open + 1] === '/' ? 1 : 0);
+    let nameEnd = nameStart;
+    while (nameEnd < end && !/[\s/>]/u.test(xml[nameEnd]!)) nameEnd += 1;
+    const name = xml.slice(nameStart, nameEnd);
+    const prefix = name && !name.includes(':') ? `xdr:${name}` : name;
+    const normalizedTag = `${xml.slice(open, nameStart)}${prefix}${xml.slice(nameEnd, end)}`
+      .replaceAll(`xmlns="${spreadsheetDrawingNamespace}"`, `xmlns:xdr="${spreadsheetDrawingNamespace}"`)
+      + '>';
+    output += normalizedTag;
+    cursor = end + 1;
+  }
+  return output;
+}
+
+async function exceljsCompatibleWorkbook(buffer: Buffer) {
+  try {
+    const zip = await JSZip.loadAsync(buffer);
+    let changed = false;
+    const drawings = Object.keys(zip.files).filter((name) => name.startsWith('xl/drawings/') && name.endsWith('.xml') && !name.includes('/_rels/'));
+    for (const name of drawings) {
+      const file = zip.file(name);
+      if (!file) continue;
+      const original = await file.async('string');
+      const normalized = prefixDefaultSpreadsheetDrawingElements(original);
+      if (normalized !== original) {
+        zip.file(name, normalized);
+        changed = true;
+      }
+    }
+    return changed ? Buffer.from(await zip.generateAsync({ type: 'nodebuffer' })) : buffer;
+  } catch {
+    return buffer;
+  }
+}
 
 export type SpreadsheetValue = string | number | boolean | null;
 
@@ -82,11 +158,18 @@ export class SpreadsheetDocumentAdapter implements DocumentAdapter, SpreadsheetI
   private readonly annotations = new Map<string, DocumentAnnotationRecord>();
 
   static async fromBuffer(fileName: string, buffer: Buffer, documentId = '') {
-    const workbook = new ExcelJS.Workbook();
+    let workbook = new ExcelJS.Workbook();
     try {
       await workbook.xlsx.load(buffer as never);
     } catch {
-      throw fail('XLSX workbook could not be opened. It may be encrypted or corrupted.', 415);
+      const compatible = await exceljsCompatibleWorkbook(buffer);
+      if (compatible === buffer) throw fail('XLSX workbook could not be opened. It may be encrypted or corrupted.', 415);
+      workbook = new ExcelJS.Workbook();
+      try {
+        await workbook.xlsx.load(compatible as never);
+      } catch {
+        throw fail('XLSX workbook could not be opened. It may be encrypted or corrupted.', 415);
+      }
     }
     return new SpreadsheetDocumentAdapter(workbook, fileName, documentId);
   }
