@@ -87,7 +87,7 @@ test('persists per-page coverage without treating unread or unprocessed pages as
   entry.pageCoverageTargets = [1, 2, 3, 4];
   entry.pageCoverage = [
     { pageNumber: 1, status: 'checked', findingCount: 0, reviewCount: 0, warningCount: 0, textBlockCount: 12 },
-    { pageNumber: 2, status: 'image_only', findingCount: 0, reviewCount: 1, warningCount: 1, textBlockCount: 0, detail: 'No selectable text was available.' },
+    { pageNumber: 2, status: 'image_only', findingCount: 0, reviewCount: 1, warningCount: 1, humanReviewed: true, warningAcknowledged: true, textBlockCount: 0, detail: 'No selectable text was available.' },
     { pageNumber: 3, status: 'failed', findingCount: 0, reviewCount: 0, warningCount: 2, detail: 'Page conversion failed.' },
   ];
   writeAgentRunHistory(storage, entry.fileName, [entry], entry.sourceHash);
@@ -96,6 +96,8 @@ test('persists per-page coverage without treating unread or unprocessed pages as
   assert.equal(restored?.pageCoverage?.length, 3);
   assert.equal(restored?.pageCoverage?.find((page) => page.pageNumber === 1)?.status, 'checked');
   assert.equal(restored?.pageCoverage?.find((page) => page.pageNumber === 2)?.status, 'image_only');
+  assert.equal(restored?.pageCoverage?.find((page) => page.pageNumber === 2)?.humanReviewed, true);
+  assert.equal(restored?.pageCoverage?.find((page) => page.pageNumber === 2)?.warningAcknowledged, true);
   assert.equal(restored?.pageCoverage?.find((page) => page.pageNumber === 3)?.status, 'failed');
   assert.equal(restored?.pageCoverage?.some((page) => page.pageNumber === 4), false, 'unprocessed pages stay absent instead of looking like no-findings pages');
   assert.deepEqual(restored?.pageCoverageTargets, [1, 2, 3, 4]);

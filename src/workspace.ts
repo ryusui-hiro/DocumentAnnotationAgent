@@ -2,11 +2,56 @@ import type { WorkspaceDocumentEntry, WorkspaceFileStatus, WorkspaceProject } fr
 
 export const workspaceProjectStorageKey = 'annotation-studio:workspace-project';
 export const maxWorkspaceDocuments = 200;
+export const maxWorkspaceDepth = 16;
 const supportedExtensions = new Set(['pdf', 'docx', 'pptx', 'xlsx', 'png', 'jpg', 'jpeg', 'webp', 'tif', 'tiff']);
 const ignoredDirectories = new Set(['.git', '.hg', '.svn', 'node_modules', 'target', 'dist', 'build', '.next', '.venv']);
 const fileStatuses: WorkspaceFileStatus[] = ['ready', 'running', 'complete', 'review', 'error'];
 
 type WorkspaceStorage = Pick<Storage, 'getItem' | 'setItem'>;
+export type NativeWorkspaceEntry = { name: string; isFile: boolean; isDirectory: boolean; isSymlink: boolean };
+export type NativeWorkspaceReadDir = (path: string) => Promise<NativeWorkspaceEntry[]>;
+export type NativeWorkspaceReadFile = (path: string) => Promise<Uint8Array>;
+
+function joinNativePath(directory: string, name: string) {
+  const separator = directory.includes('\\') ? '\\' : '/';
+  return `${directory.replace(/[\\/]+$/, '')}${separator}${name}`;
+}
+
+export function nativeWorkspaceDirectoryName(path: string) {
+  return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
+}
+
+/** Enumerate a native project using the caller's filesystem capability. */
+export async function enumerateDesktopWorkspace(
+  rootPath: string,
+  readDir: NativeWorkspaceReadDir,
+  maxDepth = maxWorkspaceDepth,
+  maxDocuments = maxWorkspaceDocuments,
+): Promise<WorkspaceDocumentEntry[]> {
+  const documents: WorkspaceDocumentEntry[] = [];
+  const visit = async (directory: string, relativeDirectory: string, depth: number): Promise<void> => {
+    if (depth > maxDepth || documents.length >= maxDocuments) return;
+    const entries = await readDir(directory);
+    for (const entry of entries) {
+      if (documents.length >= maxDocuments) break;
+      if (!entry.name || entry.isSymlink) continue;
+      const nativePath = joinNativePath(directory, entry.name);
+      const relativePath = relativeDirectory ? `${relativeDirectory}/${entry.name}` : entry.name;
+      if (entry.isDirectory) {
+        if (!shouldIgnoreWorkspaceDirectory(entry.name)) await visit(nativePath, relativePath, depth + 1);
+      } else if (entry.isFile && isSupportedWorkspaceFile(entry.name)) {
+        documents.push({ id: relativePath, relativePath, selected: true, status: 'ready', nativePath });
+      }
+    }
+  };
+  await visit(rootPath, '', 0);
+  return documents.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+}
+
+export async function readNativeWorkspaceDocument(nativePath: string, readFile: NativeWorkspaceReadFile) {
+  const bytes = await readFile(nativePath);
+  return new Blob([Uint8Array.from(bytes).buffer]);
+}
 
 export function isSupportedWorkspaceFile(path: string) {
   const fileName = path.split(/[\\/]/).at(-1) ?? '';

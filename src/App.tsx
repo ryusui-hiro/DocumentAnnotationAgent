@@ -17,7 +17,9 @@ import {
   LoaderCircle,
   MessageSquareText,
   MousePointer2,
+  Pencil,
   ScanLine,
+  Search,
   Settings2,
   ShieldAlert,
   Sparkles,
@@ -33,19 +35,25 @@ import {
   createSvgPreviewUrl,
   revokeSvgPreviewUrl,
 } from 'document-svg/preview-ui';
-import type { AgentActivityEvent, AgentActivityPhase, AgentMode, AgentPageCoverage, AgentHumanDecisionRecord, AgentRunHistory, AgentRunStatus, Annotation, AnnotationCandidate, AnnotationReviewPriority, ApiHealth, AppSettings, CodexModel, ConvertedDocument, ConvertedPage, DocumentAnnotationOperation, DocumentAnnotationRecord, ModelId, NormalizedTextBox, PreparedDocumentExport, ProviderId, SpreadsheetCellChange, TokenUsage, UsageTotals, WorkbookSessionSummary, WorkspaceDocumentEntry, WorkspaceProject } from './types';
+import type { AgentActivityEvent, AgentActivityPhase, AgentMode, AgentPageCoverage, AgentHumanDecisionRecord, AgentRunHistory, AgentRunStatus, Annotation, AnnotationCandidate, AnnotationReviewPriority, ApiHealth, AppSettings, CodexModel, ConvertedDocument, ConvertedPage, DocumentAnnotationOperation, DocumentAnnotationRecord, ModelId, NormalizedTextBox, PreparedDocumentExport, ProviderId, SpreadsheetCellChange, SpreadsheetValue, TokenUsage, UsageTotals, WorkbookSessionSummary, WorkspaceDocumentEntry, WorkspaceProject } from './types';
 import SettingsDialog from './components/SettingsDialog';
 import { apiFetch } from './api';
 import { consumeAgentStream, type LiveToolActivity } from './agentStream';
 import { readAgentRunHistory, resolveHumanReviewStatus, upsertAgentRunHistory, writeAgentRunHistory } from './runHistory';
+import { acknowledgePageCoverage, countResolvedReviewCandidatesOnPage, inferFullDocumentContinuation, mergeResumedPageCoverage as mergePageCoverageFromResume, selectUninspectedPages } from './pageCoverage';
 import { localTaskPlan, parseTaskPlan, taskPlanAsInstructions, taskPlanSignature, type AnnotationTaskPlan, type TaskPlanSource } from './taskPlan';
+import type { CorrectionRuleDraft, CorrectionRuleInput } from '../server/correctionRulePlanner';
 import { findInconsistentRepeatedExcerpts, restoreAnnotationConsistencyIssues, type AnnotationConsistencyIssue } from './consistency';
 import { normalizeDocumentAnnotationRecords, readStoredDocumentAnnotationRecords, resolveCandidateReview, restoreDocumentAnnotationRecords, spreadsheetChangeStatusLabel } from './documentAnnotations';
 import { annotationReviewStatus } from './annotationStatus';
+import { buildValidatorSnapshotPayload, validatorSnapshotSignature as computeValidatorSnapshotSignature, type ValidatorSnapshotAnnotation } from './validatorSnapshotSignature';
+import { excelColumnLetters, parseExcelCellAddress, spreadsheetChangeAtCell, workbookColumnStartForCell, workbookColumnWindow } from './workbookPreview';
 import { mergePreparedDocumentExports, restorePreparedDocumentExports } from './preparedExports';
 import { createHumanDecisionRecord, readHumanDecisionRecords, recordHumanDecision, type HumanDecisionScope } from './humanDecisionScope';
-import { isSupportedWorkspaceFile, loadWorkspaceProject, maxWorkspaceDocuments, saveWorkspaceProject, shouldIgnoreWorkspaceDirectory } from './workspace';
+import { enumerateDesktopWorkspace, isSupportedWorkspaceFile, loadWorkspaceProject, maxWorkspaceDocuments, nativeWorkspaceDirectoryName, readNativeWorkspaceDocument, saveWorkspaceProject } from './workspace';
 import { readWorkspaceState, writeWorkspaceState } from './workspaceState';
+import { terminationContractDemoAnnotations, terminationContractDemoCandidate, terminationContractDemoFileName, terminationContractDemoGuidelines, terminationContractDemoPrompt } from './terminationContractDemo';
+import { productHuntDemoChurnFileName, productHuntDemoChurnGuidelines, productHuntDemoChurnPrompt, productHuntDemoContractFileName, productHuntDemoContractGuidelines, productHuntDemoContractPrompt, productHuntDemoFeedbackFileName, productHuntDemoFeedbackGuidelines, productHuntDemoFeedbackPrompt } from './productHuntDemo';
 import {
   emptyUsageTotals,
   formatTokens,
@@ -65,12 +73,178 @@ function reviewPriorityLabel(priority?: AnnotationReviewPriority, requiresReview
 }
 
 type ArrayStateAction<T> = T[] | ((previous: T[]) => T[]);
+type WorkbookContextRows = { changeId: string; sheetName: string; range: string; targetRange: string; viewMode: 'context' | 'range'; pageIndex: number; pageCount: number; targetCellCount: number; rows: Array<Array<{ address: string; value: SpreadsheetValue; truncated?: boolean }>>; cellCount: number };
+type WorkbookContextState = { loading: boolean; data?: WorkbookContextRows; error?: string };
 
 function resolveArrayState<T>(action: ArrayStateAction<T>, previous: T[]) {
   return typeof action === 'function' ? (action as (previous: T[]) => T[])(previous) : action;
 }
 
 type AgentPostResult = { ok: boolean; status: number; payload: any; streamedActivityCount: number };
+
+type ValidatorInputSnapshot = {
+  documentId: string;
+  sourceHash: string;
+  instruction: string;
+  taskPlan: string;
+  guidelines: string;
+  correction: string;
+  annotations: Array<Annotation | AnnotationCandidate>;
+};
+
+type InRunValidatorResult = {
+  status?: string;
+  snapshotSignature?: string;
+  findings?: unknown;
+  usage?: (Partial<TokenUsage> & { requests?: number });
+  provider?: ProviderId;
+  model?: string;
+  error?: string;
+};
+
+type ManualValidatorReview = {
+  documentId: string;
+  sourceHash: string;
+  inputSignature: string;
+  status: 'running' | 'complete' | 'error';
+  message: string;
+};
+
+type CandidateRuleDraftState = {
+  inputSignature: string;
+  status: 'loading' | 'complete' | 'error';
+  draft?: CorrectionRuleDraft;
+  message?: string;
+};
+
+function validatorInputSignature(input: ValidatorInputSnapshot) {
+  const annotations = [...new Map(input.annotations.map((annotation) => [annotation.id, annotation])).values()]
+    .sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0);
+  return JSON.stringify({
+    documentId: input.documentId,
+    sourceHash: input.sourceHash,
+    instruction: input.instruction,
+    taskPlan: input.taskPlan,
+    guidelines: input.guidelines,
+    correction: input.correction,
+    annotations,
+  });
+}
+
+function validatorAnnotationSummaries(annotations: Array<Annotation | AnnotationCandidate>): ValidatorSnapshotAnnotation[] {
+  const uniqueAnnotations = [...new Map(annotations.map((annotation) => [annotation.id, annotation])).values()].slice(0, 500);
+  return uniqueAnnotations.map((annotation) => ({
+    id: annotation.id,
+    pageNumber: annotation.pageNumber,
+    label: annotation.label.slice(0, 60),
+    excerpt: (annotation.excerpt ?? '').slice(0, 1000),
+    explanation: [annotation.reason, annotation.note].filter(Boolean).join('\n').slice(0, 1000),
+    reviewPriority: annotation.reviewPriority ?? (annotation.requiresReview ? 'high' : 'medium'),
+    status: annotationReviewStatus(annotation) as ValidatorSnapshotAnnotation['status'],
+  }));
+}
+
+function mapValidatorFindings(findings: unknown, summaries: ValidatorSnapshotAnnotation[]): AnnotationConsistencyIssue[] {
+  const annotationsById = new Map(summaries.map((annotation) => [annotation.id, annotation]));
+  return (Array.isArray(findings) ? findings : []).flatMap((rawFinding: unknown) => {
+    if (!rawFinding || typeof rawFinding !== 'object' || Array.isArray(rawFinding)) return [];
+    const finding = rawFinding as Record<string, unknown>;
+    const validatorType = ['label_conflict', 'similar_excerpt', 'unsupported_claim', 'evidence_gap'].includes(String(finding.kind))
+      ? String(finding.kind) as NonNullable<AnnotationConsistencyIssue['validatorType']>
+      : undefined;
+    const annotationIds = Array.isArray(finding.annotationIds) ? [...new Set(finding.annotationIds.map(String))].filter((id) => annotationsById.has(id)).slice(0, 10) : [];
+    if (!validatorType || !annotationIds.length || (['label_conflict', 'similar_excerpt'].includes(validatorType) && annotationIds.length < 2)) return [];
+    const occurrences = annotationIds.map((id) => {
+      const annotation = annotationsById.get(id)!;
+      return { annotationId: id, pageNumber: annotation.pageNumber, label: annotation.label, excerpt: annotation.excerpt };
+    }).sort((left, right) => left.pageNumber - right.pageNumber);
+    if (['label_conflict', 'similar_excerpt'].includes(validatorType) && new Set(occurrences.map((item) => item.label.normalize('NFKC').toLocaleLowerCase())).size < 2) return [];
+    return [{
+      id: typeof finding.id === 'string' ? finding.id : `validator:${validatorType}:${annotationIds.slice().sort().join(':')}`,
+      kind: 'model_review' as const,
+      validatorType,
+      validatorTitle: typeof finding.title === 'string' ? finding.title.slice(0, 160) : 'Validator Agent review',
+      validatorReason: typeof finding.reason === 'string' ? finding.reason.slice(0, 600) : '',
+      reviewPriority: ['low', 'medium', 'high'].includes(String(finding.reviewPriority)) ? finding.reviewPriority as AnnotationConsistencyIssue['reviewPriority'] : 'medium',
+      excerpt: occurrences[0]?.excerpt ?? '',
+      labels: [...new Set(occurrences.map((item) => item.label))],
+      occurrences,
+    }];
+  });
+}
+
+function mergeValidatorFindings(issues: AnnotationConsistencyIssue[], modelIssues: AnnotationConsistencyIssue[]) {
+  for (const modelIssue of modelIssues) {
+    const modelIds = [...modelIssue.occurrences.map((item) => item.annotationId)].sort().join('\u0000');
+    const matchingRuleIssue = issues.find((issue) => [...issue.occurrences.map((item) => item.annotationId)].sort().join('\u0000') === modelIds);
+    if (matchingRuleIssue) {
+      matchingRuleIssue.validatorTitle = modelIssue.validatorTitle;
+      matchingRuleIssue.validatorReason = modelIssue.validatorReason;
+      matchingRuleIssue.validatorType = modelIssue.validatorType;
+      matchingRuleIssue.reviewPriority = modelIssue.reviewPriority;
+    } else {
+      issues.push(modelIssue);
+    }
+  }
+  return issues;
+}
+
+function buildCorrectionRuleSnapshot(args: {
+  documentId: string;
+  sourceHash: string;
+  instruction: string;
+  taskPlan: string;
+  guidelines: string;
+  candidate: AnnotationCandidate;
+  correction: { label: string; note: string };
+  remainingPages: number[];
+  continuation?: Partial<AgentContinuation>;
+}) {
+  const input: CorrectionRuleInput = {
+    task: args.instruction.slice(0, 2000),
+    taskPlan: args.taskPlan.slice(0, 5000),
+    guidelines: args.guidelines.slice(0, 4000),
+    sourceCandidate: {
+      pageNumber: args.candidate.pageNumber,
+      label: args.candidate.label,
+      note: args.candidate.note,
+      reason: args.candidate.reason ?? '',
+      excerpt: args.candidate.excerpt ?? '',
+    },
+    correction: { label: args.correction.label, note: args.correction.note },
+  };
+  const signature = JSON.stringify({
+    documentId: args.documentId,
+    sourceHash: args.sourceHash,
+    candidateId: args.candidate.id,
+    input,
+    remainingPages: args.remainingPages,
+    continuation: {
+      blockedPage: args.continuation?.blockedPage,
+      runHistoryId: args.continuation?.runHistoryId,
+      approvalRunId: args.continuation?.approvalRunId,
+      approvalId: args.continuation?.approvalId,
+      mode: args.continuation?.mode,
+      fullDocument: args.continuation?.fullDocument,
+    },
+  });
+  return { documentId: args.documentId, sourceHash: args.sourceHash, input, signature };
+}
+
+function parseClientCorrectionRuleDraft(value: unknown): CorrectionRuleDraft | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const draft = value as Record<string, unknown>;
+  if (draft.outcome === 'no_safe_rule' && typeof draft.reason === 'string' && draft.reason.trim().length > 0 && draft.reason.length <= 300
+    && Object.keys(draft).every((key) => ['outcome', 'reason'].includes(key))) {
+    return { outcome: 'no_safe_rule', reason: draft.reason.trim() };
+  }
+  if (draft.outcome === 'proposed_rule' && typeof draft.rule === 'string' && draft.rule.trim().length > 0 && draft.rule.length <= 500
+    && typeof draft.basis === 'string' && draft.basis.trim().length > 0 && draft.basis.length <= 500
+    && Object.keys(draft).every((key) => ['outcome', 'rule', 'basis'].includes(key))) {
+    return { outcome: 'proposed_rule', rule: draft.rule.trim(), basis: draft.basis.trim() };
+  }
+  return null;
+}
 
 async function postAgentRequest(
   path: string,
@@ -91,9 +265,50 @@ async function postAgentRequest(
   return { ok: true, status: response.status, payload: result, streamedActivityCount };
 }
 type PanelTab = 'ai' | 'annotations' | 'workspace';
-type GuideTab = 'workflow' | 'concept';
+type GuideTab = 'workflow' | 'concept' | 'formats';
 type Point = { x: number; y: number };
 type RegionShape = { x: number; y: number; width: number; height: number; fragments?: NormalizedTextBox[] };
+
+function documentTypeLabel(fileType?: string) {
+  switch (fileType?.toLowerCase()) {
+    case 'pdf': return 'PDF';
+    case 'docx': return 'Word';
+    case 'pptx': return 'PowerPoint';
+    case 'xlsx': return 'Excel';
+    case 'png': case 'jpg': case 'jpeg': case 'webp': case 'tif': case 'tiff': return '画像';
+    default: return fileType?.toUpperCase() || '文書';
+  }
+}
+
+function documentUnitLabel(fileType?: string) {
+  switch (fileType?.toLowerCase()) {
+    case 'pptx': return 'スライド';
+    case 'xlsx': return 'プレビュー';
+    default: return 'ページ';
+  }
+}
+
+function agentStatusLabel(status: AgentRunStatus) {
+  switch (status) {
+    case 'ready': return '準備完了';
+    case 'running': return '実行中';
+    case 'waiting': return '確認待ち';
+    case 'error': return '停止';
+    default: return '完了';
+  }
+}
+
+const AGENT_PHASE_LABELS: Record<AgentActivityPhase, string> = {
+  Planning: '計画',
+  Navigating: 'ページ移動',
+  Reading: '読み取り',
+  Searching: '検索',
+  Annotating: '注釈',
+  Reviewing: '検証',
+  Asking: '人の確認',
+  Continuing: '続行',
+  Exporting: '書き出し',
+};
 
 function visibleAnnotationFragments(region: RegionShape): NormalizedTextBox[] {
   return region.fragments?.length ? region.fragments : [{ x: region.x, y: region.y, width: region.width, height: region.height }];
@@ -104,7 +319,9 @@ type AgentContinuation = {
   sourceHash?: string;
   fullDocument?: boolean;
   humanCorrections?: number;
+  importantFindingIds?: string[];
   visitedPages?: number[];
+  inspectedPages?: number[];
   mode: AgentMode;
   instruction: string;
   guidelines: string;
@@ -121,43 +338,10 @@ type AgentContinuation = {
 type AgentApprovalDecision = { runId: string; approvalId: string; approved: boolean; note?: string };
 type AgentAnalysisOutcome = { status: 'complete' | 'waiting' | 'error'; completedPages: number; totalPages: number };
 type BatchProgress = { status: 'running' | 'complete' | 'stopped'; current: number; total: number; fileName: string };
-type TaskPlanSnapshot = { signature: string; source: TaskPlanSource; plan: AnnotationTaskPlan };
-
-const WORKSPACE_MAX_DEPTH = 16;
+type TaskPlanSnapshot = { signature: string; source: TaskPlanSource; manualEdits?: boolean; plan: AnnotationTaskPlan };
 
 function waitForRender() {
   return new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
-}
-
-function joinNativePath(directory: string, name: string) {
-  const separator = directory.includes('\\') ? '\\' : '/';
-  return `${directory.replace(/[\\/]+$/, '')}${separator}${name}`;
-}
-
-function nativeDirectoryName(path: string) {
-  return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
-}
-
-async function enumerateDesktopWorkspace(rootPath: string): Promise<WorkspaceDocumentEntry[]> {
-  const { readDir } = await import('@tauri-apps/plugin-fs');
-  const documents: WorkspaceDocumentEntry[] = [];
-  const visit = async (directory: string, relativeDirectory: string, depth: number): Promise<void> => {
-    if (depth > WORKSPACE_MAX_DEPTH || documents.length >= maxWorkspaceDocuments) return;
-    const entries = await readDir(directory);
-    for (const entry of entries) {
-      if (documents.length >= maxWorkspaceDocuments) break;
-      if (!entry.name || entry.isSymlink) continue;
-      const nativePath = joinNativePath(directory, entry.name);
-      const relativePath = relativeDirectory ? `${relativeDirectory}/${entry.name}` : entry.name;
-      if (entry.isDirectory) {
-        if (!shouldIgnoreWorkspaceDirectory(entry.name)) await visit(nativePath, relativePath, depth + 1);
-      } else if (entry.isFile && isSupportedWorkspaceFile(entry.name)) {
-        documents.push({ id: relativePath, relativePath, selected: true, status: 'ready', nativePath });
-      }
-    }
-  };
-  await visit(rootPath, '', 0);
-  return documents.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
 }
 
 const DEFAULT_PROMPT = '安全上の警告と締結トルクを抽出';
@@ -165,6 +349,8 @@ const TASK_PRESETS = [
   { id: 'contract', label: '契約リスク', prompt: '契約書全体から解除、損害賠償、更新、秘密保持に関する条項を見つけ、High / Medium / Low riskで分類してください。', guidelines: 'High: 一方的な解除、上限のない賠償など重大な不利益。Medium: 条件や期限が不明確。Low: 標準的で限定的な義務。該当文の範囲を囲み、判断理由と短い原文抜粋を付けてください。' },
   { id: 'pii', label: '個人情報', prompt: '文書内の個人情報をすべて見つけて種類別にマーキングしてください。', guidelines: '氏名、連絡先、住所、識別番号、口座・決済情報を分類してください。推測せず、該当文字列が読める場合は短く引用してください。' },
   { id: 'spreadsheet', label: '表の行リスク', prompt: '表の各行を読み、記載内容に基づいてHigh / Medium / Low riskに分類してください。', guidelines: '行全体を対象範囲にし、分類ラベルと根拠を付けてください。列の値を取り違えないようにし、読めないセルが判断に影響する場合は確認が必要としてください。' },
+  { id: 'customer-feedback', label: '顧客フィードバック', prompt: productHuntDemoFeedbackPrompt, guidelines: productHuntDemoFeedbackGuidelines },
+  { id: 'churn-risk', label: '顧客解約リスク', prompt: productHuntDemoChurnPrompt, guidelines: productHuntDemoChurnGuidelines },
   { id: 'claims', label: '主張・根拠', prompt: 'レポートの主張を見つけ、事実の根拠・推測・意見に分類してください。', guidelines: '対象段落を囲み、主張と根拠の対応を短く説明してください。根拠が文書内に見つからない場合は推測として扱い、確認が必要としてください。' },
   { id: 'slides', label: 'スライド分類', prompt: '各スライドの内容を Product / Market / Financial / Team に分類してください。', guidelines: 'スライド内の主要な内容を対象範囲にし、最も重要なカテゴリを1つ選んで理由を記してください。複数カテゴリが同程度なら人の確認を求めてください。' },
 ];
@@ -172,7 +358,7 @@ const AGENT_MODES: Array<{ id: AgentMode; label: string; description: string }> 
   { id: 'observe', label: 'Observe', description: '読み取りのみ。注釈状態を変更しません。' },
   { id: 'suggest', label: 'Suggest', description: '見つけた箇所をすべて候補として提示します。' },
   { id: 'assist', label: 'Assist', description: '明確な箇所を注釈し、曖昧なら確認します。' },
-  { id: 'autopilot', label: 'Autopilot', description: '全ページを連続処理し、曖昧な箇所だけ待ちます。' },
+  { id: 'autopilot', label: 'Autopilot', description: '全件を処理し、高優先度の重要項目を報告。曖昧な箇所だけ確認します。' },
 ];
 const PAGE_COVERAGE_LABELS: Record<AgentPageCoverage['status'], string> = {
   checked: '確認済み',
@@ -308,7 +494,7 @@ function colorComponents(hex: string) {
   return [((number >> 16) & 255) / 255, ((number >> 8) & 255) / 255, (number & 255) / 255] as const;
 }
 
-function sameRegion(left: Annotation, right: Annotation) {
+function sameRegion(left: Pick<Annotation, 'pageNumber' | 'x' | 'y' | 'width' | 'height'>, right: Pick<Annotation, 'pageNumber' | 'x' | 'y' | 'width' | 'height'>) {
   if (left.pageNumber !== right.pageNumber) return false;
   const intersectionWidth = Math.max(0, Math.min(left.x + left.width, right.x + right.width) - Math.max(left.x, right.x));
   const intersectionHeight = Math.max(0, Math.min(left.y + left.height, right.y + right.height) - Math.max(left.y, right.y));
@@ -363,12 +549,21 @@ function App() {
   const desktop = isDesktopShell();
   const [documentData, setDocumentData] = useState<ConvertedDocument | null>(null);
   const [workbookSummary, setWorkbookSummary] = useState<WorkbookSessionSummary | null>(null);
+  const [workbookContextPreviews, setWorkbookContextPreviews] = useState<Record<string, WorkbookContextState>>({});
+  const [activeWorkbookSheetName, setActiveWorkbookSheetName] = useState('');
+  const [workbookColumnStart, setWorkbookColumnStart] = useState(1);
+  const alignedReviewTargetRef = useRef('');
+  useEffect(() => {
+    setWorkbookColumnStart(1);
+    setWorkbookContextPreviews({});
+  }, [documentData?.documentId]);
   const [documentAnnotationRecords, setDocumentAnnotationRecords] = useState<DocumentAnnotationRecord[]>([]);
   const documentAnnotationView = useMemo(() => restoreDocumentAnnotationRecords(documentAnnotationRecords), [documentAnnotationRecords]);
   const { annotations, candidates, rejectedCandidates, spreadsheetChanges } = documentAnnotationView;
   const [preparedDocumentExports, setPreparedDocumentExports] = useState<PreparedDocumentExport[]>([]);
   const [annotationOperations, setAnnotationOperations] = useState<DocumentAnnotationOperation[]>([]);
   const [consistencyIssues, setConsistencyIssues] = useState<AnnotationConsistencyIssue[]>([]);
+  const [manualValidatorReview, setManualValidatorReview] = useState<ManualValidatorReview | null>(null);
   const [observationFindings, setObservationFindings] = useState<AnnotationCandidate[]>([]);
   const [observationDocumentId, setObservationDocumentId] = useState<string | null>(null);
   const [health, setHealth] = useState<ApiHealth | null>(null);
@@ -379,6 +574,7 @@ function App() {
   const [batchProgress, setBatchProgress] = useState<BatchProgress | null>(null);
   const [taskPlan, setTaskPlan] = useState<TaskPlanSnapshot | null>(null);
   const [taskPlanLoading, setTaskPlanLoading] = useState(false);
+  const [taskPlanEditorOpen, setTaskPlanEditorOpen] = useState(false);
   const [guidelineImporting, setGuidelineImporting] = useState(false);
   const [settings, setSettings] = useState<AppSettings>(loadSettings);
   const [apiKey, setApiKey] = useState(() => loadApiKey());
@@ -387,9 +583,12 @@ function App() {
   const [codexModels, setCodexModels] = useState<CodexModel[]>([]);
   const [codexModelsLoading, setCodexModelsLoading] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [exportMenuOpen, setExportMenuOpen] = useState(false);
   const [connectionTest, setConnectionTest] = useState<{ status: 'idle' | 'testing' | 'success' | 'error'; message: string }>({ status: 'idle', message: '' });
   const [candidateCorrections, setCandidateCorrections] = useState<Record<string, { label: string; note: string }>>({});
   const [candidateCorrectionScopes, setCandidateCorrectionScopes] = useState<Record<string, HumanDecisionScope>>({});
+  const [candidateCorrectionRules, setCandidateCorrectionRules] = useState<Record<string, string>>({});
+  const [candidateRuleDrafts, setCandidateRuleDrafts] = useState<Record<string, CandidateRuleDraftState>>({});
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [pageNumber, setPageNumber] = useState(1);
   const [activeTool, setActiveTool] = useState<Tool>('select');
@@ -409,6 +608,16 @@ function App() {
   const [taskPresetId, setTaskPresetId] = useState('');
   const [guidelines, setGuidelines] = useState('該当箇所を囲み、簡潔なラベルと文書上の根拠を付けてください。判断が曖昧な場合は確認が必要としてください。');
   const [correction, setCorrection] = useState('');
+  const validatorSnapshot = useMemo<ValidatorInputSnapshot>(() => ({
+    documentId: documentData?.documentId ?? '',
+    sourceHash: documentData?.sourceHash ?? '',
+    instruction: prompt.trim().length >= 2 ? prompt.trim() : DEFAULT_PROMPT,
+    taskPlan: taskPlan ? taskPlanAsInstructions(taskPlan.plan) : '',
+    guidelines: guidelines.trim(),
+    correction: correction.trim(),
+    annotations: [...annotations, ...candidates],
+  }), [documentData?.documentId, documentData?.sourceHash, annotations, candidates, prompt, taskPlan, guidelines, correction]);
+  const validatorSnapshotSignature = useMemo(() => validatorInputSignature(validatorSnapshot), [validatorSnapshot]);
   const [scanProgress, setScanProgress] = useState<{ current: number; total: number; scope: 'current' | 'all' } | null>(null);
   const [working, setWorking] = useState(false);
   const [exportingPdf, setExportingPdf] = useState(false);
@@ -416,6 +625,10 @@ function App() {
   const [exportingPowerPoint, setExportingPowerPoint] = useState(false);
   const [exportProgress, setExportProgress] = useState<{ current: number; total: number } | null>(null);
   const [loadingDemo, setLoadingDemo] = useState(true);
+  const [loadingContractDemo, setLoadingContractDemo] = useState(false);
+  const [loadingLlmDemo, setLoadingLlmDemo] = useState(false);
+  const [llmDemoMenuOpen, setLlmDemoMenuOpen] = useState(false);
+  const [requiredLiveDemoDocumentId, setRequiredLiveDemoDocumentId] = useState<string | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState('');
   const [uploading, setUploading] = useState(false);
@@ -438,12 +651,21 @@ function App() {
   const activeDocumentIdRef = useRef<string | null>(documentData?.documentId ?? null);
   const activeFileTypeRef = useRef<string | null>(documentData?.fileType ?? null);
   const taskPlanRef = useRef(taskPlan);
+  const candidateCorrectionsRef = useRef(candidateCorrections);
+  candidateCorrectionsRef.current = candidateCorrections;
+  const activeCorrectionRuleRequestsRef = useRef(new Set<string>());
+  const validatorSnapshotRef = useRef({ snapshot: validatorSnapshot, signature: validatorSnapshotSignature });
+  validatorSnapshotRef.current = { snapshot: validatorSnapshot, signature: validatorSnapshotSignature };
+  const lastInRunValidatorRef = useRef<InRunValidatorResult | null>(null);
   const pageFrameRef = useRef<HTMLDivElement>(null);
   const pageScrollAreaRef = useRef<HTMLDivElement>(null);
   const pageImageRef = useRef<HTMLImageElement>(null);
   const candidateSectionRef = useRef<HTMLDivElement>(null);
-  const activityPanelRef = useRef<HTMLElement>(null);
+  const workbookPanelRef = useRef<HTMLElement>(null);
+  const exportMenuRef = useRef<HTMLDivElement>(null);
+  const agentOverviewRef = useRef<HTMLElement>(null);
   const activityLogRef = useRef<HTMLOListElement>(null);
+  const agentActivityPanelRef = useRef<HTMLElement>(null);
   const agentActivityRef = useRef<AgentActivityEvent[]>([]);
   const agentRunHistoryRef = useRef<AgentRunHistory[]>([]);
   const activeAgentRunRef = useRef<AgentRunHistory | null>(null);
@@ -451,6 +673,7 @@ function App() {
   const analyzeAgentRef = useRef<((scope: 'current' | 'all', continuation?: AgentContinuation) => Promise<AgentAnalysisOutcome | undefined>) | null>(null);
   const resumeAgentRef = useRef<((continuation: AgentContinuation, decision?: AgentApprovalDecision) => Promise<void>) | null>(null);
   const updateDocumentAnnotationRecords = (update: (current: ReturnType<typeof restoreDocumentAnnotationRecords>) => ReturnType<typeof restoreDocumentAnnotationRecords>) => {
+    setConsistencyIssues([]);
     setDocumentAnnotationRecords((records) => {
       const current = restoreDocumentAnnotationRecords(records);
       const next = update(current);
@@ -480,6 +703,7 @@ function App() {
     const summary = await response.json() as WorkbookSessionSummary;
     if (activeDocumentIdRef.current === documentId) {
       setWorkbookSummary(summary);
+      setActiveWorkbookSheetName((current) => summary.sheets.some((sheet) => sheet.name === current) ? current : summary.sheets[0]?.name ?? '');
       setSpreadsheetChanges((existing) => {
         const byId = new Map(existing.map((change) => [change.id, change]));
         for (const change of summary.changes ?? []) byId.set(change.id, change);
@@ -487,6 +711,34 @@ function App() {
       });
     }
     return summary;
+  };
+
+  const loadWorkbookChangeContext = async (change: SpreadsheetCellChange, pageIndex = 0) => {
+    if (!documentData || documentData.fileType.toLowerCase() !== 'xlsx') return;
+    const documentId = documentData.documentId;
+    const address = parseExcelCellAddress(change.range.split(':')[0] ?? '');
+    setActiveWorkbookSheetName(change.sheetName);
+    const sheet = workbookSummary?.sheets.find((item) => item.name === change.sheetName);
+    setWorkbookColumnStart(workbookColumnStartForCell(address?.column ?? 80, Math.max(sheet?.columnCount ?? 0, address?.column ?? 80)));
+    setWorkbookContextPreviews((current) => ({ ...current, [change.id]: { loading: true, data: current[change.id]?.data } }));
+    try {
+      const response = await apiFetch(`/api/documents/${encodeURIComponent(documentId)}/workbook/changes/${encodeURIComponent(change.id)}/context?page=${pageIndex}`, undefined, settings.apiServerUrl);
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error ?? '周辺のExcelセルを読み込めませんでした。');
+      if (activeDocumentIdRef.current !== documentId) return;
+      setWorkbookContextPreviews((current) => ({ ...current, [change.id]: { loading: false, data: result as WorkbookContextRows } }));
+    } catch (error) {
+      if (activeDocumentIdRef.current !== documentId) return;
+      setWorkbookContextPreviews((current) => ({ ...current, [change.id]: { loading: false, error: error instanceof Error ? error.message : '周辺のExcelセルを読み込めませんでした。' } }));
+    }
+  };
+
+  const showWorkbookChangeInGrid = (change: SpreadsheetCellChange) => {
+    setActiveWorkbookSheetName(change.sheetName);
+    const address = parseExcelCellAddress(change.range.split(':')[0] ?? '');
+    const sheet = workbookSummary?.sheets.find((item) => item.name === change.sheetName);
+    setWorkbookColumnStart(workbookColumnStartForCell(address?.column ?? 80, Math.max(sheet?.columnCount ?? 0, address?.column ?? 80)));
+    window.requestAnimationFrame(() => document.querySelector<HTMLElement>('.canvas-zone')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }));
   };
 
   const mergeWorkbookChanges = (items: unknown, approvalRunId?: unknown, approvalId?: unknown) => {
@@ -644,13 +896,21 @@ function App() {
               const pendingHashMatches = !sourceHash || pending.sourceHash === sourceHash;
               const legacyRunMatches = Boolean(sourceHash && !pending.sourceHash && typeof value.documentId === 'string' && await verifyDocumentIdentity(value.documentId));
               if (pendingHashMatches || legacyRunMatches) {
+                const savedRun = typeof pending.runHistoryId === 'string'
+                  ? agentRunHistoryRef.current.find((run) => run.id === pending.runHistoryId)
+                  : undefined;
+                const restoredInspectedPages = Array.isArray(pending.inspectedPages)
+                  ? pending.inspectedPages.map(Number).filter((page) => Number.isInteger(page) && page >= 1 && page <= pageCount)
+                  : (savedRun?.pageCoverage ?? []).filter((item) => item.status === 'checked' || item.status === 'image_only').map((item) => item.pageNumber);
                 continuation = {
                   remainingPages: pending.remainingPages.map(Number).filter((page) => page >= 1 && page <= pageCount),
                   blockedPage: Number(pending.blockedPage),
                   ...(sourceHash ? { sourceHash } : {}),
                   ...(typeof pending.fullDocument === 'boolean' ? { fullDocument: pending.fullDocument } : {}),
                   ...(Number.isFinite(pending.humanCorrections) ? { humanCorrections: Number(pending.humanCorrections) } : {}),
+                  ...(Array.isArray(pending.importantFindingIds) ? { importantFindingIds: pending.importantFindingIds.filter((id): id is string => typeof id === 'string').slice(0, 500) } : {}),
                   ...(Array.isArray(pending.visitedPages) ? { visitedPages: pending.visitedPages.map(Number).filter((page) => page >= 1 && page <= pageCount) } : {}),
+                  inspectedPages: [...new Set(restoredInspectedPages)],
                   mode: pending.mode as AgentMode,
                   instruction: String(pending.instruction ?? ''),
                   guidelines: String(pending.guidelines ?? ''),
@@ -698,12 +958,31 @@ function App() {
       } catch { /* Keep the legacy workspace in place if migration storage fails. */ }
     }
 
-    setDocumentAnnotationRecords(normalizeDocumentAnnotationRecords({
+    const restoredDocumentAnnotations = normalizeDocumentAnnotationRecords({
       documentId: activeDocumentIdRef.current ?? '',
       sourceHash,
       fileType: activeFileTypeRef.current ?? 'PDF',
       annotations, candidates, rejectedCandidates: rejected, spreadsheetChanges: restoredSpreadsheetChanges,
-    }));
+    });
+    setDocumentAnnotationRecords(restoredDocumentAnnotations);
+    let workbookRestoreError: string | undefined;
+    const workbookRecords = restoredDocumentAnnotations.filter((record) => record.target.kind === 'sheet');
+    const activeDocumentId = activeDocumentIdRef.current;
+    if (activeDocumentId && sourceHash && (activeFileTypeRef.current ?? '').toLowerCase() === 'xlsx' && workbookRecords.length) {
+      try {
+        const response = await apiFetch(`/api/documents/${encodeURIComponent(activeDocumentId)}/workbook/restore`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sourceHash, documentAnnotations: workbookRecords }),
+        }, settings.apiServerUrl);
+        const summary = await response.json();
+        if (!response.ok) throw new Error(summary.error ?? '保存済みのExcel変更を復元できませんでした。');
+        const restoredWorkbook = summary as WorkbookSessionSummary;
+        setWorkbookSummary(restoredWorkbook);
+        setSpreadsheetChanges(restoredWorkbook.changes ?? []);
+      } catch (error) {
+        workbookRestoreError = error instanceof Error ? error.message : '保存済みのExcel変更をサーバーセッションに復元できませんでした。';
+      }
+    }
     annotationOperationsRef.current = restoredAnnotationOperations;
     setAnnotationOperations(restoredAnnotationOperations);
     setConsistencyIssues(restoredConsistencyIssues);
@@ -723,13 +1002,13 @@ function App() {
       const parsedPlan = storedPlan ? parseTaskPlan(storedPlan.plan) : null;
       const expectedSignature = taskPlanSignature(restoredPrompt, restoredGuidelines, restoredCorrection, restoredMode, settings.model, settings.provider);
       const restoredTaskPlan = parsedPlan && storedPlan?.signature === expectedSignature && (storedPlan.source === 'model' || storedPlan.source === 'local')
-        ? { signature: expectedSignature, source: storedPlan.source, plan: parsedPlan }
+        ? { signature: expectedSignature, source: storedPlan.source, ...(storedPlan.manualEdits === true ? { manualEdits: true } : {}), plan: parsedPlan }
         : null;
       taskPlanRef.current = restoredTaskPlan;
       setTaskPlan(restoredTaskPlan);
     }
     setSaved(true);
-    return { sourceChanged, continuationInvalid, foundWorkspace: Boolean(raw) || sourceChanged };
+    return { sourceChanged, continuationInvalid, foundWorkspace: Boolean(raw) || sourceChanged, workbookRestoreError };
   };
 
   const addAgentActivity = (phase: AgentActivityPhase, detail: string, status: AgentActivityEvent['status'] = 'complete', targetPage?: number) => {
@@ -743,6 +1022,39 @@ function App() {
       persistRunHistoryEntry(activeAgentRunRef.current);
     }
     return id;
+  };
+
+  const acknowledgeRunCoverage = (runId: string, targetPage: number) => {
+    const run = agentRunHistoryRef.current.find((item) => item.id === runId);
+    if (!run || run.status !== 'waiting' || !documentData || run.fileName !== documentData.fileName || run.sourceHash !== documentData.sourceHash) return;
+    const pageCoverage = acknowledgePageCoverage(run.pageCoverage ?? [], targetPage);
+    if (pageCoverage.every((item, index) => item === run.pageCoverage?.[index])) return;
+    const workspace = restoreDocumentAnnotationRecords(documentWorkspaceStateRef.current.documentAnnotationRecords);
+    const hasPendingReview = workspace.candidates.length > 0
+      || workspace.spreadsheetChanges.some((change) => change.requiresReview && !change.approved && !change.rejected)
+      || annotationOperationsRef.current.some((operation) => operation.status === 'needs_review');
+    const outcome = resolveHumanReviewStatus(hasPendingReview, run.pageCoverageTargets, pageCoverage);
+    const summary = outcome.status === 'complete'
+      ? `ページ確認完了: P.${targetPage}の画像・変換状態を人が確認しました。`
+      : `P.${targetPage}のページ確認を記録しました。ほかに追加確認が必要です。`;
+    const isLatestRun = agentRunHistoryRef.current[0]?.id === runId;
+    const acknowledgementEvent: AgentActivityEvent = {
+      id: crypto.randomUUID(), phase: 'Reviewing',
+      detail: `人がP.${targetPage}の画像${pageCoverage.find((item) => item.pageNumber === targetPage)?.warningAcknowledged ? 'と変換警告' : ''}を確認済みとして記録しました。`,
+      status: 'complete', pageNumber: targetPage, createdAt: Date.now(),
+    };
+    const events = [...run.events, acknowledgementEvent].slice(-48);
+    const updatedRun = { ...run, pageCoverage, events, status: outcome.status, endedAt: Date.now(), summary };
+    persistRunHistoryEntry(updatedRun);
+    if (isLatestRun) {
+      agentActivityRef.current = events;
+      setAgentActivity(events);
+      setAgentStatus(outcome.status);
+    }
+    if (activeAgentRunRef.current?.id === runId) {
+      activeAgentRunRef.current = updatedRun;
+    }
+    setMessage(outcome.status === 'complete' ? `P.${targetPage}の確認を記録し、全文書のページ範囲確認が完了しました。` : `P.${targetPage}の確認を記録しました。ほかのページまたは候補に追加確認が必要です。`);
   };
 
   const updateAgentActivity = (id: string, patch: Partial<Pick<AgentActivityEvent, 'detail' | 'status' | 'pageNumber'>>) => {
@@ -892,6 +1204,21 @@ function App() {
   const invalidateTaskPlan = () => {
     taskPlanRef.current = null;
     setTaskPlan(null);
+    setTaskPlanEditorOpen(false);
+    setCandidateCorrectionScopes({});
+    setCandidateCorrectionRules({});
+    setCandidateRuleDrafts({});
+  };
+
+  const updateTaskPlanDraft = (update: (current: AnnotationTaskPlan) => AnnotationTaskPlan) => {
+    const current = taskPlanRef.current;
+    if (!current) return;
+    const next = { ...current, manualEdits: true, plan: update(current.plan) };
+    taskPlanRef.current = next;
+    setTaskPlan(next);
+    const workspace = documentWorkspaceStateRef.current;
+    documentWorkspaceStateRef.current = { ...workspace, task: { ...workspace.task, plan: next } };
+    if (documentData) autoSaveDocumentWorkspace(documentData.fileName);
   };
 
   const prepareTaskPlan = async (instruction: string, taskGuidelines: string, taskCorrection: string, mode: AgentMode) => {
@@ -940,25 +1267,49 @@ function App() {
   };
 
   const validateCompletedDocument = async (input: {
+    documentId?: string;
+    sourceHash?: string;
     instruction: string;
     taskPlan: string;
     guidelines: string;
     correction?: string;
     humanDecisions?: string;
     annotations: Array<Annotation | AnnotationCandidate>;
-  }) => {
+    inRunValidator?: InRunValidatorResult | null;
+  }, isCurrent: () => boolean = () => true): Promise<{ issues: AnnotationConsistencyIssue[]; usage?: TokenUsage; modelFindingCount: number; modelReviewCompleted: boolean; error?: string }> => {
     const uniqueAnnotations = [...new Map(input.annotations.map((annotation) => [annotation.id, annotation])).values()].slice(0, 500);
-    const summaries = uniqueAnnotations.map((annotation) => ({
-      id: annotation.id,
-      pageNumber: annotation.pageNumber,
-      label: annotation.label.slice(0, 60),
-      excerpt: (annotation.excerpt ?? '').slice(0, 1000),
-      explanation: [annotation.reason, annotation.note].filter(Boolean).join('\n').slice(0, 1000),
-      reviewPriority: annotation.reviewPriority ?? (annotation.requiresReview ? 'high' as const : 'medium' as const),
-      status: annotationReviewStatus(annotation),
-    }));
+    const summaries = validatorAnnotationSummaries(uniqueAnnotations);
     const issues = findInconsistentRepeatedExcerpts(uniqueAnnotations);
-    if (!summaries.length) return { issues, usage: undefined as TokenUsage | undefined, modelFindingCount: 0 };
+    if (!summaries.length) return { issues, modelFindingCount: 0, modelReviewCompleted: false };
+    const inRunValidator = input.inRunValidator;
+    if (inRunValidator?.status === 'complete' && inRunValidator.model === settings.model && inRunValidator.provider === settings.provider
+      && typeof inRunValidator.snapshotSignature === 'string' && Array.isArray(inRunValidator.findings)) {
+      try {
+        const snapshotPayload = buildValidatorSnapshotPayload({
+          documentId: input.documentId ?? documentData?.documentId ?? '',
+          sourceHash: input.sourceHash ?? documentData?.sourceHash ?? '',
+          instruction: input.instruction.trim(),
+          taskPlan: input.taskPlan,
+          guidelines: input.guidelines.trim(),
+          correction: (input.correction ?? '').trim(),
+          humanDecisions: (input.humanDecisions ?? '').slice(0, 4000),
+          annotations: summaries,
+        });
+        const signature = await computeValidatorSnapshotSignature(snapshotPayload);
+        if (signature === inRunValidator.snapshotSignature) {
+          const modelIssues = mapValidatorFindings(inRunValidator.findings, summaries);
+          mergeValidatorFindings(issues, modelIssues);
+          const activityId = addAgentActivity('Reviewing', 'validator_agent → checking the completed in-run Validator result against the final annotation snapshot.', 'active');
+          if (isCurrent()) updateAgentActivity(activityId, {
+            status: 'complete',
+            detail: `validator_agent → reused in-run review of ${summaries.length} annotation records; ${modelIssues.length} independent review finding${modelIssues.length === 1 ? '' : 's'}.`,
+          });
+          return { issues, modelFindingCount: modelIssues.length, modelReviewCompleted: true };
+        }
+      } catch {
+        // If Web Crypto is unavailable, fall through and use the regular Validator endpoint.
+      }
+    }
     const providerMatches = (settings.provider === 'azure-openai' && health?.provider === 'azure') ||
       (settings.provider === 'openai-api' && health?.provider === 'openai');
     const validatorConfigured = settings.provider === 'codex-app-server'
@@ -966,7 +1317,7 @@ function App() {
       : settings.provider === 'openai-compatible'
         ? Boolean(settings.endpoint.trim())
         : Boolean(apiKey.trim()) || Boolean(health?.aiConfigured && providerMatches);
-    if (!validatorConfigured) return { issues, usage: undefined as TokenUsage | undefined, modelFindingCount: 0 };
+    if (!validatorConfigured) return { issues, modelFindingCount: 0, modelReviewCompleted: false };
 
     const activityId = addAgentActivity('Reviewing', 'validator_agent → independently reviewing document-wide labels, evidence, and support.', 'active');
     try {
@@ -986,40 +1337,8 @@ function App() {
       }, settings.apiServerUrl);
       const result = await response.json();
       if (!response.ok) throw new Error(result.error ?? 'Validator Agent could not review the annotation set.');
-      const annotationsById = new Map(summaries.map((annotation) => [annotation.id, annotation]));
-      const modelIssues: AnnotationConsistencyIssue[] = (Array.isArray(result.findings) ? result.findings : []).flatMap((finding: Record<string, unknown>) => {
-        const validatorType = ['label_conflict', 'similar_excerpt', 'unsupported_claim', 'evidence_gap'].includes(String(finding.kind)) ? String(finding.kind) as NonNullable<AnnotationConsistencyIssue['validatorType']> : undefined;
-        const annotationIds = Array.isArray(finding.annotationIds) ? [...new Set(finding.annotationIds.map(String))].filter((id) => annotationsById.has(id)).slice(0, 10) : [];
-        if (!validatorType || !annotationIds.length || (['label_conflict', 'similar_excerpt'].includes(validatorType) && annotationIds.length < 2)) return [];
-        const occurrences = annotationIds.map((id) => {
-          const annotation = annotationsById.get(id)!;
-          return { annotationId: id, pageNumber: annotation.pageNumber, label: annotation.label, excerpt: annotation.excerpt };
-        }).sort((left, right) => left.pageNumber - right.pageNumber);
-        if (['label_conflict', 'similar_excerpt'].includes(validatorType) && new Set(occurrences.map((item) => item.label.normalize('NFKC').toLocaleLowerCase())).size < 2) return [];
-        return [{
-          id: typeof finding.id === 'string' ? finding.id : `validator:${validatorType}:${annotationIds.slice().sort().join(':')}`,
-          kind: 'model_review' as const,
-          validatorType,
-          validatorTitle: typeof finding.title === 'string' ? finding.title.slice(0, 160) : 'Validator Agent review',
-          validatorReason: typeof finding.reason === 'string' ? finding.reason.slice(0, 600) : '',
-          reviewPriority: ['low', 'medium', 'high'].includes(String(finding.reviewPriority)) ? finding.reviewPriority as AnnotationConsistencyIssue['reviewPriority'] : 'medium',
-          excerpt: occurrences[0]?.excerpt ?? '',
-          labels: [...new Set(occurrences.map((item) => item.label))],
-          occurrences,
-        }];
-      });
-      for (const modelIssue of modelIssues) {
-        const modelIds = [...modelIssue.occurrences.map((item) => item.annotationId)].sort().join('\u0000');
-        const matchingRuleIssue = issues.find((issue) => [...issue.occurrences.map((item) => item.annotationId)].sort().join('\u0000') === modelIds);
-        if (matchingRuleIssue) {
-          matchingRuleIssue.validatorTitle = modelIssue.validatorTitle;
-          matchingRuleIssue.validatorReason = modelIssue.validatorReason;
-          matchingRuleIssue.validatorType = modelIssue.validatorType;
-          matchingRuleIssue.reviewPriority = modelIssue.reviewPriority;
-        } else {
-          issues.push(modelIssue);
-        }
-      }
+      const modelIssues = mapValidatorFindings(result.findings, summaries);
+      mergeValidatorFindings(issues, modelIssues);
       const rawUsage = result.usage as (Partial<TokenUsage> & { requests?: number }) | undefined;
       const usage = rawUsage ? {
         inputTokens: Number(rawUsage.inputTokens ?? 0),
@@ -1029,17 +1348,135 @@ function App() {
         totalTokens: Number(rawUsage.totalTokens ?? 0),
       } : undefined;
       if (usage) recordUsage(result.provider as ProviderId, String(result.model ?? settings.model), usage, Math.max(1, Number(rawUsage?.requests ?? 1)));
-      updateAgentActivity(activityId, {
+      if (isCurrent()) updateAgentActivity(activityId, {
         status: 'complete',
         detail: `validator_agent → reviewed ${summaries.length} annotation records; ${modelIssues.length} independent review finding${modelIssues.length === 1 ? '' : 's'}.`,
       });
-      return { issues, usage, modelFindingCount: modelIssues.length };
+      return { issues, usage, modelFindingCount: modelIssues.length, modelReviewCompleted: true };
     } catch (error) {
-      updateAgentActivity(activityId, {
+      const detail = error instanceof Error ? error.message : 'Validator Agent review failed.';
+      if (isCurrent()) updateAgentActivity(activityId, {
         status: 'error',
-        detail: `validator_agent → independent review unavailable; keeping rule-based results. ${error instanceof Error ? error.message : ''}`,
+        detail: `validator_agent → independent review unavailable; keeping rule-based results. ${detail}`,
       });
-      return { issues, usage: undefined as TokenUsage | undefined, modelFindingCount: 0 };
+      return { issues, modelFindingCount: 0, modelReviewCompleted: false, error: detail };
+    }
+  };
+
+  const reviewCurrentAnnotations = async () => {
+    const { snapshot, signature } = validatorSnapshotRef.current;
+    if (!documentData || !snapshot.annotations.length || working) return;
+    if (!aiConfiguredForSession) {
+      setManualValidatorReview({
+        documentId: snapshot.documentId,
+        sourceHash: snapshot.sourceHash,
+        inputSignature: signature,
+        status: 'error',
+        message: 'Validator Agentを実行するには、接続設定でAIプロバイダーを設定してください。',
+      });
+      return;
+    }
+
+    setManualValidatorReview({ documentId: snapshot.documentId, sourceHash: snapshot.sourceHash, inputSignature: signature, status: 'running', message: '現在の注釈を読み取り専用で確認しています…' });
+    const isCurrent = () => {
+      const latest = validatorSnapshotRef.current;
+      return latest.signature === signature && latest.snapshot.documentId === snapshot.documentId && latest.snapshot.sourceHash === snapshot.sourceHash;
+    };
+    try {
+      const review = await validateCompletedDocument(snapshot, isCurrent);
+      if (!isCurrent()) return;
+      setConsistencyIssues(review.issues);
+      setManualValidatorReview({
+        documentId: snapshot.documentId,
+        sourceHash: snapshot.sourceHash,
+        inputSignature: signature,
+        status: review.modelReviewCompleted ? 'complete' : 'error',
+        message: review.modelReviewCompleted
+          ? `Validator Agentが${snapshot.annotations.length}件の注釈を確認しました。独立指摘 ${review.modelFindingCount}件。`
+          : review.error
+            ? `Validator Agentの確認に失敗しました。ローカルの一貫性チェックを表示しています。${review.error}`
+            : 'Validator Agentを実行できませんでした。AI接続設定を確認してください。',
+      });
+      if (review.usage) setLastUsage(review.usage);
+      await waitForRender();
+      if (isCurrent() && documentData) saveCurrentDocumentWorkspace(documentData.fileName);
+    } catch (error) {
+      if (!isCurrent()) return;
+      setManualValidatorReview({
+        documentId: snapshot.documentId,
+        sourceHash: snapshot.sourceHash,
+        inputSignature: signature,
+        status: 'error',
+        message: `Validator Agentを実行できませんでした。${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
+  };
+
+  const draftRemainingPageRule = async (candidate: AnnotationCandidate) => {
+    const edit = candidateCorrections[candidate.id] ?? { label: candidate.label, note: candidate.note };
+    const remainingPages = agentContinuation?.remainingPages ?? [];
+    if (!remainingPages.length) return;
+    if (!aiConfiguredForSession) {
+      setMessage('ルール案を作るには、接続設定でAIプロバイダーを設定してください。');
+      return;
+    }
+    const snapshot = getCandidateRuleSnapshot(candidate, edit);
+    if (activeCorrectionRuleRequestsRef.current.has(snapshot.signature)) return;
+    activeCorrectionRuleRequestsRef.current.add(snapshot.signature);
+    const activityId = addAgentActivity('Planning', `修正ルール案を作成しています · P.${candidate.pageNumber}`, 'active', candidate.pageNumber);
+    setCandidateRuleDrafts((current) => ({ ...current, [candidate.id]: { inputSignature: snapshot.signature, status: 'loading' } }));
+
+    const currentSnapshot = () => {
+      const workspace = documentWorkspaceStateRef.current;
+      const latestCandidate = restoreDocumentAnnotationRecords(workspace.documentAnnotationRecords).candidates.find((item) => item.id === candidate.id);
+      if (!latestCandidate) return null;
+      const storedTask = workspace.task;
+      const storedPlan = storedTask.plan as TaskPlanSnapshot | null;
+      const currentEdit = candidateCorrectionsRef.current[candidate.id] ?? { label: latestCandidate.label, note: latestCandidate.note };
+      return buildCorrectionRuleSnapshot({
+        documentId: workspace.documentId,
+        sourceHash: workspace.sourceHash,
+        instruction: typeof storedTask.prompt === 'string' && storedTask.prompt.trim().length >= 2 ? storedTask.prompt.trim() : DEFAULT_PROMPT,
+        taskPlan: storedPlan ? taskPlanAsInstructions(storedPlan.plan) : '',
+        guidelines: typeof storedTask.guidelines === 'string' ? storedTask.guidelines.trim() : '',
+        candidate: latestCandidate,
+        correction: currentEdit,
+        remainingPages: workspace.continuation?.remainingPages ?? [],
+        continuation: workspace.continuation ?? undefined,
+      });
+    };
+
+    try {
+      const response = await apiFetch('/api/ai/correction-rule', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ input: snapshot.input, model: settings.model, settings: { ...settings, apiKey } }),
+      }, settings.apiServerUrl);
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error ?? '修正ルール案を作成できませんでした。');
+      const draft = parseClientCorrectionRuleDraft(result.draft);
+      if (!draft) throw new Error('修正ルール案の応答を確認できませんでした。');
+      const latest = currentSnapshot();
+      if (!latest || latest.signature !== snapshot.signature) {
+        updateAgentActivity(activityId, { status: 'complete', detail: '入力が変わったため、古い修正ルール案は破棄しました。', pageNumber: candidate.pageNumber });
+        return;
+      }
+      setCandidateRuleDrafts((current) => ({ ...current, [candidate.id]: { inputSignature: snapshot.signature, status: 'complete', draft } }));
+      if (result.usage) recordUsage(result.provider as ProviderId, String(result.model ?? settings.model), result.usage as TokenUsage);
+      updateAgentActivity(activityId, {
+        status: 'complete',
+        detail: draft.outcome === 'proposed_rule'
+          ? `修正ルール案を作成しました。残りページへの適用は人の確認後に行います。`
+          : `修正内容を一般化できる安全なルール案はありませんでした。`,
+        pageNumber: candidate.pageNumber,
+      });
+    } catch (error) {
+      const latest = currentSnapshot();
+      if (!latest || latest.signature !== snapshot.signature) return;
+      setCandidateRuleDrafts((current) => ({ ...current, [candidate.id]: { inputSignature: snapshot.signature, status: 'error', message: error instanceof Error ? error.message : '修正ルール案を作成できませんでした。' } }));
+      updateAgentActivity(activityId, { status: 'error', detail: error instanceof Error ? error.message : '修正ルール案を作成できませんでした。', pageNumber: candidate.pageNumber });
+    } finally {
+      activeCorrectionRuleRequestsRef.current.delete(snapshot.signature);
     }
   };
 
@@ -1076,6 +1513,10 @@ function App() {
       setCodexModels([]);
     }
   }, [refreshCodexModels, settings.provider]);
+
+  useEffect(() => {
+    setWorkbookContextPreviews({});
+  }, [documentData?.documentId]);
 
   const testConnection = async () => {
     if (settings.provider === 'codex-app-server') {
@@ -1208,14 +1649,181 @@ function App() {
     setPreviewError('');
     setPreviewLoading(true);
     try {
-      const response = await apiFetch('/api/demo', undefined, settings.apiServerUrl);
+      const demoEndpoint = documentData.fileName === productHuntDemoContractFileName
+        ? '/api/demo/termination-contract-live'
+        : documentData.fileName === terminationContractDemoFileName
+          ? '/api/demo/termination-contract'
+        : documentData.fileName === productHuntDemoChurnFileName ? '/api/demo/customer-churn-risk'
+          : documentData.fileName === productHuntDemoFeedbackFileName ? '/api/demo/customer-feedback' : '/api/demo';
+      const response = await apiFetch(demoEndpoint, undefined, settings.apiServerUrl);
       if (!response.ok) throw new Error('サンプル文書を開き直せませんでした。');
       const refreshed = parseDocument(await response.json() as Record<string, unknown>);
       setDocumentData(refreshed);
       setPageNumber((current) => clamp(current, 1, refreshed.pageCount));
+      if (refreshed.fileType.toLowerCase() === 'xlsx') await refreshWorkbookSummary(refreshed.documentId);
     } catch (error) {
       setPreviewError(error instanceof Error ? error.message : '文書を開き直せませんでした。');
       setPreviewLoading(false);
+    }
+  };
+
+  const openTerminationContractDemo = async () => {
+    setLoadingContractDemo(true);
+    setMessage('架空の契約書デモを開いています…');
+    try {
+      const response = await apiFetch('/api/demo/termination-contract', undefined, settings.apiServerUrl);
+      if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error ?? '契約書デモを開けませんでした。');
+      const nextDocument = parseDocument(await response.json() as Record<string, unknown>);
+      activeDocumentIdRef.current = nextDocument.documentId;
+      activeFileTypeRef.current = nextDocument.fileType;
+      setRequiredLiveDemoDocumentId(null);
+      activeAgentRunRef.current = null;
+      setWorkbookSummary(null);
+      setSpreadsheetChanges([]);
+      setDocumentData(nextDocument);
+      setPageNumber(1);
+      setSelectedId(null);
+      clearAgentViewport();
+      clearAgentActivity();
+      setAgentStatus('ready');
+      setAgentContinuation(null);
+      setManualValidatorReview(null);
+      setObservationFindings([]);
+      setObservationDocumentId(null);
+      setConsistencyIssues([]);
+      setAnnotationOperations([]);
+      annotationOperationsRef.current = [];
+      setTaskPlan(null);
+      taskPlanRef.current = null;
+      setPrompt(terminationContractDemoPrompt);
+      setGuidelines(terminationContractDemoGuidelines);
+      setCorrection('');
+      setTaskPresetId('contract');
+      setAiMode('demo');
+      setAgentMode('suggest');
+      setCandidateCorrections({});
+      setCandidateCorrectionScopes({});
+      setCandidateCorrectionRules({});
+      setCandidateRuleDrafts({});
+      restoreRunHistory(nextDocument.fileName, nextDocument.sourceHash);
+      const restored = await restoreDocumentWorkspace(nextDocument.fileName, nextDocument.pageCount, false, nextDocument.sourceHash);
+      if (!restored.foundWorkspace) {
+        setDocumentAnnotationRecords(normalizeDocumentAnnotationRecords({
+          documentId: nextDocument.documentId,
+          sourceHash: nextDocument.sourceHash,
+          fileType: nextDocument.fileType,
+          annotations: terminationContractDemoAnnotations,
+          candidates: [terminationContractDemoCandidate],
+          rejectedCandidates: [],
+          spreadsheetChanges: [],
+        }));
+      }
+      setAgentStatus('ready');
+      setActiveTab('ai');
+      setMessage('架空の契約書を開きました。表示中の注釈と確認候補は固定デモで、AIは実行していません。');
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : '契約書デモを開けませんでした。');
+    } finally {
+      setLoadingContractDemo(false);
+    }
+  };
+
+  const activateLiveLlmDemo = async (payload: Record<string, unknown>, demo: { taskPresetId: string; prompt: string; guidelines: string; mode?: AgentMode }) => {
+    const nextDocument = parseDocument(payload);
+    activeDocumentIdRef.current = nextDocument.documentId;
+    activeFileTypeRef.current = nextDocument.fileType;
+    setRequiredLiveDemoDocumentId(nextDocument.documentId);
+    activeAgentRunRef.current = null;
+    setWorkbookSummary(null);
+    setSpreadsheetChanges([]);
+    setDocumentData(nextDocument);
+    setPageNumber(1);
+    setSelectedId(null);
+    clearAgentViewport();
+    clearAgentActivity();
+    setAgentStatus('ready');
+    setAgentContinuation(null);
+    setManualValidatorReview(null);
+    setObservationFindings([]);
+    setObservationDocumentId(null);
+    setConsistencyIssues([]);
+    setAnnotationOperations([]);
+    annotationOperationsRef.current = [];
+    setTaskPlan(null);
+    taskPlanRef.current = null;
+    setCandidateCorrections({});
+    setCandidateCorrectionScopes({});
+    setCandidateCorrectionRules({});
+    setCandidateRuleDrafts({});
+    restoreRunHistory(nextDocument.fileName, nextDocument.sourceHash);
+    const restored = await restoreDocumentWorkspace(nextDocument.fileName, nextDocument.pageCount, false, nextDocument.sourceHash);
+    if (!restored.foundWorkspace) {
+      setDocumentAnnotationRecords(normalizeDocumentAnnotationRecords({
+        documentId: nextDocument.documentId,
+        sourceHash: nextDocument.sourceHash,
+        fileType: nextDocument.fileType,
+        annotations: [],
+        candidates: [],
+        rejectedCandidates: [],
+        spreadsheetChanges: [],
+      }));
+    }
+    setPrompt(demo.prompt);
+    setGuidelines(demo.guidelines);
+    setCorrection('');
+    setTaskPresetId(demo.taskPresetId);
+    setAiMode(null);
+    setAgentMode(demo.mode ?? 'assist');
+    setActiveTab('ai');
+    if (nextDocument.fileType.toLowerCase() === 'xlsx') await refreshWorkbookSummary(nextDocument.documentId);
+    setMessage('架空データを開きました。出力ラベルは未記入です。AI接続を確認してからAgentを実行してください。');
+  };
+
+  const openLlmContractDemo = async () => {
+    setLoadingLlmDemo(true);
+    setLlmDemoMenuOpen(false);
+    try {
+      const response = await apiFetch('/api/demo/termination-contract-live', undefined, settings.apiServerUrl);
+      if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error ?? '契約書のAIデモを開けませんでした。');
+      await activateLiveLlmDemo(await response.json() as Record<string, unknown>, {
+        taskPresetId: 'contract', prompt: productHuntDemoContractPrompt, guidelines: productHuntDemoContractGuidelines, mode: 'autopilot',
+      });
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : '契約書のAIデモを開けませんでした。');
+    } finally {
+      setLoadingLlmDemo(false);
+    }
+  };
+
+  const openLlmFeedbackDemo = async () => {
+    setLoadingLlmDemo(true);
+    setLlmDemoMenuOpen(false);
+    try {
+      const response = await apiFetch('/api/demo/customer-feedback', undefined, settings.apiServerUrl);
+      if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error ?? '顧客フィードバックのAIデモを開けませんでした。');
+      await activateLiveLlmDemo(await response.json() as Record<string, unknown>, {
+        taskPresetId: 'customer-feedback', prompt: productHuntDemoFeedbackPrompt, guidelines: productHuntDemoFeedbackGuidelines,
+      });
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : '顧客フィードバックのAIデモを開けませんでした。');
+    } finally {
+      setLoadingLlmDemo(false);
+    }
+  };
+
+  const openLlmChurnDemo = async () => {
+    setLoadingLlmDemo(true);
+    setLlmDemoMenuOpen(false);
+    try {
+      const response = await apiFetch('/api/demo/customer-churn-risk', undefined, settings.apiServerUrl);
+      if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error ?? '顧客解約リスクのAIデモを開けませんでした。');
+      await activateLiveLlmDemo(await response.json() as Record<string, unknown>, {
+        taskPresetId: 'churn-risk', prompt: productHuntDemoChurnPrompt, guidelines: productHuntDemoChurnGuidelines, mode: 'autopilot',
+      });
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : '顧客解約リスクのAIデモを開けませんでした。');
+    } finally {
+      setLoadingLlmDemo(false);
     }
   };
 
@@ -1242,7 +1850,7 @@ function App() {
 
   useEffect(() => {
     if (activeTab !== 'ai' || working || !candidates.length) return;
-    window.requestAnimationFrame(() => candidateSectionRef.current?.scrollIntoView({ block: 'start', behavior: 'smooth' }));
+    window.requestAnimationFrame(() => agentOverviewRef.current?.scrollIntoView({ block: 'start', behavior: 'smooth' }));
   }, [activeTab, candidates.length, working]);
 
   useEffect(() => {
@@ -1252,6 +1860,7 @@ function App() {
 
   const onFileSelected = useCallback(async (file?: File) => {
     if (!file) return;
+    setRequiredLiveDemoDocumentId(null);
     activeDocumentIdRef.current = null;
     activeFileTypeRef.current = null;
     setWorkbookSummary(null);
@@ -1278,7 +1887,7 @@ function App() {
       setWorkbookSummary(null);
       setSpreadsheetChanges([]);
       setDocumentData(next);
-      if (next.fileType.toLowerCase() === 'xlsx') void refreshWorkbookSummary(next.documentId).catch((error) => setMessage(error instanceof Error ? error.message : 'Excelブックを読み込めませんでした。'));
+      if (next.fileType.toLowerCase() === 'xlsx') await refreshWorkbookSummary(next.documentId).catch((error) => setMessage(error instanceof Error ? error.message : 'Excelブックを読み込めませんでした。'));
       restoreRunHistory(next.fileName, next.sourceHash);
       setPageNumber(1);
       clearAgentViewport();
@@ -1286,7 +1895,9 @@ function App() {
       setAiMode(null);
       setMessage(restoredWorkspace.sourceChanged
         ? `${next.fileName} は同名の前回ファイルと内容が異なるため、古い注釈を表示せず新しい作業として開きました。`
-        : restoredWorkspace.continuationInvalid
+        : restoredWorkspace.workbookRestoreError
+          ? `${next.fileName}: ${restoredWorkspace.workbookRestoreError}`
+          : restoredWorkspace.continuationInvalid
           ? `${next.fileName} を読み込みましたが、元の文書版を確認できない承認待ちRunは再開しませんでした。`
           : `${next.fileName} を読み込みました。${next.pageCount}ページを変換しました。`);
       setActiveTab('annotations');
@@ -1346,16 +1957,18 @@ function App() {
       const selected = await open({
         directory: true,
         multiple: false,
+        recursive: true,
         title: 'プロジェクトフォルダーを選択',
         ...(previous?.rootPath ? { defaultPath: previous.rootPath } : {}),
       });
       if (typeof selected !== 'string') return;
-      const documents = await enumerateDesktopWorkspace(selected);
+      const { readDir } = await import('@tauri-apps/plugin-fs');
+      const documents = await enumerateDesktopWorkspace(selected, readDir);
       const projectId = selected;
       const oldDocuments = previous?.id === projectId ? new Map(previous.documents.map((item) => [item.relativePath, item])) : new Map<string, WorkspaceDocumentEntry>();
       const project: WorkspaceProject = {
         id: projectId,
-        name: nativeDirectoryName(selected),
+        name: nativeWorkspaceDirectoryName(selected),
         source: 'desktop',
         rootPath: selected,
         connected: true,
@@ -1452,6 +2065,35 @@ function App() {
     void onFileSelected(supportedFiles[0]);
   };
 
+  const readWorkspaceFileContents = async (entry: WorkspaceDocumentEntry) => {
+    let contents: Blob | undefined = workspaceBrowserFilesRef.current.get(entry.id);
+    if (!contents && entry.nativePath && desktop) {
+      const { readFile } = await import('@tauri-apps/plugin-fs');
+      contents = await readNativeWorkspaceDocument(entry.nativePath, readFile);
+    }
+    return contents;
+  };
+
+  const createWorkspaceExportSession = async (entry: WorkspaceDocumentEntry) => {
+    const contents = await readWorkspaceFileContents(entry);
+    if (!contents) throw new Error('プロジェクトフォルダーへ再接続してから、もう一度書き出してください。');
+    const form = new FormData();
+    form.append('file', contents, entry.relativePath.split('/').at(-1) || entry.relativePath);
+    form.append('relativePath', entry.relativePath);
+    const response = await apiFetch('/api/convert', { method: 'POST', body: form }, settings.apiServerUrl);
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error ?? `${entry.relativePath} の文書セッションを復元できませんでした。`);
+    const next = parseDocument(result as Record<string, unknown>);
+    const currentEntry = workspaceProjectRef.current?.documents.find((item) => item.id === entry.id);
+    if (currentEntry?.sourceHash && next.sourceHash && currentEntry.sourceHash !== next.sourceHash) {
+      updateWorkspaceDocument(entry.id, { sourceHash: next.sourceHash, status: 'ready', error: undefined });
+      throw new Error(`${entry.relativePath} は前回処理したファイルから変更されています。古い注釈を適用せず、文書を開き直して再実行してください。`);
+    }
+    setWorkspaceSessionIds((current) => ({ ...current, [entry.id]: next.documentId }));
+    if (!currentEntry?.sourceHash && next.sourceHash) updateWorkspaceDocument(entry.id, { sourceHash: next.sourceHash });
+    return next.documentId;
+  };
+
   const openWorkspaceDocument = async (entry: WorkspaceDocumentEntry, restoreTask = true) => {
     if (documentData && documentData.fileName !== entry.relativePath) saveCurrentDocumentWorkspace(documentData.fileName);
     setUploading(true);
@@ -1460,12 +2102,7 @@ function App() {
     clearAgentActivity();
     setConsistencyIssues([]);
     try {
-      let contents: Blob | undefined = workspaceBrowserFilesRef.current.get(entry.id);
-      if (!contents && entry.nativePath && desktop) {
-        const { readFile } = await import('@tauri-apps/plugin-fs');
-        const bytes = await readFile(entry.nativePath);
-        contents = new Blob([Uint8Array.from(bytes).buffer]);
-      }
+      const contents = await readWorkspaceFileContents(entry);
       if (!contents) throw new Error('フォルダー内の元ファイルにアクセスできません。プロジェクトフォルダーを再接続してください。');
       const form = new FormData();
       form.append('file', contents, entry.relativePath.split('/').at(-1) || entry.relativePath);
@@ -1491,7 +2128,9 @@ function App() {
       setActiveTab('ai');
       setMessage(restoredWorkspace.sourceChanged
         ? `${entry.relativePath} は前回処理したファイルから変更されています。古い注釈は引き継がず、新しい内容に再実行してください。`
-        : restoredWorkspace.continuationInvalid
+        : restoredWorkspace.workbookRestoreError
+          ? `${entry.relativePath}: ${restoredWorkspace.workbookRestoreError}`
+          : restoredWorkspace.continuationInvalid
           ? `${entry.relativePath} を開きましたが、元の文書版を確認できない承認待ちRunは再開しませんでした。`
           : `${entry.relativePath} を開きました。${next.pageCount}ページ。`);
       await waitForRender();
@@ -1619,8 +2258,8 @@ function App() {
     const approvedCandidate = { ...candidate };
     delete approvedCandidate.approvalRunId;
     delete approvedCandidate.approvalId;
-    updateDocumentAnnotationRecords((current) => resolveCandidateReview(current, candidate.id, {
-      type: 'approve', annotation: { ...approvedCandidate, source: 'ai', requiresReview: false, reviewedByHuman: true, reviewOutcome: 'approved' },
+      updateDocumentAnnotationRecords((current) => resolveCandidateReview(current, candidate.id, {
+      type: 'approve', annotation: { ...approvedCandidate, source: candidate.source === 'demo' ? 'demo' : 'ai', requiresReview: false, reviewedByHuman: true, reviewOutcome: 'approved' },
     }));
     setCandidateCorrections((items) => { const next = { ...items }; delete next[candidate.id]; return next; });
     setCandidateCorrectionScopes((items) => { const next = { ...items }; delete next[candidate.id]; return next; });
@@ -1633,12 +2272,35 @@ function App() {
     continueAfterHumanDecision(candidate, 'approved');
   };
 
+  const updateCandidateCorrection = (candidateId: string, edit: { label: string; note: string }) => {
+    setCandidateCorrections((items) => ({ ...items, [candidateId]: edit }));
+    setCandidateCorrectionScopes((items) => ({ ...items, [candidateId]: 'item' }));
+    setCandidateCorrectionRules((items) => { const next = { ...items }; delete next[candidateId]; return next; });
+    setCandidateRuleDrafts((items) => { const next = { ...items }; delete next[candidateId]; return next; });
+  };
+
   const correctCandidate = (candidate: AnnotationCandidate) => {
+    const continuation = agentContinuation;
+    if (continuation && (candidate.pageNumber !== continuation.blockedPage || (continuation.sourceHash && continuation.sourceHash !== documentData?.sourceHash))) {
+      setMessage('文書または確認ページが変わりました。現在の候補をもう一度開いてください。');
+      return;
+    }
     const edit = candidateCorrections[candidate.id] ?? { label: candidate.label, note: candidate.note };
     const label = edit.label.trim() || candidate.label;
     const note = edit.note.trim() || candidate.note;
     if (label === candidate.label && note === candidate.note) {
       setMessage('ラベルまたはメモを変更してから確定してください。');
+      return;
+    }
+    const scope = candidateCorrectionScopes[candidate.id] ?? 'item';
+    if (scope === 'remaining_pages' && !continuation?.remainingPages.length) {
+      setMessage('残りのページがないため、この修正だけを候補に適用できます。');
+      setCandidateCorrectionScopes((items) => ({ ...items, [candidate.id]: 'item' }));
+      return;
+    }
+    const approvedRule = scope === 'remaining_pages' ? candidateCorrectionRules[candidate.id]?.trim() ?? '' : '';
+    if (scope === 'remaining_pages' && !approvedRule) {
+      setMessage('残りページに適用するルールを入力するか、AIの提案を確認して適用してください。');
       return;
     }
     const corrected: Annotation = {
@@ -1656,13 +2318,17 @@ function App() {
     updateDocumentAnnotationRecords((current) => resolveCandidateReview(current, candidate.id, { type: 'correct', annotation: corrected }));
     setCandidateCorrections((items) => { const next = { ...items }; delete next[candidate.id]; return next; });
     setCandidateCorrectionScopes((items) => { const next = { ...items }; delete next[candidate.id]; return next; });
+    setCandidateCorrectionRules((items) => { const next = { ...items }; delete next[candidate.id]; return next; });
+    setCandidateRuleDrafts((items) => { const next = { ...items }; delete next[candidate.id]; return next; });
     addAgentActivity('Annotating', `人が候補を修正して確定: ${candidate.label} → ${label}`, 'complete', candidate.pageNumber);
     setAgentStatus(candidates.length > 1 ? 'waiting' : 'complete');
     setSaved(false);
-    setMessage(`P.${candidate.pageNumber}の候補を「${label}」に修正しました。`);
+    setMessage(approvedRule ? `P.${candidate.pageNumber}の候補を「${label}」に修正しました。確認済みルールをP.${continuation?.remainingPages[0]}以降に適用します。` : `P.${candidate.pageNumber}の候補を「${label}」に修正しました。`);
     if (documentData) autoSaveDocumentWorkspace(documentData.fileName);
-    const scope = candidateCorrectionScopes[candidate.id] ?? 'item';
-    const decisionText = `P.${candidate.pageNumber} ${candidate.label} → ${label}: ${note}`.slice(0, 500);
+    const decisionText = [
+      `P.${candidate.pageNumber} ${candidate.label} → ${label}: ${note}`,
+      approvedRule ? `人が確認して適用する残りページ用ルール: ${approvedRule}` : '',
+    ].filter(Boolean).join('\n').slice(0, 1000);
     continueAfterHumanDecision(candidate, 'approved', { decisionText, sdkApproved: false, scope });
   };
 
@@ -1798,20 +2464,63 @@ function App() {
     }
   }
 
-  const decideSpreadsheetChange = (change: SpreadsheetCellChange, approved: boolean) => {
+  const decideSpreadsheetChange = async (change: SpreadsheetCellChange, approved: boolean) => {
     const continuation = agentContinuation;
-    if (!continuation?.approvalRunId || continuation.approvalId !== change.id) return;
-    const note = `人が${approved ? '承認' : '却下'}: ${change.sheetName}!${change.range} ${change.operation}`.slice(0, 500);
-    setSpreadsheetChanges((items) => items.map((item) => item.id === change.id ? { ...item, ...(approved ? {} : { rejected: true }) } : item));
-    setAgentContinuation(null);
-    setAgentStatus('running');
-    addAgentActivity('Continuing', `人が${change.sheetName}!${change.range}の表変更を${approved ? '承認' : '却下'}し、同じAgent Runを再開します。`, 'complete', continuation.blockedPage);
-    void resumeAgentRef.current?.({ ...continuation, pendingApprovalDecision: { approved, note } }, {
-      runId: continuation.approvalRunId,
-      approvalId: continuation.approvalId,
-      approved,
-      note,
-    });
+    if (continuation?.approvalRunId) {
+      if (continuation.approvalId !== change.id) return;
+      const note = `人が${approved ? '承認' : '却下'}: ${change.sheetName}!${change.range} ${change.operation}`.slice(0, 500);
+      setSpreadsheetChanges((items) => items.map((item) => item.id === change.id ? { ...item, ...(approved ? {} : { rejected: true }) } : item));
+      setAgentContinuation(null);
+      setAgentStatus('running');
+      addAgentActivity('Continuing', `人が${change.sheetName}!${change.range}の表変更を${approved ? '承認' : '却下'}し、同じAgent Runを再開します。`, 'complete', continuation.blockedPage);
+      void resumeAgentRef.current?.({ ...continuation, pendingApprovalDecision: { approved, note } }, {
+        runId: continuation.approvalRunId,
+        approvalId: continuation.approvalId,
+        approved,
+        note,
+      });
+      return;
+    }
+    if (!documentData || !documentData.sourceHash || !change.requiresReview || change.approved || change.rejected || change.approvalRunId) return;
+    const documentId = documentData.documentId;
+    const sourceHash = documentData.sourceHash;
+    setWorking(true);
+    try {
+      const response = await apiFetch(`/api/documents/${encodeURIComponent(documentId)}/workbook/changes/${encodeURIComponent(change.id)}/decision`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ approved, sourceHash }),
+      }, settings.apiServerUrl);
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error ?? 'Workbook approval could not be recorded.');
+      const summary = await refreshWorkbookSummary(documentId);
+      await waitForRender();
+      autoSaveDocumentWorkspace(documentData.fileName);
+      const remainingChanges = summary.changes.filter((item) => item.id !== change.id && item.requiresReview && !item.approved && !item.rejected).length;
+      const hasPendingReview = remainingChanges > 0 || candidates.length > 0 || annotationOperations.some((item) => item.status === 'needs_review');
+      const waitingRun = agentRunHistoryRef.current.find((run) => run.status === 'waiting' && run.fileName === documentData.fileName && run.sourceHash === sourceHash);
+      const outcome = waitingRun ? resolveHumanReviewStatus(hasPendingReview, waitingRun.pageCoverageTargets, waitingRun.pageCoverage) : undefined;
+      const decisionDetail = `Human ${approved ? 'approved' : 'rejected'} ${change.sheetName}!${change.range} (${change.operation}); ${approved ? 'the workbook adapter applied the approved change' : 'the workbook remains unchanged'}.`;
+      addAgentActivity('Continuing', decisionDetail, 'complete');
+      if (waitingRun && outcome) {
+        const updatedRun: AgentRunHistory = {
+          ...waitingRun,
+          status: outcome.status,
+          endedAt: Date.now(),
+          summary: hasPendingReview ? 'Workbook decision recorded; additional reviews remain.' : outcome.coverageStillNeedsReview ? 'Workbook decision recorded; page coverage still needs review.' : 'Workbook review is complete.',
+          events: [...waitingRun.events, { id: crypto.randomUUID(), phase: 'Continuing', detail: decisionDetail, status: 'complete', createdAt: Date.now(), pageNumber: 1 }],
+        };
+        persistRunHistoryEntry(updatedRun);
+        setAgentStatus(outcome.status);
+      } else {
+        setAgentStatus(hasPendingReview ? 'waiting' : 'complete');
+      }
+      setMessage(`${change.sheetName}!${change.range}を${approved ? '承認し、ブックに反映しました' : '却下しました'}。${remainingChanges ? `ほかに${remainingChanges}件のセル変更が確認待ちです。` : ''}`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Workbook approval could not be recorded.');
+    } finally {
+      setWorking(false);
+    }
   };
 
   const decideAnnotationOperation = (operation: DocumentAnnotationOperation, approved: boolean) => {
@@ -1897,9 +2606,8 @@ function App() {
   };
 
   const exportWorkspaceDocument = async (entry: WorkspaceDocumentEntry, format: 'native-annotated' | 'annotations-json' | 'annotations-csv') => {
-    const documentId = workspaceSessionIds[entry.id];
-    if (!documentId) return;
-    const documentAnnotations = workspaceDocumentAnnotations(entry, documentId);
+    let documentId = workspaceSessionIds[entry.id];
+    const documentAnnotations = workspaceDocumentAnnotations(entry, documentId ?? 'workspace-export-placeholder');
     if (format === 'native-annotated' && !hasWorkspaceNativeAnnotations(entry, documentAnnotations)) {
       setMessage(`${entry.relativePath} に確定済みの注釈がありません。確認待ち候補はJSONまたはCSVで保存できます。`);
       return;
@@ -1909,10 +2617,15 @@ function App() {
       return;
     }
     try {
-      const response = await apiFetch(`/api/documents/${encodeURIComponent(documentId)}/export`, {
+      const requestExport = (sessionId: string) => apiFetch(`/api/documents/${encodeURIComponent(sessionId)}/export`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ format, documentAnnotations }),
+        body: JSON.stringify({ format, documentAnnotations: workspaceDocumentAnnotations(entry, sessionId) }),
       }, settings.apiServerUrl);
+      let response = documentId ? await requestExport(documentId) : null;
+      if (!response || response.status === 410) {
+        documentId = await createWorkspaceExportSession(entry);
+        response = await requestExport(documentId);
+      }
       if (!response.ok) throw new Error((await response.json()).error ?? `${entry.relativePath} を書き出せませんでした。文書を開き直して再実行してください。`);
       const extension = entry.relativePath.match(/\.([^.]+)$/)?.[1]?.toLowerCase() ?? 'pdf';
       const nativeExtension = extension === 'xlsx' || extension === 'docx' || extension === 'pptx' ? extension : 'pdf';
@@ -1928,8 +2641,8 @@ function App() {
   };
 
   const workspaceExportActions = (entry: WorkspaceDocumentEntry) => {
-    const documentId = workspaceSessionIds[entry.id];
-    const records = documentId ? workspaceDocumentAnnotations(entry, documentId) : [];
+    const documentId = workspaceSessionIds[entry.id] ?? 'workspace-export-placeholder';
+    const records = workspaceDocumentAnnotations(entry, documentId);
     const canExportNative = hasWorkspaceNativeAnnotations(entry, records);
     const hasRecords = records.length > 0;
     const prepared = preparedExportsForDocument(entry.relativePath);
@@ -1937,11 +2650,9 @@ function App() {
     const isWorkbook = /\.xlsx$/i.test(entry.relativePath);
     return (
       <div className="workspace-export-actions" role="group" aria-label={`${entry.relativePath}を書き出す`}>
-        {documentId && <>
-          <button className="workspace-export-button" type="button" aria-label={`${entry.relativePath}の注釈付きコピーを保存`} title={isWorkbook ? '承認済みのExcelコピー' : '注釈付きコピー'} disabled={!canExportNative} onClick={() => void exportWorkspaceDocument(entry, 'native-annotated')}><Download size={11} /><span>{isWorkbook ? 'Excel' : '注釈付き'}</span></button>
-          <button className="workspace-export-button" type="button" aria-label={`${entry.relativePath}の注釈CSVを保存`} disabled={!hasRecords} onClick={() => void exportWorkspaceDocument(entry, 'annotations-csv')}><span>CSV</span></button>
-          <button className="workspace-export-button" type="button" aria-label={`${entry.relativePath}の注釈JSONを保存`} disabled={!hasRecords} onClick={() => void exportWorkspaceDocument(entry, 'annotations-json')}><span>JSON</span></button>
-        </>}
+        <button className="workspace-export-button" type="button" aria-label={`${entry.relativePath}の注釈付きコピーを保存`} title={isWorkbook ? '承認済みのExcelコピー' : '注釈付きコピー'} disabled={!canExportNative} onClick={() => void exportWorkspaceDocument(entry, 'native-annotated')}><Download size={11} /><span>{isWorkbook ? 'Excel' : '注釈付き'}</span></button>
+        <button className="workspace-export-button" type="button" aria-label={`${entry.relativePath}の注釈CSVを保存`} disabled={!hasRecords} onClick={() => void exportWorkspaceDocument(entry, 'annotations-csv')}><span>CSV</span></button>
+        <button className="workspace-export-button" type="button" aria-label={`${entry.relativePath}の注釈JSONを保存`} disabled={!hasRecords} onClick={() => void exportWorkspaceDocument(entry, 'annotations-json')}><span>JSON</span></button>
         {prepared.map((artifact) => <button key={artifact.id} className="workspace-export-button" type="button" aria-label={`${artifact.fileName}をAgent出力からダウンロード`} title={`Agentが準備した${artifact.format}`} onClick={() => void downloadPreparedExport(artifact)}><Download size={11} /><span>Agent</span></button>)}
       </div>
     );
@@ -1997,8 +2708,17 @@ function App() {
       setObservationFindings([]);
       setObservationDocumentId(selectedMode === 'observe' ? documentData.documentId : null);
     }
+    const continuationRun = continuation?.runHistoryId
+      ? agentRunHistoryRef.current.find((run) => run.id === continuation.runHistoryId)
+      : undefined;
     const effectiveScope = continuation
-      ? continuation.fullDocument === undefined ? continuation.remainingPages.length > 1 ? 'all' : 'current' : continuation.fullDocument ? 'all' : 'current'
+      ? inferFullDocumentContinuation({
+        fullDocument: continuation.fullDocument,
+        remainingPages: continuation.remainingPages,
+        visitedPages: continuation.visitedPages,
+        pageCoverageTargets: continuationRun?.pageCoverageTargets,
+        pageCount: documentData.pageCount,
+      }) ? 'all' : 'current'
       : selectedMode === 'autopilot' ? 'all' : scope;
     const startingPageNumber = pageNumber;
     if (!continuation && effectiveScope === 'all') setZoom(100);
@@ -2008,17 +2728,23 @@ function App() {
     const configuredForThisSession = settings.provider === 'codex-app-server' ||
       (settings.provider === 'openai-compatible' && Boolean(settings.endpoint.trim())) ||
       Boolean(apiKey.trim()) || Boolean(health?.aiConfigured && envProviderMatches);
-    const useAgentNavigation = effectiveScope === 'all' && configuredForThisSession && settings.provider !== 'codex-app-server' && !continuation?.visitedPages?.length;
-    let pages = continuation?.remainingPages ?? (isWorkbook ? [1] : useAgentNavigation ? [1] : effectiveScope === 'all' ? documentData.pages.map((page) => page.pageNumber) : [pageNumber]);
+    if (requiredLiveDemoDocumentId === documentData.documentId && !configuredForThisSession) {
+      setMessage('この実AIデモは固定結果を使いません。OpenAI、Azure、互換API、またはCodex App Serverを設定してください。');
+      setSettingsOpen(true);
+      return;
+    }
+    const useAgentNavigation = effectiveScope === 'all' && !isWorkbook && configuredForThisSession && settings.provider !== 'codex-app-server';
+    const remainingNavigationPages = continuation?.remainingPages ?? documentData.pages.map((page) => page.pageNumber);
+    let pages = useAgentNavigation
+      ? (continuation ? remainingNavigationPages.slice(0, 1) : [1])
+      : continuation?.remainingPages ?? (isWorkbook ? [1] : effectiveScope === 'all' ? documentData.pages.map((page) => page.pageNumber) : [pageNumber]);
     const runTotalPages = effectiveScope === 'all' ? documentData.pageCount : pages.length;
     const coverageTargetPages = effectiveScope === 'all'
       ? documentData.pages.map((page) => page.pageNumber)
       : [...new Set(continuation?.remainingPages ?? pages)];
     if (!pages.length) return;
     const runStartedAt = Date.now();
-    const resumedRun = continuation?.runHistoryId
-      ? agentRunHistoryRef.current.find((run) => run.id === continuation.runHistoryId)
-      : undefined;
+    const resumedRun = continuationRun;
     setWorking(true);
     setAiMode(null);
     setAgentStatus('running');
@@ -2056,7 +2782,7 @@ function App() {
     }
     setActiveTab('ai');
     if (!window.matchMedia('(max-width: 560px)').matches) {
-      window.requestAnimationFrame(() => activityPanelRef.current?.scrollIntoView({ block: 'start', behavior: 'smooth' }));
+      window.requestAnimationFrame(() => agentOverviewRef.current?.scrollIntoView({ block: 'start', behavior: 'smooth' }));
     }
     setScanProgress({ current: 0, total: runTotalPages, scope: effectiveScope });
     let failure = '';
@@ -2066,13 +2792,17 @@ function App() {
     let autoAppliedCount = 0;
     let reviewCount = 0;
     let spreadsheetReviewCount = 0;
+    let latestInRunValidator: InRunValidatorResult | null = null;
     const runFindings: AnnotationCandidate[] = [];
-    const processedPages = new Set<number>(continuation?.visitedPages ?? []);
+    const importantFindingIds = new Set<string>(continuation?.importantFindingIds ?? []);
+    const priorInspectedPages = continuation?.inspectedPages ?? [];
+    const processedPages = new Set<number>(priorInspectedPages);
     let pausedContinuation: AgentContinuation | null = null;
     let runMode: 'live' | 'demo' = configuredForThisSession ? 'live' : 'demo';
     const runUsage: TokenUsage = { inputTokens: 0, outputTokens: 0, reasoningTokens: 0, cachedInputTokens: 0, totalTokens: 0 };
     let structuredTaskPlan = '';
-    const agentVisitedPages = new Set<number>(continuation?.visitedPages ?? []);
+    const agentVisitedPages = new Set<number>(continuation?.visitedPages ?? priorInspectedPages);
+    const agentInspectedPages = new Set<number>(priorInspectedPages);
     const mergePageCoverage = (updates: AgentPageCoverage[]) => {
       if (!updates.length || !activeAgentRunRef.current) return;
       const byPage = new Map((activeAgentRunRef.current.pageCoverage ?? []).map((item) => [item.pageNumber, item]));
@@ -2092,7 +2822,7 @@ function App() {
         id: annotation.id, pageNumber: annotation.pageNumber, x: annotation.x, y: annotation.y,
         width: annotation.width, height: annotation.height, label: annotation.label,
         note: annotation.note.slice(0, 240), ...(annotation.excerpt ? { excerpt: annotation.excerpt.slice(0, 240) } : {}),
-        ...(annotation.reviewPriority ? { reviewPriority: annotation.reviewPriority } : {}), status: !annotation.reviewedByHuman && (annotation.requiresReview || annotation.reviewPriority === 'high') ? 'needs_review' : 'active',
+        ...(annotation.reviewPriority ? { reviewPriority: annotation.reviewPriority } : {}), status: !annotation.reviewedByHuman && annotation.requiresReview ? 'needs_review' : 'active',
       });
     }
     for (const candidate of candidates) {
@@ -2139,6 +2869,9 @@ function App() {
       for (const [index, targetPage] of pages.entries()) {
         if (useAgentNavigation && navigationUsed && agentVisitedPages.has(targetPage)) continue;
         const navigateThisCall = useAgentNavigation && !navigationUsed;
+        const segmentVisitedPages = new Set<number>([targetPage]);
+        const segmentInspectedPages = new Set<number>();
+        let apiRemainingPages: number[] | undefined;
         let pageTextBlockCount: number | undefined;
         let pageToolEvents: Array<{ toolName: string; phase: AgentActivityPhase; detail: string; status: 'active' | 'complete' | 'waiting' | 'error'; pageNumber?: number; textBlockCount?: number; warningCount?: number; viewport?: NormalizedTextBox }> = [];
         setScanProgress({ current: useAgentNavigation ? Math.max(1, completedPages) : index + 1, total: runTotalPages, scope: effectiveScope });
@@ -2163,6 +2896,10 @@ function App() {
           let pageCandidates: AnnotationCandidate[];
           if (runMode === 'demo') {
             pageCandidates = seededCandidates(targetPage, taskInstruction.trim());
+            agentVisitedPages.add(targetPage);
+            segmentVisitedPages.add(targetPage);
+            agentInspectedPages.add(targetPage);
+            segmentInspectedPages.add(targetPage);
             addAgentActivity('Searching', 'search_document → demo fixture only; no model search was performed.', 'complete', targetPage);
           } else {
             const searchId = addAgentActivity('Searching', 'search_document → checking extracted text, positions, and visual layout for task targets.', 'active', targetPage);
@@ -2183,6 +2920,7 @@ function App() {
                 guidelines: taskGuidelines.trim(),
                 correction: taskCorrection.trim(),
                 humanDecisions,
+                alreadyInspectedPages: effectiveScope === 'all' && !isWorkbook ? [...processedPages].sort((left, right) => left - right) : [],
                 documentId: documentData.documentId,
                 documentScope: navigateThisCall ? 'all' : 'current',
                 exportScope: effectiveScope,
@@ -2212,15 +2950,48 @@ function App() {
                 throw new Error(result.error ?? `ページ ${targetPage} の候補を作成できませんでした。`);
               }
             } else {
+              if (result.validator && typeof result.validator === 'object' && !Array.isArray(result.validator)) {
+                latestInRunValidator = result.validator as InRunValidatorResult;
+                lastInRunValidatorRef.current = latestInRunValidator;
+              }
               pageCandidates = (Array.isArray(result.annotations) ? result.annotations : []) as AnnotationCandidate[];
               const toolEvents = (Array.isArray(result.toolEvents) ? result.toolEvents : []) as typeof pageToolEvents;
               pageToolEvents = toolEvents;
+              if (Array.isArray(result.remainingPages)) {
+                apiRemainingPages = result.remainingPages.map(Number).filter((value: number) => Number.isInteger(value) && value >= 1 && value <= documentData.pageCount);
+              }
               if (navigateThisCall) navigationUsed = true;
+              agentVisitedPages.add(targetPage);
+              segmentVisitedPages.add(targetPage);
               if (Array.isArray(result.visitedPages)) {
-                for (const visitedPage of result.visitedPages.map(Number).filter((value:number)=>Number.isFinite(value)&&value>=1&&value<=documentData.pageCount)) agentVisitedPages.add(visitedPage);
+                for (const visitedPage of result.visitedPages.map(Number).filter((value:number)=>Number.isFinite(value)&&value>=1&&value<=documentData.pageCount)) {
+                  agentVisitedPages.add(visitedPage);
+                  segmentVisitedPages.add(visitedPage);
+                }
+              }
+              if (isWorkbook || !Array.isArray(result.inspectedPages)) {
+                agentInspectedPages.add(targetPage);
+                segmentInspectedPages.add(targetPage);
+              }
+              if (Array.isArray(result.inspectedPages) && !isWorkbook) {
+                for (const inspectedPage of result.inspectedPages.map(Number).filter((value:number)=>Number.isInteger(value)&&value>=1&&value<=documentData.pageCount)) {
+                  agentInspectedPages.add(inspectedPage);
+                  segmentInspectedPages.add(inspectedPage);
+                  agentVisitedPages.add(inspectedPage);
+                  segmentVisitedPages.add(inspectedPage);
+                }
               }
               for (const toolEvent of toolEvents) {
-                if (toolEvent.toolName === 'inspect_page' && Number.isInteger(toolEvent.pageNumber)) agentVisitedPages.add(Number(toolEvent.pageNumber));
+                if (!Number.isInteger(toolEvent.pageNumber)) continue;
+                const eventPage = Number(toolEvent.pageNumber);
+                if (toolEvent.toolName === 'navigate_page' || toolEvent.toolName === 'inspect_page') {
+                  agentVisitedPages.add(eventPage);
+                  segmentVisitedPages.add(eventPage);
+                }
+                if (toolEvent.toolName === 'inspect_page') {
+                  agentInspectedPages.add(eventPage);
+                  segmentInspectedPages.add(eventPage);
+                }
               }
               if (streamedActivityCount === 0) {
                 for (const toolEvent of toolEvents) {
@@ -2230,13 +3001,21 @@ function App() {
                 }
               }
               mergeWorkbookChanges(result.spreadsheetChanges, result.approvalRunId, result.approvalId);
+              const returnedWorkbookChanges = Array.isArray(result.spreadsheetChanges) ? result.spreadsheetChanges as SpreadsheetCellChange[] : [];
+              if (Array.isArray(result.spreadsheetChanges)) {
+                for (const change of returnedWorkbookChanges) {
+                  if (change.reviewPriority === 'high') importantFindingIds.add(change.id);
+                }
+              }
+              if (Number.isInteger(result.spreadsheetReviewCount)) spreadsheetReviewCount += Math.max(0, Number(result.spreadsheetReviewCount));
+              else spreadsheetReviewCount += returnedWorkbookChanges.filter((change) => change.requiresReview && !change.approved && !change.rejected).length;
               rememberPreparedExports(result.exports, documentData.documentId);
               mergeAnnotationOperations(result.annotationOperations);
               workbookApprovalRunId = typeof result.approvalRunId === 'string' ? result.approvalRunId : undefined;
               workbookApprovalId = typeof result.approvalId === 'string' ? result.approvalId : undefined;
               if (Array.isArray(result.spreadsheetChanges)) {
                 workbookApproval = (result.spreadsheetChanges as SpreadsheetCellChange[]).find((change) => change.id === workbookApprovalId && change.requiresReview);
-                if (workbookApproval) spreadsheetReviewCount += 1;
+                if (workbookApproval && !Number.isInteger(result.spreadsheetReviewCount) && !returnedWorkbookChanges.some((change) => change.id === workbookApproval?.id)) spreadsheetReviewCount += 1;
               }
               const itemUsage = result.usage as (Partial<TokenUsage> & { requests?: number }) | undefined;
               if (itemUsage) {
@@ -2262,9 +3041,9 @@ function App() {
           }
 
           const normalizedCandidates = pageCandidates.map((candidate) => ({ ...candidate, pageNumber: Number(candidate.pageNumber) || targetPage, source: 'ai' as const }));
-          const touchedPages = navigateThisCall ? new Set(agentVisitedPages) : new Set([targetPage]);
+          const touchedPages = new Set(segmentInspectedPages);
           normalizedCandidates.forEach((candidate) => touchedPages.add(candidate.pageNumber));
-          const existingDecisions = annotations.filter((annotation) => touchedPages.has(annotation.pageNumber));
+          const existingDecisions = [...annotationSnapshot.values()].filter((annotation) => touchedPages.has(annotation.pageNumber));
           const humanRejected = rejectedCandidates.filter((candidate) => touchedPages.has(candidate.pageNumber));
           const eligible = normalizedCandidates.filter((candidate) => {
             if (existingDecisions.some((annotation) => sameRegion(annotation, candidate))) return false;
@@ -2272,6 +3051,7 @@ function App() {
           });
           agentVisitedPages.add(targetPage);
           runFindings.push(...eligible);
+          eligible.filter((candidate) => candidate.reviewPriority === 'high').forEach((candidate) => importantFindingIds.add(candidate.id));
           foundCount += eligible.length;
           if (selectedMode === 'observe') {
             setObservationFindings((existing) => {
@@ -2301,31 +3081,26 @@ function App() {
           }
           const mayAutoAnnotate = selectedMode === 'assist' || selectedMode === 'autopilot';
           const autoAccepted = runMode === 'live' && mayAutoAnnotate
-            ? eligible.filter((candidate) => !candidate.requiresReview && candidate.reviewPriority !== 'high')
+            ? eligible.filter((candidate) => !candidate.requiresReview && (candidate.reviewPriority !== 'high' || selectedMode === 'autopilot'))
             : [];
           const needsReview = selectedMode === 'observe' ? [] : selectedMode === 'suggest' ? eligible : eligible.filter((candidate) => !autoAccepted.some((accepted) => accepted.id === candidate.id));
           autoAccepted.forEach((candidate) => saveAnnotationSummary(candidate, 'active'));
           needsReview.forEach((candidate) => saveAnnotationSummary(candidate, 'needs_review'));
-          const newlyVisited = navigateThisCall
-            ? [...agentVisitedPages].filter((visitedPage) => !processedPages.has(visitedPage))
-            : [targetPage];
-          const pagesProcessedThisPass = [...new Set([targetPage, ...newlyVisited])].filter((visitedPage) => !processedPages.has(visitedPage));
-          const openedOnlyPages = pageToolEvents
-            .filter((event) => event.toolName === 'navigate_page' && Number.isInteger(event.pageNumber))
-            .map((event) => Number(event.pageNumber))
-            .filter((visitedPage) => !pagesProcessedThisPass.includes(visitedPage));
+          const pagesProcessedThisPass = [...segmentInspectedPages].filter((inspectedPage) => !processedPages.has(inspectedPage));
+          const openedOnlyPages = [...segmentVisitedPages].filter((visitedPage) => !segmentInspectedPages.has(visitedPage) && !processedPages.has(visitedPage));
           const coveragePageNumbers = [...new Set([...pagesProcessedThisPass, ...openedOnlyPages])];
           const pageCoverageUpdates: AgentPageCoverage[] = coveragePageNumbers.map((coveragePage) => {
             const pageEvents = pageToolEvents.filter((event) => event.pageNumber === coveragePage);
-            const hasInspection = coveragePage === targetPage || pageEvents.some((event) => event.toolName === 'inspect_page');
+            const hasInspection = segmentInspectedPages.has(coveragePage);
             const eventTextCount = pageEvents.find((event) => event.textBlockCount !== undefined)?.textBlockCount;
             const textBlockCount = coveragePage === targetPage ? pageTextBlockCount : eventTextCount;
             const documentWarningCount = documentData.pages.find((item) => item.pageNumber === coveragePage)?.warningCount ?? 0;
             const eventWarningCount = pageEvents.reduce((maximum, event) => Math.max(maximum, Number(event.warningCount ?? 0)), 0);
             const warningCount = Math.max(documentWarningCount, eventWarningCount);
+            const previousCoverage = activeAgentRunRef.current?.pageCoverage?.find((item) => item.pageNumber === coveragePage);
             const status: AgentPageCoverage['status'] = runMode === 'demo'
               ? 'demo_only'
-              : !hasInspection ? 'opened'
+              : !hasInspection ? previousCoverage?.status ?? 'opened'
                 : textBlockCount === 0 ? 'image_only' : 'checked';
             const findingCount = eligible.filter((candidate) => candidate.pageNumber === coveragePage).length;
             const reviewCount = needsReview.filter((candidate) => candidate.pageNumber === coveragePage).length;
@@ -2381,13 +3156,15 @@ function App() {
             const blockingPage = toolApprovalCandidate?.pageNumber ?? pendingAnnotationOperation?.pageNumber ?? targetPage;
             pausedContinuation = {
               ...(documentData.sourceHash ? { sourceHash: documentData.sourceHash } : {}),
-              remainingPages: navigateThisCall && effectiveScope === 'all'
-                ? documentData.pages.map((page) => page.pageNumber).filter((page) => !agentVisitedPages.has(page))
-                : pages.slice(index + 1).filter((page) => !agentVisitedPages.has(page)),
+              remainingPages: effectiveScope === 'all' && !isWorkbook
+                ? apiRemainingPages ?? selectUninspectedPages(documentData.pages.map((page) => page.pageNumber), agentInspectedPages)
+                : pages.slice(index + 1).filter((page) => !agentInspectedPages.has(page)),
               blockedPage: blockingPage,
-              fullDocument: effectiveScope === 'all',
+              fullDocument: effectiveScope === 'all' && !isWorkbook,
               humanCorrections: continuation?.humanCorrections ?? 0,
+              importantFindingIds: [...importantFindingIds].slice(0, 500),
               visitedPages: [...agentVisitedPages],
+              inspectedPages: [...agentInspectedPages],
               mode: selectedMode,
               instruction: taskInstruction,
               guidelines: taskGuidelines,
@@ -2403,15 +3180,16 @@ function App() {
             const resumeDetail = pausedContinuation.remainingPages.length
               ? `Resolve these ${pendingCount} item${pendingCount === 1 ? '' : 's'} to continue with page ${pausedContinuation.remainingPages[0]}.`
               : `Resolve these ${pendingCount} item${pendingCount === 1 ? '' : 's'} to finish the current task.`;
+            if (documentData.fileType.toLowerCase() !== 'xlsx') goToPage(blockingPage);
             addAgentActivity('Asking', `Agent paused on page ${blockingPage}. ${resumeDetail}`, 'waiting', blockingPage);
             break;
           }
-          if (navigateThisCall && effectiveScope === 'all' && !pausedContinuation) {
-            const scheduled = new Set(pages);
-            const unvisitedPages = documentData.pages.map((page) => page.pageNumber).filter((page) => !agentVisitedPages.has(page) && !scheduled.has(page));
+          if (navigateThisCall && effectiveScope === 'all' && !isWorkbook && !pausedContinuation) {
+            const unvisitedPages = apiRemainingPages ?? selectUninspectedPages(documentData.pages.map((page) => page.pageNumber), agentInspectedPages);
             if (unvisitedPages.length) {
-              pages.push(...unvisitedPages);
-              addAgentActivity('Continuing', `The Agent visited ${agentVisitedPages.size} pages; opening ${unvisitedPages.length} remaining page${unvisitedPages.length === 1 ? '' : 's'} for visual coverage.`, 'complete', targetPage);
+              pages.push(unvisitedPages[0]!);
+              navigationUsed = false;
+              addAgentActivity('Continuing', `The Agent inspected ${agentVisitedPages.size} pages; starting a new navigation segment at page ${unvisitedPages[0]} of ${documentData.pageCount}.`, 'complete', unvisitedPages[0]);
             }
           }
           if (index < pages.length - 1) addAgentActivity('Continuing', `Moving on from page ${targetPage} to the next page.`, 'complete', targetPage);
@@ -2431,12 +3209,15 @@ function App() {
         && (!pausedContinuation || pausedContinuation.remainingPages.length === 0);
       const finalValidation = documentPassComplete
         ? await validateCompletedDocument({
+          documentId: documentData.documentId,
+          sourceHash: documentData.sourceHash ?? '',
           instruction: taskInstruction,
           taskPlan: structuredTaskPlan,
           guidelines: taskGuidelines,
           correction: taskCorrection,
           humanDecisions,
           annotations: [...annotations, ...candidates, ...runFindings],
+          inRunValidator: latestInRunValidator,
         })
         : { issues: [], usage: undefined, modelFindingCount: 0 };
       const nextConsistencyIssues = finalValidation.issues;
@@ -2464,12 +3245,16 @@ function App() {
       const scopedCoverage = coverageTargetPages.map((target) => coverageByPage.get(target));
       const checkedCoverageCount = scopedCoverage.filter((item) => item?.status === 'checked').length;
       const noFindingCoverageCount = scopedCoverage.filter((item) => item?.status === 'checked' && item.findingCount === 0).length;
-      const imageOnlyCoverageCount = scopedCoverage.filter((item) => item?.status === 'image_only').length;
+      const imageOnlyCoverageCount = scopedCoverage.filter((item) => item?.status === 'image_only' && !item.humanReviewed).length;
+      const humanReviewedImageOnlyCount = scopedCoverage.filter((item) => item?.status === 'image_only' && item.humanReviewed).length;
       const openedCoverageCount = scopedCoverage.filter((item) => item?.status === 'opened').length;
       const failedCoverageCount = scopedCoverage.filter((item) => item?.status === 'failed').length;
-      const warningCoverageCount = scopedCoverage.filter((item) => Boolean(item && item.warningCount > 0)).length;
+      const warningCoverageCount = scopedCoverage.filter((item) => Boolean(item && item.warningCount > 0 && !item.warningAcknowledged)).length;
+      const acknowledgedWarningCount = scopedCoverage.filter((item) => Boolean(item && item.warningCount > 0 && item.warningAcknowledged)).length;
       const unprocessedCoverageCount = scopedCoverage.filter((item) => !item).length;
-      const coverageAttentionCount = scopedCoverage.filter((item) => !item || ['image_only', 'opened', 'failed'].includes(item.status) || item.warningCount > 0).length;
+      const coverageAttentionCount = scopedCoverage.filter((item) => !item
+        || (item.status !== 'checked' && !(item.status === 'image_only' && item.humanReviewed))
+        || (item.warningCount > 0 && !item.warningAcknowledged)).length;
       const remainingReviewCount = selectedMode === 'observe'
         ? candidates.length
         : candidates.filter((candidate) => !processedPages.has(candidate.pageNumber)).length + reviewCount + spreadsheetReviewCount;
@@ -2488,7 +3273,9 @@ function App() {
         ? `${foundCount}件の可能性のある範囲を読み取りました。文書は変更していません。`
         : selectedMode === 'suggest'
           ? `${reviewCount}件の候補を確認待ちにしました。`
-          : `${autoAppliedCount}件を注釈し、${reviewCount}件の範囲と${spreadsheetReviewCount}件のセル変更を人の確認待ちにしました。`;
+          : selectedMode === 'autopilot'
+            ? `${autoAppliedCount}件の明確な結果を自動適用し、高優先度の重要項目${importantFindingIds.size}件を報告しました。${reviewCount + spreadsheetReviewCount ? `曖昧な${reviewCount + spreadsheetReviewCount}件は人の確認待ちです。` : ''}`
+            : `${autoAppliedCount}件を注釈し、${reviewCount}件の範囲と${spreadsheetReviewCount}件のセル変更を人の確認待ちにしました。`;
       const demoText = runMode === 'demo' ? ' デモ候補は実モデルの解析結果ではありません。' : '';
       const partialText = failure ? ` ${failure} ここまでの結果を保持しました。` : '';
       const usageText = runUsage.totalTokens ? ` 使用量 ${formatTokens(runUsage.totalTokens)} tokens` : '';
@@ -2496,7 +3283,7 @@ function App() {
         ? ` 一貫性レビューで${nextConsistencyIssues.length}件の確認候補を検出しました。${modelValidationCount ? ` Validator Agentの独立指摘が${modelValidationCount}件あります。` : ''}`
         : '';
       const humanCorrectionText = continuation?.humanCorrections ? ` 人の修正を${continuation.humanCorrections}件後続ページに反映しました。` : '';
-      const coverageText = `確認範囲: ${checkedCoverageCount}/${coverageTargetPages.length}ページをテキスト付きで確認し、${noFindingCoverageCount}ページは該当なし。${imageOnlyCoverageCount ? ` 文字抽出なし ${imageOnlyCoverageCount}ページ。` : ''}${warningCoverageCount ? ` 変換警告 ${warningCoverageCount}ページ。` : ''}${openedCoverageCount ? ` 開いたが未確認 ${openedCoverageCount}ページ。` : ''}${failedCoverageCount ? ` 失敗 ${failedCoverageCount}ページ。` : ''}${unprocessedCoverageCount ? ` 未処理 ${unprocessedCoverageCount}ページ。` : ''}`;
+      const coverageText = `確認範囲: ${checkedCoverageCount}/${coverageTargetPages.length}ページをテキスト付きで確認し、${noFindingCoverageCount}ページは該当なし。${humanReviewedImageOnlyCount ? ` 画像のみ ${humanReviewedImageOnlyCount}ページを人が確認済み。` : ''}${imageOnlyCoverageCount ? ` 文字抽出なし・未確認 ${imageOnlyCoverageCount}ページ。` : ''}${acknowledgedWarningCount ? ` 変換警告 ${acknowledgedWarningCount}ページを人が確認済み。` : ''}${warningCoverageCount ? ` 変換警告 ${warningCoverageCount}ページ。` : ''}${openedCoverageCount ? ` 開いたが未確認 ${openedCoverageCount}ページ。` : ''}${failedCoverageCount ? ` 失敗 ${failedCoverageCount}ページ。` : ''}${unprocessedCoverageCount ? ` 未処理 ${unprocessedCoverageCount}ページ。` : ''}`;
       const runSummary = `${completedPages} / ${runTotalPages}ページを処理しました。${coverageText}${modeSummary}${humanCorrectionText}${consistencyText}${usageText}${demoText}${partialText}`;
       setMessage(runSummary);
       setActiveTab('ai');
@@ -2547,12 +3334,15 @@ function App() {
       await waitForRender();
       const current = restoreDocumentAnnotationRecords(documentWorkspaceStateRef.current.documentAnnotationRecords);
       const review = await validateCompletedDocument({
+        documentId: documentData.documentId,
+        sourceHash: documentData.sourceHash ?? '',
         instruction: pending.instruction,
         taskPlan: taskPlanRef.current ? taskPlanAsInstructions(taskPlanRef.current.plan) : '',
         guidelines: pending.guidelines,
         correction: pending.correction,
         humanDecisions: [pending.decisionContext, decision?.note ?? ''].filter(Boolean).join('\n').slice(0, 4000),
         annotations: [...current.annotations, ...current.candidates],
+        inRunValidator: lastInRunValidatorRef.current,
       });
       setConsistencyIssues(review.issues);
       await waitForRender();
@@ -2565,6 +3355,58 @@ function App() {
       });
       return review.issues.length;
     };
+    const persistResumedPageCoverage = (toolEvents: unknown, returned: AnnotationCandidate[], newlyPending: AnnotationCandidate[], resolvedCandidatePage?: number, resolvedCandidateCount = 1) => {
+      const activeRun = activeAgentRunRef.current;
+      if (!activeRun) return;
+      activeAgentRunRef.current = {
+        ...activeRun,
+        pageCoverage: mergePageCoverageFromResume({
+          existing: activeRun.pageCoverage ?? [], toolEvents, returned, newlyPending,
+          existingFindingIds: [...annotations, ...candidates, ...rejectedCandidates].map((candidate) => candidate.id),
+          pageWarnings: documentData?.pages ?? [],
+          ...(resolvedCandidatePage ? { resolvedCandidatePage, resolvedCandidateCount } : {}),
+        }),
+      };
+      persistRunHistoryEntry(activeAgentRunRef.current);
+    };
+    const resolvedCandidatePage = decision
+      ? documentData?.fileType.toLowerCase() === 'xlsx' ? undefined : [...candidates, ...rejectedCandidates].find((candidate) => candidate.id === decision.approvalId)?.pageNumber
+      : pending.humanDecisions?.at(-1)?.pageNumber;
+    const resolvedCandidateCount = resolvedCandidatePage
+      ? Math.max(1, countResolvedReviewCandidatesOnPage(pending.humanDecisions ?? [], resolvedCandidatePage))
+      : 0;
+    if (resolvedCandidatePage) persistResumedPageCoverage([], [], [], resolvedCandidatePage, resolvedCandidateCount);
+    const finalizeResumedDocument = async (intro: string) => {
+      const issueCount = await rerunFinalConsistency();
+      const activeRun = activeAgentRunRef.current;
+      const workspace = restoreDocumentAnnotationRecords(documentWorkspaceStateRef.current.documentAnnotationRecords);
+      const hasPendingReview = workspace.candidates.length > 0
+        || workspace.spreadsheetChanges.some((change) => change.requiresReview && !change.approved && !change.rejected)
+        || annotationOperationsRef.current.some((operation) => operation.status === 'needs_review');
+      const outcome = resolveHumanReviewStatus(hasPendingReview, activeRun?.pageCoverageTargets, activeRun?.pageCoverage);
+      const coverage = new Map((activeRun?.pageCoverage ?? []).map((item) => [item.pageNumber, item]));
+      const coverageTargets = activeRun?.pageCoverageTargets ?? [];
+      const checkedCoverageCount = coverageTargets.filter((page) => coverage.get(page)?.status === 'checked').length;
+      const unprocessedCoverageCount = coverageTargets.filter((page) => !coverage.has(page)).length;
+      const imageOnlyCoverageCount = coverageTargets.filter((page) => coverage.get(page)?.status === 'image_only' && !coverage.get(page)?.humanReviewed).length;
+      const humanReviewedImageOnlyCount = coverageTargets.filter((page) => coverage.get(page)?.status === 'image_only' && coverage.get(page)?.humanReviewed).length;
+      const openedCoverageCount = coverageTargets.filter((page) => coverage.get(page)?.status === 'opened').length;
+      const failedCoverageCount = coverageTargets.filter((page) => coverage.get(page)?.status === 'failed').length;
+      const warningCoverageCount = coverageTargets.filter((page) => (coverage.get(page)?.warningCount ?? 0) > 0 && !coverage.get(page)?.warningAcknowledged).length;
+      const acknowledgedWarningCount = coverageTargets.filter((page) => (coverage.get(page)?.warningCount ?? 0) > 0 && coverage.get(page)?.warningAcknowledged).length;
+      const coverageText = coverageTargets.length
+        ? `確認範囲: ${checkedCoverageCount}/${coverageTargets.length}ページをテキスト付きで確認。${humanReviewedImageOnlyCount ? ` 画像のみ ${humanReviewedImageOnlyCount}ページを人が確認済み。` : ''}${imageOnlyCoverageCount ? ` 文字抽出なし・未確認 ${imageOnlyCoverageCount}ページ。` : ''}${openedCoverageCount ? ` 開いたが未確認 ${openedCoverageCount}ページ。` : ''}${failedCoverageCount ? ` 失敗 ${failedCoverageCount}ページ。` : ''}${acknowledgedWarningCount ? ` 変換警告 ${acknowledgedWarningCount}ページを人が確認済み。` : ''}${warningCoverageCount ? ` 変換警告 ${warningCoverageCount}ページ。` : ''}${unprocessedCoverageCount ? ` 未処理 ${unprocessedCoverageCount}ページ。` : ''}`
+        : '';
+      const finalSummary = `${intro}${outcome.status === 'complete' ? ' 文書の確認が完了しました。' : ' 追加の確認が必要です。'}${coverageText ? ` ${coverageText}` : ''}${hasPendingReview ? ' 人の確認待ち項目があります。' : ''}${issueCount ? ` 一貫性レビューで${issueCount}件の確認候補があります。` : ''}`;
+      addAgentActivity(outcome.status === 'complete' ? 'Continuing' : 'Asking', outcome.status === 'complete' ? 'The resumed document run completed.' : outcome.coverageStillNeedsReview ? 'The resumed run still has page coverage that needs review.' : 'The resumed run still has human review items.', outcome.status === 'complete' ? 'complete' : 'waiting');
+      setMessage(finalSummary);
+      await waitForRender();
+      if (documentData) saveCurrentDocumentWorkspace(documentData.fileName);
+      setSaved(true);
+      finishRunHistory(outcome.status, finalSummary);
+      setAgentStatus(outcome.status);
+      return outcome;
+    };
     if (!decision) {
       if (pending.remainingPages.length) {
         await waitForRender();
@@ -2573,12 +3415,7 @@ function App() {
         setAgentContinuation(null);
         setWorking(true);
         setAgentStatus('running');
-        const issueCount = await rerunFinalConsistency();
-        setAgentStatus('complete');
-        await waitForRender();
-        if (documentData) saveCurrentDocumentWorkspace(documentData.fileName);
-        setSaved(true);
-        finishRunHistory('complete', `人の判断を記録しました。残りのページはありません。${issueCount ? ` 一貫性レビューで${issueCount}件の確認候補があります。` : ''}`);
+        await finalizeResumedDocument('人の判断を記録しました。');
         setWorking(false);
       }
       return;
@@ -2599,17 +3436,29 @@ function App() {
         addAgentActivity(toolEvent.phase, `${toolEvent.toolName} → ${toolEvent.detail}`, toolEvent.status, toolEvent.pageNumber);
       });
       if (!ok) throw new Error(result.error ?? 'Agent Runを再開できませんでした。');
+      if (result.validator && typeof result.validator === 'object' && !Array.isArray(result.validator)) {
+        lastInRunValidatorRef.current = result.validator as InRunValidatorResult;
+      }
       const resumedVisitedPages = Array.isArray(result.visitedPages)
         ? result.visitedPages.map(Number).filter((page: number) => Number.isFinite(page) && page >= 1 && page <= (documentData?.pageCount ?? 120))
         : [];
       const visitedPages = [...new Set([...(pending.visitedPages ?? []), ...resumedVisitedPages])];
-      const visitedPageSet = new Set(visitedPages);
+      const resumedToolEvents = Array.isArray(result.toolEvents) ? result.toolEvents as Array<{ toolName?: unknown; pageNumber?: unknown }> : [];
+      const resumedInspectedPages = Array.isArray(result.inspectedPages)
+        ? result.inspectedPages.map(Number).filter((page: number) => Number.isInteger(page) && page >= 1 && page <= (documentData?.pageCount ?? 120))
+        : resumedToolEvents.filter((event) => event.toolName === 'inspect_page' && Number.isInteger(event.pageNumber))
+          .map((event) => Number(event.pageNumber));
+      const inspectedPages = [...new Set([...(pending.inspectedPages ?? []), ...resumedInspectedPages])];
+      const inspectedPageSet = new Set(inspectedPages);
+      const apiRemainingPages = Array.isArray(result.remainingPages)
+        ? result.remainingPages.map(Number).filter((page: number) => Number.isInteger(page) && page >= 1 && page <= (documentData?.pageCount ?? 120))
+        : undefined;
       const remainingPages = pending.fullDocument && documentData
-        ? documentData.pages.map((page) => page.pageNumber).filter((page) => !visitedPageSet.has(page))
-        : pending.remainingPages.filter((page) => !visitedPageSet.has(page));
+        ? apiRemainingPages ?? selectUninspectedPages(documentData.pages.map((page) => page.pageNumber), inspectedPageSet)
+        : pending.remainingPages.filter((page) => !inspectedPageSet.has(page));
       const blockedPage = Number(result.blockedPage) || pending.blockedPage;
       if (activeAgentRunRef.current) {
-        const completedPages = Math.max(activeAgentRunRef.current.completedPages, visitedPages.length);
+        const completedPages = Math.max(activeAgentRunRef.current.completedPages, inspectedPages.length);
         activeAgentRunRef.current = { ...activeAgentRunRef.current, completedPages };
         persistRunHistoryEntry(activeAgentRunRef.current);
       }
@@ -2628,8 +3477,9 @@ function App() {
         try { await refreshWorkbookSummary(documentData.documentId); } catch { /* Keep the live Agent result if the workbook session expired. */ }
       }
       const returnedCandidates = (Array.isArray(result.annotations) ? result.annotations : []) as AnnotationCandidate[];
-      const autoAccepted = returnedCandidates.filter((candidate) => candidate.reviewedByHuman || (!candidate.requiresReview && candidate.reviewPriority !== 'high'));
+      const autoAccepted = returnedCandidates.filter((candidate) => candidate.reviewedByHuman || (!candidate.requiresReview && (candidate.reviewPriority !== 'high' || pending.mode === 'autopilot')));
       const needsReview = returnedCandidates.filter((candidate) => !autoAccepted.some((accepted) => accepted.id === candidate.id));
+      persistResumedPageCoverage(result.toolEvents, returnedCandidates, needsReview);
       if (autoAccepted.length) {
         setAnnotations((existing) => {
           const next = new Map(existing.map((item) => [item.id, item]));
@@ -2649,6 +3499,7 @@ function App() {
           blockedPage,
           remainingPages,
           visitedPages,
+          inspectedPages,
           approvalRunId: result.approvalRunId,
           approvalId: result.approvalId,
           pendingApprovalDecision: undefined,
@@ -2656,6 +3507,7 @@ function App() {
         };
         setAgentContinuation(nextContinuation);
         setAgentStatus('waiting');
+        if (documentData?.fileType.toLowerCase() !== 'xlsx') goToPage(blockedPage);
         addAgentActivity('Asking', 'Agent paused again for another human approval in the same Run.', 'waiting', blockedPage);
         await waitForRender();
         if (documentData) saveCurrentDocumentWorkspace(documentData.fileName);
@@ -2665,8 +3517,9 @@ function App() {
       }
 
       if (needsReview.length && (pending.mode === 'assist' || pending.mode === 'autopilot')) {
-        setAgentContinuation({ ...pending, blockedPage, remainingPages, visitedPages, approvalRunId: undefined, approvalId: undefined, pendingApprovalDecision: undefined, decisionContext: pending.decisionContext });
+        setAgentContinuation({ ...pending, blockedPage, remainingPages, visitedPages, inspectedPages, approvalRunId: undefined, approvalId: undefined, pendingApprovalDecision: undefined, decisionContext: pending.decisionContext });
         setAgentStatus('waiting');
+        if (documentData?.fileType.toLowerCase() !== 'xlsx') goToPage(blockedPage);
         addAgentActivity('Asking', `${needsReview.length} additional region${needsReview.length === 1 ? '' : 's'} need review before continuing.`, 'waiting', blockedPage);
         await waitForRender();
         if (documentData) saveCurrentDocumentWorkspace(documentData.fileName);
@@ -2677,7 +3530,7 @@ function App() {
 
       const decisionContext = pending.decisionContext;
       if (remainingPages.length) {
-        const nextContinuation = { ...pending, blockedPage, remainingPages, visitedPages, approvalRunId: undefined, approvalId: undefined, pendingApprovalDecision: undefined, decisionContext };
+        const nextContinuation = { ...pending, blockedPage, remainingPages, visitedPages, inspectedPages, approvalRunId: undefined, approvalId: undefined, pendingApprovalDecision: undefined, decisionContext };
         setAgentContinuation(null);
         setAgentStatus('running');
         addAgentActivity('Continuing', `The same Agent Run resumed with the human decision; continuing at page ${remainingPages[0]}.`, 'complete', blockedPage);
@@ -2688,11 +3541,7 @@ function App() {
         setAgentStatus('running');
         addAgentActivity('Continuing', 'The Agent Run resumed with the human decision and finished; there are no remaining pages.', 'complete', blockedPage);
         await waitForRender();
-        const issueCount = await rerunFinalConsistency();
-        setAgentStatus('complete');
-        if (documentData) saveCurrentDocumentWorkspace(documentData.fileName);
-        setSaved(true);
-        finishRunHistory('complete', `Agent Run resumed after approval and finished the document.${issueCount ? ` ${issueCount} consistency finding${issueCount === 1 ? '' : 's'} need human review.` : ''}`);
+        await finalizeResumedDocument('Agent Runを再開しました。');
       }
     } catch (error) {
       const detail = error instanceof Error ? error.message : 'Agent Run could not be resumed.';
@@ -2765,7 +3614,7 @@ function App() {
     if (!documentData) return;
     const headers = ['page', 'status', 'label', 'note', 'reason', 'excerpt', 'review_priority', 'confidence_hint', 'x', 'y', 'width', 'height', 'source'];
     const rows = [
-      ...annotations.map((item) => ({ ...item, status: !item.reviewedByHuman && (item.requiresReview || item.reviewPriority === 'high') ? '確認待ち' : '確定' })),
+      ...annotations.map((item) => ({ ...item, status: !item.reviewedByHuman && item.requiresReview ? '確認待ち' : '確定' })),
       ...candidates.map((item) => ({ ...item, status: '確認待ち' })),
       ...rejectedCandidates.map((item) => ({ ...item, status: '却下' })),
     ];
@@ -2780,7 +3629,7 @@ function App() {
 
   const exportAnnotatedWord = async () => {
     if (!documentData || documentData.fileType.toLowerCase() !== 'docx' || exportingWord) return;
-    const exportableAnnotations = annotations.filter((annotation) => !annotation.requiresReview && (annotation.reviewedByHuman || annotation.reviewPriority !== 'high'));
+    const exportableAnnotations = annotations.filter((annotation) => !annotation.requiresReview);
     if (!exportableAnnotations.length) {
       setMessage('Wordへ書き出す確定注釈がありません。');
       return;
@@ -2797,8 +3646,8 @@ function App() {
       const skippedCount = Number(response.headers.get('X-Document-Export-Skipped') ?? 0);
       const baseName = documentData.fileName.replace(/\.docx$/i, '').split(/[\\/]/).at(-1) || 'document';
       downloadBlob(await response.blob(), `${baseName}-annotated.docx`);
-      addAgentActivity('Exporting', `Wordコメントを${commentCount}段落に書き出しました。${skippedCount ? ` ${skippedCount}件は抜粋を特定できずスキップしました。` : ''}`);
-      setMessage(`元の文書を変更せず、${commentCount}段落にコメントを追加したDOCXを保存しました。${skippedCount ? `${skippedCount}件は抜粋を特定できずスキップしました。` : ''}`);
+      addAgentActivity('Exporting', `Wordコメントを${commentCount}件書き出しました。${skippedCount ? ` ${skippedCount}件は抜粋を特定できずスキップしました。` : ''}`);
+      setMessage(`元の文書を変更せず、${commentCount}件のコメントを含むDOCXを保存しました。${skippedCount ? `${skippedCount}件は抜粋を特定できずスキップしました。` : ''}`);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : 'Wordコメントを書き出せませんでした。');
     } finally {
@@ -2808,7 +3657,7 @@ function App() {
 
   const exportAnnotatedPowerPoint = async () => {
     if (!documentData || documentData.fileType.toLowerCase() !== 'pptx' || exportingPowerPoint) return;
-    const exportableAnnotations = annotations.filter((annotation) => !annotation.requiresReview && (annotation.reviewedByHuman || annotation.reviewPriority !== 'high'));
+    const exportableAnnotations = annotations.filter((annotation) => !annotation.requiresReview);
     if (!exportableAnnotations.length) {
       setMessage('PowerPointへ書き出す確定注釈がありません。');
       return;
@@ -2846,7 +3695,7 @@ function App() {
       const { PDFDocument, StandardFonts, rgb } = await import('pdf-lib');
       const pdf = await PDFDocument.create();
       pdf.setTitle(`${documentData.fileName} · Annotated`);
-      pdf.setAuthor('Annotation Studio');
+      pdf.setAuthor('Astra Annotator');
       const font = await pdf.embedFont(StandardFonts.Helvetica);
       for (const [index, sourcePage] of documentData.pages.entries()) {
         setExportProgress({ current: index + 1, total: documentData.pageCount });
@@ -2947,6 +3796,51 @@ function App() {
     Boolean(apiKey.trim()) || Boolean(health?.aiConfigured && envProviderMatches);
   const aiConfiguredForSession = (settings.provider === 'codex-app-server' && codexModels.length > 0) ||
     apiConfiguredForSession;
+  const currentManualValidatorReview = manualValidatorReview &&
+    manualValidatorReview.documentId === validatorSnapshot.documentId &&
+    manualValidatorReview.sourceHash === validatorSnapshot.sourceHash &&
+    manualValidatorReview.inputSignature === validatorSnapshotSignature
+    ? manualValidatorReview
+    : null;
+  const getCandidateRuleSnapshot = (candidate: AnnotationCandidate, edit = candidateCorrections[candidate.id] ?? { label: candidate.label, note: candidate.note }) => buildCorrectionRuleSnapshot({
+    documentId: documentData?.documentId ?? '',
+    sourceHash: documentData?.sourceHash ?? '',
+    instruction: prompt.trim().length >= 2 ? prompt.trim() : DEFAULT_PROMPT,
+    taskPlan: taskPlan ? taskPlanAsInstructions(taskPlan.plan) : '',
+    guidelines: guidelines.trim(),
+    candidate,
+    correction: edit,
+    remainingPages: agentContinuation?.remainingPages ?? [],
+    continuation: agentContinuation ?? undefined,
+  });
+  const renderCorrectionRuleControls = (candidate: AnnotationCandidate) => {
+    const snapshot = getCandidateRuleSnapshot(candidate);
+    const stored = candidateRuleDrafts[candidate.id];
+    const currentDraft = stored?.inputSignature === snapshot.signature ? stored : null;
+    const proposedDraft = currentDraft?.status === 'complete' && currentDraft.draft?.outcome === 'proposed_rule' ? currentDraft.draft : null;
+    const canUseRemainingPages = Boolean(agentContinuation?.remainingPages.length);
+    const isRemainingScope = candidateCorrectionScopes[candidate.id] === 'remaining_pages';
+    return <div className="correction-rule-controls" data-testid={`correction-rule-${candidate.id}`}>
+      <button className="candidate-rule-draft-button" data-testid="draft-correction-rule" type="button" onClick={() => void draftRemainingPageRule(candidate)} disabled={working || !canUseRemainingPages || !aiConfiguredForSession || currentDraft?.status === 'loading'}>
+        {currentDraft?.status === 'loading' ? 'ルール案を作成中…' : 'AIで残りページのルール案を作成'}
+      </button>
+      {!canUseRemainingPages && <small>続きのページがある場合に、修正を一般化した案を作れます。</small>}
+      {!aiConfiguredForSession && <small>AI接続設定が必要です。</small>}
+      {currentDraft?.status === 'error' && <p className="correction-rule-message is-error" role="status">{currentDraft.message}</p>}
+      {currentDraft?.status === 'complete' && currentDraft.draft?.outcome === 'no_safe_rule' && <p className="correction-rule-message" role="status">個別の修正にとどめる案です。{currentDraft.draft.reason}</p>}
+      {isRemainingScope && !(currentDraft?.status === 'complete' && currentDraft.draft?.outcome === 'proposed_rule') && <label>残りページに適用するルール（必須）<textarea data-testid="manual-correction-rule" value={candidateCorrectionRules[candidate.id] ?? ''} maxLength={500} onChange={(event) => setCandidateCorrectionRules((items) => ({ ...items, [candidate.id]: event.target.value }))} /></label>}
+      {proposedDraft && <div className="correction-rule-proposal">
+        <strong>{isRemainingScope ? '適用するルール · 確認・編集できます' : 'ルール案 · 適用前に編集・確認してください'}</strong>
+        <label>残りページに使うルール<textarea data-testid="correction-rule-text" value={candidateCorrectionRules[candidate.id] ?? proposedDraft.rule} maxLength={500} onChange={(event) => {
+          const rule = event.target.value;
+          setCandidateRuleDrafts((items) => ({ ...items, [candidate.id]: { inputSignature: snapshot.signature, status: 'complete', draft: { ...proposedDraft, rule } } }));
+          if (isRemainingScope) setCandidateCorrectionRules((items) => ({ ...items, [candidate.id]: rule }));
+        }} /></label>
+        <p>{proposedDraft.basis}</p>
+        {!isRemainingScope && <button className="candidate-rule-accept-button" type="button" onClick={() => { setCandidateCorrectionRules((items) => ({ ...items, [candidate.id]: proposedDraft.rule })); setCandidateCorrectionScopes((items) => ({ ...items, [candidate.id]: 'remaining_pages' })); setMessage(`このルール案をP.${agentContinuation?.remainingPages[0]}以降に適用する設定にしました。確定する前に文案を確認してください。`); }} disabled={!canUseRemainingPages || !proposedDraft.rule.trim()}>この案を残りページに適用</button>}
+      </div>}
+    </div>;
+  };
   const activeProviderLabel = settings.provider === 'codex-app-server'
     ? 'Codex App Server · ローカルCLI'
     : settings.provider === 'azure-openai'
@@ -2954,13 +3848,124 @@ function App() {
       : settings.provider === 'openai-compatible'
         ? `OpenAI互換API · ${settings.model}`
         : `OpenAI API · ${settings.model}`;
+  const fileTypeKey = documentData?.fileType.toLowerCase() ?? '';
+  const activeWorkbookSheet = workbookSummary?.sheets.find((sheet) => sheet.name === activeWorkbookSheetName) ?? workbookSummary?.sheets[0] ?? null;
+  const workbookChangeColumnCount = activeWorkbookSheet
+    ? spreadsheetChanges.filter((change) => change.sheetName === activeWorkbookSheet.name).reduce((count, change) => {
+      const [, endText] = change.range.split(':');
+      return Math.max(count, parseExcelCellAddress(endText ?? change.range)?.column ?? 0);
+    }, 0)
+    : 0;
+  const workbookPreviewColumnLimit = 80;
+  const workbookPreviewWindowSize = 16;
+  const previewColumnWindow = workbookColumnWindow(activeWorkbookSheet
+    ? Math.max(activeWorkbookSheet.columnCount, activeWorkbookSheet.headers.length, workbookChangeColumnCount, ...activeWorkbookSheet.sampleRows.map((row) => row.values.length))
+    : 0, workbookColumnStart, workbookPreviewColumnLimit, workbookPreviewWindowSize);
+  const availableWorkbookPreviewColumns = activeWorkbookSheet ? previewColumnWindow.available : 0;
+  const activeWorkbookColumnStart = previewColumnWindow.start;
+  const activeWorkbookColumnEnd = previewColumnWindow.end;
+  const activeWorkbookColumnCount = activeWorkbookSheet ? Math.max(1, activeWorkbookColumnEnd - activeWorkbookColumnStart + 1) : 0;
+  const hasWorkbookPreviewContent = activeWorkbookSheet
+    ? activeWorkbookSheet.headers.some(Boolean) || activeWorkbookSheet.sampleRows.length > 0 || spreadsheetChanges.some((change) => change.sheetName === activeWorkbookSheet.name)
+    : false;
+  const fileTypeName = documentTypeLabel(documentData?.fileType);
+  const navigationUnit = documentUnitLabel(documentData?.fileType);
+  const documentCountLabel = fileTypeKey === 'xlsx'
+    ? `${workbookSummary?.sheets.length ?? 0} シート`
+    : `${documentData?.pageCount ?? 0} ${navigationUnit}`;
+  const pendingSheetChanges = spreadsheetChanges.filter((change) => change.requiresReview && !change.approved && !change.rejected);
+  const pendingAnnotationOperations = annotationOperations.filter((operation) => operation.status === 'needs_review');
+  const pendingReviewCount = candidates.length + pendingSheetChanges.length + pendingAnnotationOperations.length;
+  const visibleAgentStatus: AgentRunStatus = pendingReviewCount > 0 && agentStatus !== 'running' && agentStatus !== 'error' ? 'waiting' : agentStatus;
+  const pendingCandidate = candidates[0];
+  useEffect(() => {
+    if (visibleAgentStatus !== 'waiting' || !documentData || documentData.fileType.toLowerCase() === 'xlsx' || !pendingCandidate) {
+      if (visibleAgentStatus !== 'waiting') alignedReviewTargetRef.current = '';
+      return;
+    }
+    const reviewTargetKey = `${documentData.documentId}:${pendingCandidate.id}`;
+    if (alignedReviewTargetRef.current === reviewTargetKey) return;
+    alignedReviewTargetRef.current = reviewTargetKey;
+    goToPage(pendingCandidate.pageNumber);
+  }, [documentData?.documentId, visibleAgentStatus, pendingCandidate?.id]);
+  const pendingSheetChange = pendingSheetChanges[0];
+  const pendingAnnotationOperation = pendingAnnotationOperations[0];
+  const latestAgentRun = agentRunHistory[0];
+  const latestAgentEvent = [...agentActivity].reverse().find((event) => event.status === 'active' || event.status === 'waiting') ?? agentActivity.at(-1);
+  const showLiveActivity = Boolean(latestAgentEvent && ['running', 'waiting'].includes(visibleAgentStatus));
+  const currentAgentAction = visibleAgentStatus === 'waiting'
+    ? pendingCandidate?.label ?? (pendingSheetChange ? `${pendingSheetChange.sheetName}!${pendingSheetChange.range}` : pendingAnnotationOperation?.existingLabel) ?? '人の判断を待っています'
+    : agentStatus === 'running'
+      ? latestAgentEvent?.detail ?? '文書を確認しています'
+      : agentStatus === 'complete'
+        ? '今回の解析が完了しました'
+        : agentStatus === 'error'
+          ? '解析が停止しました'
+          : 'タスクの指示を確認して開始できます';
+  const nextAgentAction = pendingReviewCount > 0
+    ? agentContinuation ? '判断を確定すると、同じAgent Runが残りの作業を続けます。' : '根拠を確認して候補を承認・修正・却下してください。'
+    : agentStatus === 'running'
+      ? 'ページの確認後、次の対象へ進みます。'
+      : agentStatus === 'complete'
+        ? '結果を確認して、この文書に合う形式で書き出せます。'
+        : fileTypeKey === 'xlsx'
+          ? 'Excelのシートを調べ、分類列やセル変更を提案します。'
+          : fileTypeKey === 'pptx'
+            ? 'スライド上の範囲を確認し、注釈と分類をまとめます。'
+            : fileTypeKey === 'docx'
+              ? '文書を読み、必要な箇所にコメントを追加します。'
+              : 'ページを移動して根拠を確認し、曖昧な箇所だけ質問します。';
+  const statusProgressTotal = Math.max(1, scanProgress?.total ?? latestAgentRun?.totalPages ?? documentData?.pageCount ?? 1);
+  const statusProgressCurrent = Math.min(statusProgressTotal, Math.max(0, scanProgress?.current ?? latestAgentRun?.completedPages ?? 0));
+  const statusProgressPercent = agentStatus === 'complete' ? 100 : Math.round(statusProgressCurrent / statusProgressTotal * 100);
+  const statusProgressLabel = fileTypeKey === 'xlsx'
+    ? `${workbookSummary?.sheets.length ?? 0} シート · ${spreadsheetChanges.length} 件のセル変更`
+    : `${statusProgressCurrent} / ${statusProgressTotal} ${navigationUnit}を確認`;
+  const selectedAgentModeLabel = AGENT_MODES.find((mode) => mode.id === agentMode)?.label ?? 'Assist';
+  const selectedModelLabel = modelCatalog.find((model) => model.id === settings.model)?.label ?? settings.model;
+  const fullRunButtonLabel = working
+    ? 'Agentが作業中…'
+    : agentMode === 'observe' ? '文書を読み取る'
+      : agentMode === 'suggest' ? '候補を提案'
+        : agentMode === 'autopilot' ? 'Autopilotを開始'
+          : fileTypeKey === 'xlsx' ? 'Excelを分類'
+            : `全${navigationUnit}を実行`;
+  const currentRunButtonLabel = working
+    ? 'Agentが作業中…'
+    : `現在の${navigationUnit}（${pageNumber}）だけ実行`;
+  const nativeExportLabel = fileTypeKey === 'docx'
+    ? '注釈付きWordを保存'
+    : fileTypeKey === 'pptx'
+      ? '注釈付きPowerPointを保存'
+      : fileTypeKey === 'xlsx'
+        ? '編集済みExcelを保存'
+        : '注釈入りPDFを保存';
+  const hasConfirmedVisualAnnotations = annotations.some((annotation) => !annotation.requiresReview);
+  const nativeExportEnabled = fileTypeKey === 'xlsx'
+    ? spreadsheetChanges.some((change) => change.approved && !change.rejected)
+    : fileTypeKey === 'docx' || fileTypeKey === 'pptx'
+      ? hasConfirmedVisualAnnotations
+      : Boolean(documentData);
+  const exportCurrentNativeFormat = () => {
+    setExportMenuOpen(false);
+    if (fileTypeKey === 'xlsx') void exportAnnotatedWorkbook();
+    else if (fileTypeKey === 'docx') void exportAnnotatedWord();
+    else if (fileTypeKey === 'pptx') void exportAnnotatedPowerPoint();
+    else void exportAnnotatedPdf();
+  };
+  const scrollToPendingReview = () => {
+    const target = fileTypeKey === 'xlsx' && pendingSheetChange
+      ? workbookPanelRef.current
+      : candidateSectionRef.current ?? document.querySelector<HTMLElement>('.annotation-operation-list');
+    target?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
 
   return (
     <div className="app-shell">
       <header className="topbar">
         <div className="brand-lockup">
           <div className="brand-mark"><ScanLine size={19} strokeWidth={2.2} /></div>
-          <span className="brand-name">Annotation Studio</span>
+          <span className="brand-name">Astra Annotator</span>
           <span className="brand-divider" />
           <span className="brand-section">Visual Document Work Agent</span>
         </div>
@@ -2972,19 +3977,40 @@ function App() {
           <button className="button button-secondary top-save" type="button" onClick={saveAnnotations} disabled={!documentData || saved}>
             <CheckCheck size={16} /> 保存
           </button>
-          <div className="export-menu">
-            <button className="button button-primary" type="button" onClick={selectedAnnotation ? exportSelection : exportJson} disabled={!documentData || exportingPdf || exportingWord || exportingPowerPoint}>
-              <Download size={16} /> {selectedAnnotation ? '選択範囲を書き出す' : '注釈を書き出す'} <ChevronDown size={14} />
+          <div
+            ref={exportMenuRef}
+            className={`export-menu${exportMenuOpen ? ' is-open' : ''}`}
+            onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setExportMenuOpen(false); }}
+            onKeyDown={(event) => { if (event.key === 'Escape') { setExportMenuOpen(false); event.currentTarget.querySelector<HTMLButtonElement>('.export-menu-toggle')?.focus(); } }}
+          >
+            <button
+              className="button button-primary export-menu-toggle"
+              type="button"
+              aria-haspopup="menu"
+              aria-expanded={exportMenuOpen}
+              aria-controls="annotation-export-menu"
+              onClick={() => setExportMenuOpen((open) => !open)}
+              disabled={!documentData || exportingPdf || exportingWord || exportingPowerPoint}
+            >
+              <Download size={16} /> {selectedAnnotation ? '範囲を書き出し' : '書き出し'} <ChevronDown size={14} />
             </button>
-            <div className="export-popover">
-              <button type="button" onClick={exportSelection} disabled={!selectedAnnotation}><Download size={15} /> 選択範囲をPNGで保存</button>
-              <button type="button" onClick={() => void exportAnnotatedPdf()} disabled={!documentData || exportingPdf}><FileText size={15} /> 注釈入りPDFを保存</button>
-              {documentData?.fileType.toLowerCase() === 'docx' && <button type="button" onClick={() => void exportAnnotatedWord()} disabled={exportingWord || !annotations.some((annotation) => !annotation.requiresReview && (annotation.reviewedByHuman || annotation.reviewPriority !== 'high'))}><FileText size={15} /> Wordにコメントを追加して保存</button>}
-              {documentData?.fileType.toLowerCase() === 'pptx' && <button type="button" onClick={() => void exportAnnotatedPowerPoint()} disabled={exportingPowerPoint || !annotations.some((annotation) => !annotation.requiresReview && (annotation.reviewedByHuman || annotation.reviewPriority !== 'high'))}><FileText size={15} /> PowerPointに注釈と分類タグを追加して保存</button>}
-              <button type="button" onClick={exportCsv}><FileText size={15} /> 注釈一覧をCSVで保存</button>
-              <button type="button" onClick={exportJson}><FileText size={15} /> 構造化JSONを保存</button>
-              <button type="button" onClick={exportRunHistory} disabled={!agentRunHistory.length}><FileText size={15} /> 作業履歴をJSONで保存</button>
-              {documentData && preparedExportsForDocument(documentData.fileName).map((artifact) => <button key={artifact.id} type="button" onClick={() => void downloadPreparedExport(artifact)}><Download size={15} /> Agent出力をダウンロード: {artifact.fileName}</button>)}
+            <div
+              className="export-popover"
+              id="annotation-export-menu"
+              role="menu"
+              aria-label="書き出し形式を選択"
+              onClick={(event) => { if ((event.target as HTMLElement).closest('button')) setExportMenuOpen(false); }}
+            >
+              {selectedAnnotation && <button role="menuitem" type="button" onClick={exportSelection}><Download size={15} /> 選択範囲をPNGで保存</button>}
+              <button role="menuitem" className="export-native-action" type="button" onClick={exportCurrentNativeFormat} disabled={!nativeExportEnabled || exportingPdf || exportingWord || exportingPowerPoint}>
+                {fileTypeKey === 'xlsx' ? <FileSpreadsheet size={15} /> : <FileText size={15} />}{nativeExportLabel}
+              </button>
+              {(fileTypeKey === 'docx' || fileTypeKey === 'pptx') && <button role="menuitem" type="button" onClick={() => void exportAnnotatedPdf()} disabled={!documentData || exportingPdf}><FileText size={15} /> PDFプレビューを保存</button>}
+              <div className="export-menu-divider" role="separator" />
+              <button role="menuitem" type="button" onClick={exportCsv}><FileText size={15} /> 注釈一覧をCSVで保存</button>
+              <button role="menuitem" type="button" onClick={exportJson}><FileText size={15} /> 構造化JSONを保存</button>
+              <button role="menuitem" type="button" onClick={exportRunHistory} disabled={!agentRunHistory.length}><FileText size={15} /> 作業履歴をJSONで保存</button>
+              {documentData && preparedExportsForDocument(documentData.fileName).map((artifact) => <button role="menuitem" key={artifact.id} type="button" onClick={() => void downloadPreparedExport(artifact)}><Download size={15} /> Agent出力を保存: {artifact.fileName}</button>)}
             </div>
           </div>
         </div>
@@ -3009,16 +4035,17 @@ function App() {
         </nav>
 
         <main className="main-column">
-          <div className="document-toolbar">
+          <div className={`document-toolbar${fileTypeKey === 'xlsx' ? ' is-workbook-toolbar' : ''}`}>
             <div className="document-title-wrap">
               <div className="document-icon"><FileText size={18} /></div>
               <div className="document-heading">
                 <div className="document-title-row">
                   <h1 title={documentData?.fileName ?? '文書を読み込み中'}>{documentData?.fileName ?? '文書を読み込み中'}</h1>
+                  {documentData && <span className={`document-type-badge is-${fileTypeKey}`}>{fileTypeName}</span>}
                   {documentData?.demo && <span className="sample-badge">サンプル</span>}
                   {uploading && <LoaderCircle className="spin" size={15} />}
                 </div>
-                <span>{documentData ? `${documentData.pageCount} ページ · ${documentData.fileType.toUpperCase()} · ${documentData.elapsedMs} ms` : '変換中…'}</span>
+                <span>{documentData ? documentCountLabel : '変換中…'}</span>
               </div>
               <input ref={fileInputRef} className="visually-hidden" type="file" accept=".pdf,.docx,.pptx,.xlsx,.png,.jpg,.jpeg,.webp,.tif,.tiff" onChange={(event) => void onFileSelected(event.target.files?.[0])} />
               <input
@@ -3033,24 +4060,64 @@ function App() {
               <button className="upload-link" type="button" onClick={() => fileInputRef.current?.click()} disabled={uploading}>
                 <Upload size={15} /> 別の文書を開く
               </button>
+              <div className="llm-demo-actions">
+                <button
+                  className="llm-demo-toggle"
+                  data-testid="open-llm-demo-menu"
+                  type="button"
+                  aria-haspopup="menu"
+                  aria-expanded={llmDemoMenuOpen}
+                  aria-label="実AIデモを選ぶ"
+                  title="実AIデモを選ぶ"
+                  onClick={() => setLlmDemoMenuOpen((open) => !open)}
+                  disabled={uploading || loadingLlmDemo}
+                >
+                  {loadingLlmDemo ? <LoaderCircle className="spin" size={14} /> : <Sparkles size={14} />}
+                  <span>実AIデモ</span><ChevronDown size={12} />
+                </button>
+                {llmDemoMenuOpen && <div className="llm-demo-menu" role="menu" aria-label="実AIデモ">
+                  <button type="button" role="menuitem" data-testid="open-live-contract-demo" onClick={() => void openLlmContractDemo()}><FileText size={15} /><span><strong>契約PDFをレビュー</strong><small>条項分類 · 根拠ハイライト · 人の確認</small></span></button>
+                  <button type="button" role="menuitem" data-testid="open-live-feedback-demo" onClick={() => void openLlmFeedbackDemo()}><FileSpreadsheet size={15} /><span><strong>顧客の声をアノテーション</strong><small>16件 · intent / sentiment / urgency</small></span></button>
+                  <button type="button" role="menuitem" data-testid="open-live-churn-demo" onClick={() => void openLlmChurnDemo()}><FileSpreadsheet size={15} /><span><strong>顧客解約リスクを分類</strong><small>18件 · High / Medium / Low</small></span></button>
+                  <p>固定の解析結果は入っていません。実行にはモデル接続が必要です。</p>
+                </div>}
+              </div>
+              <button
+                className="contract-demo-link"
+                data-testid="open-contract-demo"
+                type="button"
+                title="架空の契約書と固定デモ注釈を開きます。AIは実行しません。"
+                onClick={() => void openTerminationContractDemo()}
+                disabled={uploading || loadingContractDemo}
+              >
+                {loadingContractDemo ? <LoaderCircle className="spin" size={14} /> : <FileText size={14} />}
+                <span>契約レビュー例</span>
+              </button>
             </div>
-            <div className="page-controls">
-              <button type="button" aria-label="前のページ" disabled={pageNumber <= 1 || !documentData} onClick={() => goToPage(pageNumber - 1)}><ArrowLeft size={15} /></button>
-              <span>ページ <strong>{pageNumber}</strong> / {documentData?.pageCount ?? '—'}</span>
-              <button type="button" aria-label="次のページ" disabled={!documentData || pageNumber >= documentData.pageCount} onClick={() => goToPage(pageNumber + 1)}><ArrowRight size={15} /></button>
+            {fileTypeKey === 'xlsx' && activeWorkbookSheet ? (
+              <div className="page-controls workbook-sheet-controls">
+                <label htmlFor="workbook-sheet-preview">プレビューするシート</label>
+                <div className="model-select-wrap"><select id="workbook-sheet-preview" value={activeWorkbookSheet.name} onChange={(event) => { setActiveWorkbookSheetName(event.target.value); setWorkbookColumnStart(1); }}>{workbookSummary?.sheets.map((sheet) => <option key={sheet.name} value={sheet.name}>{sheet.name}</option>)}</select><ChevronDown size={15} /></div>
+                <span>{activeWorkbookSheet.rowCount} 行 · {activeWorkbookSheet.columnCount} 列</span>
+                <button className="toolbar-help" type="button" title="使い方" aria-label="使い方" onClick={() => { setGuideTab('workflow'); setShowGuide(true); }}><CircleHelp size={16} /></button>
+              </div>
+            ) : <div className="page-controls">
+              <button type="button" aria-label={`前の${navigationUnit}`} disabled={pageNumber <= 1 || !documentData} onClick={() => goToPage(pageNumber - 1)}><ArrowLeft size={15} /></button>
+              <span>{navigationUnit} <strong>{pageNumber}</strong> / {documentData?.pageCount ?? '—'}</span>
+              <button type="button" aria-label={`次の${navigationUnit}`} disabled={!documentData || pageNumber >= documentData.pageCount} onClick={() => goToPage(pageNumber + 1)}><ArrowRight size={15} /></button>
               <span className="control-divider" />
               <button type="button" aria-label="ズームアウト" onClick={() => { clearAgentViewport(); setZoom((value) => Math.max(70, value - 10)); }}><ZoomOut size={15} /></button>
               <span className="zoom-readout">{agentViewport ? `${Math.round(100 * (agentViewportScale ?? 1 / Math.max(agentViewport.width, agentViewport.height)))}%` : `${zoom}%`}</span>
               <button type="button" aria-label="ズームイン" onClick={() => { clearAgentViewport(); setZoom((value) => Math.min(130, value + 10)); }}><ZoomIn size={15} /></button>
               <span className="control-divider" />
               <button className="toolbar-help" type="button" title="使い方" aria-label="使い方" onClick={() => { setGuideTab('workflow'); setShowGuide(true); }}><CircleHelp size={16} /></button>
-            </div>
+            </div>}
           </div>
 
           {documentData?.needsReview && <div className="conversion-notice"><ShieldAlert size={16} /><span>変換時の警告があります。表示内容を原本と照合してください。</span><button type="button" onClick={() => setMessage(documentData.warnings.join(' · ') || '一部の要素は簡略化されている可能性があります。')}>詳細</button></div>}
 
-          <section className="canvas-zone" aria-label="文書ページ">
-            <div className="canvas-hint"><span><MousePointer2 size={14} /> 領域を選択するか、ツールを選んでドラッグ</span><span>{currentAnnotations.length} 件の注釈</span></div>
+          <section className="canvas-zone" aria-label={fileTypeKey === 'xlsx' ? 'Excelワークシートプレビュー' : '文書ページ'}>
+            <div className="canvas-hint"><span><MousePointer2 size={14} /> {fileTypeKey === 'xlsx' ? 'ハイライトしたセルの変更案はAgent欄で承認・却下できます' : `${navigationUnit}の領域を選択するか、ツールを選んでドラッグ`}</span><span>{fileTypeKey === 'xlsx' ? `${spreadsheetChanges.length} 件のセル変更` : `${currentAnnotations.length} 件の注釈`}</span></div>
             <div ref={pageScrollAreaRef} className={`page-scroll-area${agentViewport ? ' is-agent-viewport' : ''}${working || agentViewport ? ' is-agent-scanning' : ''}`}>
               {loadingDemo ? (
                 <div className="loading-state"><LoaderCircle className="spin" size={26} /><span>サンプル文書を準備しています</span></div>
@@ -3058,6 +4125,67 @@ function App() {
                 <div className="loading-state"><LoaderCircle className="spin" size={26} /><span>ページを読み込んでいます</span></div>
               ) : previewError ? (
                 <div className="empty-state"><div className="empty-icon"><FileText size={26} /></div><h2>ページを開けません</h2><p>{previewError}</p><button className="button button-primary" type="button" onClick={() => void reopenDocument()}>{documentData?.demo ? 'サンプルを開き直す' : '文書を再選択'}</button></div>
+              ) : fileTypeKey === 'xlsx' && activeWorkbookSheet ? (
+                <div className="workbook-preview" aria-label={`${activeWorkbookSheet.name} のワークシートプレビュー`}>
+                  <div className="workbook-preview-heading">
+                    <div><span>ワークシート</span><strong>{activeWorkbookSheet.name}</strong><small>冒頭 {activeWorkbookSheet.sampleRows.length} 行 · 列 {excelColumnLetters(activeWorkbookColumnStart)}–{excelColumnLetters(activeWorkbookColumnEnd)} を表示</small></div>
+                    <div className="workbook-preview-legend" aria-label="セルの表示">
+                      <span><i className="is-pending" />確認待ち</span>
+                      <span><i className="is-applied" />適用済み</span>
+                    </div>
+                  </div>
+                  {availableWorkbookPreviewColumns > workbookPreviewWindowSize && <div className="workbook-column-page-control" aria-label="表示する列">
+                    <span>列 {excelColumnLetters(activeWorkbookColumnStart)}–{excelColumnLetters(activeWorkbookColumnEnd)} / 最初の{availableWorkbookPreviewColumns}列{activeWorkbookSheet.columnCount > workbookPreviewColumnLimit ? `（全${activeWorkbookSheet.columnCount}列）` : ''}</span>
+                    <div><button type="button" aria-label="前のExcel列を表示" disabled={activeWorkbookColumnStart <= 1} onClick={() => setWorkbookColumnStart(Math.max(1, activeWorkbookColumnStart - workbookPreviewWindowSize))}><ArrowLeft size={13} />前へ</button>
+                      <button type="button" aria-label="次のExcel列を表示" disabled={activeWorkbookColumnEnd >= availableWorkbookPreviewColumns} onClick={() => setWorkbookColumnStart(Math.min(availableWorkbookPreviewColumns, activeWorkbookColumnStart + workbookPreviewWindowSize))}>次へ<ArrowRight size={13} /></button></div>
+                  </div>}
+                  {hasWorkbookPreviewContent ? (
+                    <div className="workbook-grid-scroll" role="region" aria-label={`${activeWorkbookSheet.name} のセル一覧。横にスクロールできます`} tabIndex={0}>
+                      <table className="workbook-grid">
+                        <caption className="visually-hidden">{activeWorkbookSheet.name} シートの冒頭 {activeWorkbookSheet.sampleRows.length} 行、列 {excelColumnLetters(activeWorkbookColumnStart)} から {excelColumnLetters(activeWorkbookColumnEnd)}。ハイライトされたセルにはAgentの変更案があります。</caption>
+                        <thead><tr><th className="workbook-row-number" scope="col">行</th>{Array.from({ length: activeWorkbookColumnCount }, (_, columnIndex) => {
+                          const columnNumber = activeWorkbookColumnStart + columnIndex;
+                          const headerChange = spreadsheetChangeAtCell(spreadsheetChanges, activeWorkbookSheet.name, 1, columnNumber);
+                          const pending = Boolean(headerChange?.change.requiresReview && !headerChange.change.approved && !headerChange.change.rejected);
+                          const applied = Boolean(headerChange && !headerChange.change.rejected && !pending);
+                          const originalHeader = activeWorkbookSheet.headers[columnNumber - 1];
+                          const proposalText = headerChange?.proposedValue === null ? '空欄' : headerChange?.proposedValue === undefined ? '' : String(headerChange.proposedValue);
+                          const originalHeaderText = originalHeader === null || originalHeader === undefined || originalHeader === '' ? `列 ${columnNumber}` : String(originalHeader);
+                          const displayHeader = pending || !headerChange || headerChange.change.rejected || headerChange.proposedValue === undefined ? originalHeaderText : String(headerChange.proposedValue || `列 ${columnNumber}`);
+                          const headerTitle = `${excelColumnLetters(columnNumber)} · ${originalHeaderText}${pending ? `。提案 ${proposalText || '空欄'}` : ''}`;
+                          return <th className={`workbook-column-heading${pending ? ' is-pending' : applied ? ' is-applied' : ''}`} key={`column-${columnNumber}`} scope="col" title={headerTitle}>
+                            <span>{excelColumnLetters(columnNumber)}</span><strong>{displayHeader}</strong>
+                            {pending && <small>提案: {proposalText || '空欄'}</small>}
+                          </th>;
+                        })}</tr></thead>
+                        <tbody>{activeWorkbookSheet.sampleRows.map((row) => <tr key={`${activeWorkbookSheet.name}-${row.rowNumber}`}>
+                          <th className="workbook-row-number" scope="row">{row.rowNumber}</th>
+                          {Array.from({ length: activeWorkbookColumnCount }, (_, columnIndex) => {
+                            const columnNumber = activeWorkbookColumnStart + columnIndex;
+                            const originalValue = row.values[columnNumber - 1];
+                            const cellChange = spreadsheetChangeAtCell(spreadsheetChanges, activeWorkbookSheet.name, row.rowNumber, columnNumber);
+                            const pending = Boolean(cellChange?.change.requiresReview && !cellChange.change.approved && !cellChange.change.rejected);
+                            const rejected = Boolean(cellChange?.change.rejected);
+                            const changedValue = cellChange?.proposedValue;
+                            const hasProposedValue = Boolean(cellChange && changedValue !== undefined);
+                            const displayValue = pending ? originalValue : hasProposedValue && !rejected ? changedValue : originalValue;
+                            const applied = Boolean(cellChange && !pending && !rejected);
+                            const reviewLabel = rejected ? '却下' : pending ? '確認待ち' : cellChange?.change.reviewOutcome === 'approved' ? '承認済み' : cellChange?.change.reviewOutcome === 'corrected' ? '修正済み' : '適用済み';
+                            const originalText = originalValue === null || originalValue === undefined ? '空欄' : String(originalValue);
+                            const proposalText = changedValue === null ? '空欄' : changedValue === undefined ? '' : String(changedValue);
+                            const cellLabel = `${activeWorkbookSheet.name}!${excelColumnLetters(columnNumber)}${row.rowNumber}: ${originalText}${pending ? `。提案 ${proposalText}、${reviewLabel}` : cellChange ? `、${reviewLabel}` : ''}`;
+                            return <td className={`workbook-cell${pending ? ' is-pending' : applied ? ' is-applied' : rejected ? ' is-rejected' : ''}`} key={`${row.rowNumber}-${columnIndex}`} title={cellLabel} aria-label={cellLabel}>
+                              <span className="workbook-cell-value">{displayValue === null || displayValue === undefined || displayValue === '' ? <span className="workbook-empty-cell">—</span> : String(displayValue)}</span>
+                              {pending && <span className="workbook-cell-proposal">提案: {proposalText || '空欄'}</span>}
+                              {cellChange && <span className="workbook-cell-status">{reviewLabel}</span>}
+                            </td>;
+                          })}
+                        </tr>)}</tbody>
+                      </table>
+                    </div>
+                  ) : <div className="workbook-preview-empty"><FileSpreadsheet size={22} /><span>このシートに表示できるデータ行がありません。</span></div>}
+                  {(activeWorkbookSheet.rowCount > activeWorkbookSheet.sampleRows.length + 1 || activeWorkbookSheet.columnCount > availableWorkbookPreviewColumns || availableWorkbookPreviewColumns > workbookPreviewWindowSize) && <div className="workbook-preview-footnote">セル表は冒頭 {activeWorkbookSheet.sampleRows.length} 行・最初の最大 {availableWorkbookPreviewColumns} 列を表示しています。表示範囲外の変更はAgent欄の「変更前と提案を表示」で確認できます。原本のExcelファイルは変更していません。</div>}
+                </div>
               ) : currentPage && previewUrl ? (
                 <div className={`page-frame-wrap${agentViewport ? ' is-agent-viewport' : ''}`} style={pageStyle}>
                   <div className="page-frame" ref={pageFrameRef}>
@@ -3113,10 +4241,10 @@ function App() {
                 <div className="loading-state"><LoaderCircle className="spin" size={26} /><span>ページを準備しています</span></div>
               )}
             </div>
-            <div className="canvas-footer"><span>{['PNG', 'JPEG', 'WEBP', 'TIFF'].includes(documentData?.fileType.toUpperCase() ?? '') ? '画像を1ページのSVGプレビューとして表示' : <>document-svg <span className="footer-separator">·</span> {documentData?.fileType.toUpperCase() ?? '—'} をページSVGに変換</>}</span><span>{documentData?.needsReview ? '原本との確認が必要です' : 'SVGプレビュー'}</span></div>
+            <div className="canvas-footer"><span>{fileTypeKey === 'xlsx' ? `選択中シートの冒頭 ${activeWorkbookSheet?.sampleRows.length ?? 0} 行をプレビュー · セル変更は色で表示` : fileTypeKey === 'docx' ? 'Word本文プレビュー · 出力時に段落へコメントを追加' : fileTypeKey === 'pptx' ? 'PowerPointスライド · 出力時に注釈図形と分類タグを追加' : ['png', 'jpeg', 'jpg', 'webp', 'tif', 'tiff'].includes(fileTypeKey) ? '画像を1ページとして表示' : 'PDFのページ範囲に注釈を配置'}</span><span>{documentData?.needsReview ? '原本との確認が必要です' : `${fileTypeName}プレビュー`}</span></div>
           </section>
 
-          <div className="tool-dock" role="toolbar" aria-label="注釈ツール">
+          {fileTypeKey !== 'xlsx' && <div className="tool-dock" role="toolbar" aria-label="注釈ツール">
             <span className="dock-label">ツール</span>
             <ToolButton selected={activeTool === 'select'} label="選択" onClick={() => setActiveTool('select')}><MousePointer2 size={16} /></ToolButton>
             <ToolButton selected={activeTool === 'rectangle'} label="範囲" onClick={() => setActiveTool('rectangle')}><Square size={16} /></ToolButton>
@@ -3124,25 +4252,85 @@ function App() {
             <span className="dock-divider" />
             <button className="dock-export" type="button" disabled={!selectedAnnotation} onClick={exportSelection}><Download size={15} /> 選択箇所を抽出</button>
             <span className="dock-shortcut">Delete で削除</span>
-          </div>
+          </div>}
         </main>
 
         <aside className="side-panel" aria-label="Document work agent and annotations">
           <div className="panel-tabs" role="tablist" aria-label="サイドパネル">
-            <button type="button" role="tab" aria-selected={activeTab === 'ai'} className={activeTab === 'ai' ? 'is-active' : ''} onClick={() => setActiveTab('ai')}><Sparkles size={15} /> Agent</button>
+            <button type="button" role="tab" aria-selected={activeTab === 'ai'} className={activeTab === 'ai' ? 'is-active' : ''} onClick={() => setActiveTab('ai')}><Sparkles size={15} /> Agent {pendingReviewCount > 0 && <span className="tab-count tab-count-pending">{pendingReviewCount}</span>}</button>
             <button type="button" role="tab" aria-selected={activeTab === 'annotations'} className={activeTab === 'annotations' ? 'is-active' : ''} onClick={() => setActiveTab('annotations')}><Highlighter size={15} /> 注釈 <span className="tab-count">{annotations.length}</span></button>
             <button type="button" role="tab" aria-selected={activeTab === 'workspace'} className={activeTab === 'workspace' ? 'is-active' : ''} onClick={() => setActiveTab('workspace')}><FolderTree size={15} /> プロジェクト <span className="tab-count">{workspaceProject?.documents.length ?? 0}</span></button>
           </div>
+          {documentData?.demo && [terminationContractDemoFileName, productHuntDemoContractFileName].includes(documentData.fileName) && <section className="contract-demo-notice" data-testid="termination-demo-notice" aria-label="契約書デモの説明">
+            {aiMode === 'demo' ? <>
+              <strong>架空の契約書 · 固定スクリプト · AI未実行</strong>
+              <p>画面上の注釈と確認候補は決め打ちの見本です。法的判断ではありません。</p>
+            </> : <>
+              <strong>{working && requiredLiveDemoDocumentId === documentData.documentId ? '架空の契約書 · 実モデルで解析中' : aiMode === 'live' ? '架空の契約書 · 実モデルの解析' : '架空の契約書 · AI解析用 · まだモデル未実行'}</strong>
+              <p>{working && requiredLiveDemoDocumentId === documentData.documentId ? 'Agentがページを読み、設定したモデルで条項を分類しています。法的助言ではありません。' : aiMode === 'live' ? '表示中の分類は、設定したモデルの出力です。法的助言ではありません。' : '初期注釈は空です。Agentを実行すると設定したモデルが条項を解析します。法的判断には使わないでください。'}</p>
+              <p><b>デモ用指示:</b> {productHuntDemoContractPrompt}</p>
+            </>}
+            {aiMode === 'demo' && <p><b>固定デモの指示:</b> {terminationContractDemoPrompt}</p>}
+          </section>}
+          {documentData?.demo && documentData.fileName === productHuntDemoFeedbackFileName && <section className="contract-demo-notice" data-testid="feedback-demo-notice" aria-label="顧客フィードバックデモの説明">
+            <strong>{working ? '合成チケット · Agentが処理中' : aiMode === 'live' ? '合成チケット · 実モデルのアノテーション' : '合成チケット · ラベル未記入 · AI未実行'}</strong>
+            <p>16件の架空チケットです。出力欄を空の状態で読み込みました。個人情報を含まず、実行にはモデル接続が必要です。</p>
+          </section>}
+          {documentData?.demo && documentData.fileName === productHuntDemoChurnFileName && <section className="contract-demo-notice" data-testid="churn-demo-notice" aria-label="顧客解約リスクデモの説明">
+            <strong>{working ? '合成顧客データ · Agentが分類中' : aiMode === 'live' ? '合成顧客データ · 実モデルの分類' : '合成顧客データ · ラベル未記入 · AI未実行'}</strong>
+            <p>18件の架空顧客を、2026-09-01時点の利用状況で分類します。Churn Risk列は空欄です。元データに実在顧客の情報はなく、Agent実行前にはモデルを呼び出しません。</p>
+          </section>}
 
           {activeTab === 'ai' ? (
             <div className="panel-content ai-content">
+              {showLiveActivity && !exportMenuOpen && latestAgentEvent && <button type="button" className={`agent-live-activity is-${latestAgentEvent.status}`} aria-live="polite" aria-label="Agentの現在の作業。ログを開く" onClick={() => agentActivityPanelRef.current?.scrollIntoView({ block: 'center', behavior: 'smooth' })}>
+                <span className="agent-live-activity-marker">{latestAgentEvent.status === 'active' ? <LoaderCircle className="spin" size={14} /> : latestAgentEvent.status === 'waiting' ? <ShieldAlert size={14} /> : <Check size={14} />}</span>
+                <span className="agent-live-activity-copy"><strong>{AGENT_PHASE_LABELS[latestAgentEvent.phase]}{latestAgentEvent.pageNumber ? ` · ${navigationUnit} ${latestAgentEvent.pageNumber}` : ''}</strong><span>{latestAgentEvent.detail}</span></span>
+                <span className="agent-live-activity-action">ログを見る <ChevronDown size={13} /></span>
+              </button>}
               <div className="panel-intro">
                 <div className="intro-icon"><Sparkles size={16} /></div>
                 <div><h2>Visual Document Work Agent</h2><p>文書を開き、ページを読み、注釈し、迷う箇所だけ確認します。</p></div>
               </div>
-              {workbookSummary && <section className="workbook-panel" aria-label="Excel workbook">
-                <div className="workbook-panel-heading"><div><strong><FileSpreadsheet size={14} /> Excel workbook</strong><span>{workbookSummary.sheets.length} sheets · {spreadsheetChanges.length} cell changes</span></div><button className="button button-secondary" type="button" onClick={() => void exportAnnotatedWorkbook()} disabled={!spreadsheetChanges.some((change) => change.approved)}><Download size={12} /> 編集済みExcelを保存</button></div>
-                {settings.provider === 'codex-app-server' && <p className="workbook-provider-note">Codex App Serverはページ画像の確認に対応します。Excelセルを読む・書くToolはOpenAI / Azure / OpenAI互換APIのAgent実行で利用できます。</p>}
+              <div className="agent-mode-picker" data-testid="agent-mode-picker">
+                <div className="agent-mode-heading"><span>実行モード</span><span className="agent-mode-hint">タスクに合った動作を選択</span></div>
+                <div className="agent-mode-grid" role="group" aria-label="Agent mode">
+                  {AGENT_MODES.map((mode) => <button key={mode.id} type="button" className={`agent-mode-option${agentMode === mode.id ? ' is-selected' : ''}`} aria-pressed={agentMode === mode.id} onClick={() => { setAgentMode(mode.id); invalidateTaskPlan(); setAgentContinuation(null); setAgentStatus('ready'); setSaved(false); }}><strong>{mode.label}</strong><span>{mode.description}</span></button>)}
+                </div>
+              </div>
+              <section ref={agentOverviewRef} className={`agent-overview is-${visibleAgentStatus}`} aria-label="Agentの進行状況" aria-live="polite" tabIndex={-1}>
+                <div className="agent-overview-header">
+                  <div className="agent-overview-file">
+                    <span className="agent-overview-file-icon">{fileTypeKey === 'xlsx' ? <FileSpreadsheet size={17} /> : <FileText size={17} />}</span>
+                    <div><span className="agent-overview-label">対象ファイル</span><strong title={documentData?.fileName}>{documentData?.fileName ?? '文書を読み込み中'}</strong><small>{fileTypeName} · {documentCountLabel} · {selectedAgentModeLabel} · {selectedModelLabel}</small></div>
+                  </div>
+                  <span className={`agent-status-pill is-${visibleAgentStatus}`}>{agentStatusLabel(visibleAgentStatus)}</span>
+                </div>
+                <div className="agent-overview-current">
+                  <span className="agent-overview-label">現在の作業</span>
+                  <strong>{currentAgentAction}</strong>
+                </div>
+                <div className="agent-overview-progress">
+                  <div className="agent-overview-progress-heading"><span>{fileTypeKey === 'xlsx' ? 'ワークブックの状態' : '文書の進行状況'}</span><strong>{statusProgressLabel}</strong></div>
+                  {fileTypeKey !== 'xlsx' && <div className="agent-overview-progress-track"><span style={{ width: `${statusProgressPercent}%` }} /></div>}
+                </div>
+                <div className="agent-overview-next"><span>次の操作</span><p>{nextAgentAction}</p></div>
+                {pendingReviewCount === 0 && <div className="agent-overview-actions">
+                  <button className="button button-primary ai-run-button" type="button" onClick={() => void analyzeDocument('all')} disabled={working || uploading || !documentData || !prompt.trim() || Boolean(agentContinuation)}>
+                    {working ? <LoaderCircle className="spin" size={16} /> : <Sparkles size={16} />}{fullRunButtonLabel}
+                  </button>
+                  {fileTypeKey !== 'xlsx' && <button className="button button-secondary page-run-button" type="button" onClick={() => void analyzeDocument('current')} disabled={working || uploading || !currentPage || agentMode === 'autopilot' || Boolean(agentContinuation)}>
+                    {currentRunButtonLabel}
+                  </button>}
+                  {workspaceProject && <button className="button button-secondary workspace-run-button" type="button" onClick={() => void runWorkspaceBatch()} disabled={working || uploading || batchProgress?.status === 'running' || !workspaceProject.connected || !workspaceProject.documents.some((item) => item.selected)}><FolderTree size={14} /> 選択した {workspaceProject.documents.filter((item) => item.selected).length} 文書を一括実行</button>}
+                </div>}
+              </section>
+              {pendingReviewCount > 0 && <section className="agent-review-preview" aria-label="確認待ちの概要">
+                <div className="agent-review-preview-heading"><ShieldAlert size={16} /><strong>確認待ち</strong><span>{pendingReviewCount}件</span><button type="button" onClick={scrollToPendingReview}><ArrowRight size={14} /> 候補を見る</button></div>
+              </section>}
+          {workbookSummary && (![productHuntDemoFeedbackFileName, productHuntDemoChurnFileName].includes(documentData?.fileName ?? '') || spreadsheetChanges.length > 0) && <section ref={workbookPanelRef} className="workbook-panel" aria-label="Excel workbook" tabIndex={-1}>
+                <div className="workbook-panel-heading"><div><strong><FileSpreadsheet size={15} /> Excelワークブック</strong><span>{workbookSummary.sheets.length} シート · {spreadsheetChanges.length} 件のセル変更{pendingSheetChanges.length ? ` · ${pendingSheetChanges.length} 件確認待ち` : ''}</span></div></div>
+                {settings.provider === 'codex-app-server' && <p className="workbook-provider-note">Codex App Serverは有界のセル範囲を読み、変更案をサーバー側Adapterに渡します。Suggestではすべて確認待ち、Assistでは明確な低・中優先度だけを適用し、高優先度や曖昧な変更は承認待ちにします。Autopilotは根拠が明確なら全優先度を適用して高優先度を報告し、曖昧な変更だけ確認待ちにします。</p>}
                 <div className="workbook-sheet-list">{workbookSummary.sheets.slice(0, 8).map((sheet) => <details className="workbook-sheet" key={sheet.name}>
                   <summary><strong>{sheet.name}</strong><span>{sheet.rowCount} rows · {sheet.columnCount} columns</span></summary>
                   <div className="workbook-table-wrap"><table><thead><tr>{sheet.headers.slice(0, 8).map((header, index) => <th key={`${sheet.name}-head-${index}`}>{header || `Column ${index + 1}`}</th>)}</tr></thead><tbody>{sheet.sampleRows.slice(0, 6).map((row) => <tr key={`${sheet.name}-${row.rowNumber}`}>{row.values.slice(0, 8).map((value, index) => <td key={`${row.rowNumber}-${index}`}>{value === null ? '' : String(value)}</td>)}</tr>)}</tbody></table></div>
@@ -3150,80 +4338,199 @@ function App() {
                 {spreadsheetChanges.length > 0 && <div className="workbook-change-list" aria-label="Agent cell changes">
                   <strong>Agentのセル変更</strong>
                   {spreadsheetChanges.slice(-20).map((change) => {
-                    const currentApproval = Boolean(agentContinuation?.approvalId === change.id && change.requiresReview);
+                    const currentApproval = Boolean(change.requiresReview && !change.approved && !change.rejected && (
+                      (agentContinuation?.approvalId === change.id && Boolean(agentContinuation.approvalRunId))
+                      || (!change.approvalRunId && !agentContinuation?.approvalRunId)
+                    ));
                     const operationLabel = change.operation === 'create_column' ? '列を追加' : change.operation === 'write_cell' ? 'セルを更新' : '範囲を更新';
-                    const proposedValues = change.values.slice(0, 3).map((row) => row.slice(0, 5).map((value) => value === null ? '空' : String(value)).join(' · ')).join(' / ');
+                    const summarizeValue = (value: SpreadsheetValue) => {
+                      if (value === null) return '空';
+                      const text = String(value);
+                      return text.length > 120 ? `${text.slice(0, 120)}…` : text;
+                    };
+                    const proposedValues = change.values.slice(0, 3).map((row) => row.slice(0, 5).map(summarizeValue).join(' · ')).join(' / ');
+                    const proposedCellCount = change.values.reduce((total, row) => total + row.length, 0);
+                    const proposalSummaryTruncated = change.values.length > 3 || change.values.some((row) => row.length > 5);
+                    const contextPreview = workbookContextPreviews[change.id];
+                    const contextStart = contextPreview?.data ? parseExcelCellAddress(contextPreview.data.range.split(':')[0]) : null;
+                    const changeStart = parseExcelCellAddress(change.range.split(':')[0] ?? '');
+                    const changePreviewSheet = workbookSummary.sheets.find((sheet) => sheet.name === change.sheetName);
+                    const changeFirstVisibleRow = changePreviewSheet?.sampleRows[0]?.rowNumber ?? 2;
+                    const changeLastVisibleRow = changePreviewSheet?.sampleRows.at(-1)?.rowNumber ?? 1;
+                    const canJumpToGrid = Boolean(changeStart && changeStart.column <= workbookPreviewColumnLimit && (changeStart.row === 1 || (changeStart.row >= changeFirstVisibleRow && changeStart.row <= changeLastVisibleRow)));
                     return <article className={`workbook-change${change.requiresReview ? ' is-pending' : change.rejected ? ' is-rejected' : change.reviewOutcome === 'approved' ? ' is-approved' : ' is-applied'}`} key={change.id}>
                       <div><strong>{change.sheetName}!{change.range}</strong><span>{spreadsheetChangeStatusLabel(change)}</span></div>
-                      <p>{operationLabel}: {proposedValues}</p><small>{change.reason}</small>
-                      {currentApproval && <div className="workbook-change-actions"><button className="candidate-add" type="button" disabled={working} onClick={() => decideSpreadsheetChange(change, true)}><Check size={13} /> 承認して続行</button><button className="candidate-reject" type="button" disabled={working} onClick={() => decideSpreadsheetChange(change, false)}>却下</button></div>}
+                      <p>{operationLabel}: {proposedValues}{proposalSummaryTruncated ? ' …' : ''}</p><small>{change.reason}</small>
+                      {proposalSummaryTruncated && <small className="workbook-change-truncation">提案は{proposedCellCount}セルです。変更範囲プレビューで全体を確認できます。</small>}
+                      <div className="workbook-change-navigation">
+                        {canJumpToGrid && <button className="workbook-grid-jump" type="button" onClick={() => showWorkbookChangeInGrid(change)}><ArrowRight size={13} />表で位置を見る</button>}
+                        <button className="workbook-context-toggle" type="button" disabled={contextPreview?.loading} onClick={() => void loadWorkbookChangeContext(change)}>
+                          {contextPreview?.loading ? <LoaderCircle className="spin" size={13} /> : <Search size={13} />}{contextPreview?.data ? '変更前と提案を再表示' : contextPreview?.error ? 'もう一度読み込む' : '変更前と提案を表示'}
+                        </button>
+                      </div>
+                      {contextPreview?.loading && <div className="workbook-context-loading" role="status"><LoaderCircle className="spin" size={13} /> セルの値を読み込んでいます</div>}
+                      {contextPreview?.error && <p className="workbook-context-error" role="alert">{contextPreview.error}</p>}
+                      {contextPreview?.data && contextStart && <div className="workbook-context-preview">
+                        <strong>{contextPreview.data.viewMode === 'range'
+                          ? `元ファイルの変更範囲 · ${contextPreview.data.targetRange}（${contextPreview.data.targetCellCount}セル）`
+                          : `元ファイルの周辺セル · ${contextPreview.data.range}`}</strong>
+                        {contextPreview.data.viewMode === 'range' && <div className="workbook-context-pages" aria-label="変更範囲のページ切り替え">
+                          <span>{contextPreview.data.range} · {contextPreview.data.pageIndex + 1} / {contextPreview.data.pageCount} · {contextPreview.data.targetCellCount}セル</span>
+                          <div><button type="button" disabled={contextPreview.loading || contextPreview.data.pageIndex <= 0} onClick={() => void loadWorkbookChangeContext(change, contextPreview.data!.pageIndex - 1)}>前へ</button>
+                          <button type="button" disabled={contextPreview.loading || contextPreview.data.pageIndex + 1 >= contextPreview.data.pageCount} onClick={() => void loadWorkbookChangeContext(change, contextPreview.data!.pageIndex + 1)}>次へ</button></div>
+                        </div>}
+                        <div className="workbook-context-table-wrap" role="region" aria-label={`${change.sheetName} ${contextPreview.data.range} のセル内容`} tabIndex={0}>
+                          <table><caption className="visually-hidden">{change.sheetName} の変更対象付近にあるセルの現在値</caption>
+                            <thead><tr><th scope="col">行</th>{contextPreview.data.rows[0]?.map((cell, index) => {
+                              const address = parseExcelCellAddress(cell.address);
+                              const column = address?.column ?? contextStart.column + index;
+                              return <th key={cell.address} scope="col"><strong>{excelColumnLetters(column)}</strong></th>;
+                            })}</tr></thead>
+                            <tbody>{contextPreview.data.rows.map((row, rowIndex) => {
+                              const firstAddress = parseExcelCellAddress(row[0]?.address ?? '');
+                              const rowNumber = firstAddress?.row ?? contextStart.row + rowIndex;
+                              return <tr key={`${change.id}-${rowNumber}`}><th scope="row">{rowNumber}</th>{row.map((cell) => {
+                                const address = parseExcelCellAddress(cell.address);
+                                const match = address ? spreadsheetChangeAtCell([change], change.sheetName, rowNumber, address.column) : null;
+                                const proposedText = match?.proposedValue === null ? '空欄' : match?.proposedValue === undefined ? '' : String(match.proposedValue);
+                                const valueText = cell.value === null ? '空欄' : String(cell.value);
+                                return <td className={match ? 'is-target' : ''} key={cell.address} title={`${cell.address}: ${valueText}${match ? ` · 提案 ${proposedText}` : ''}`}>
+                                  <span>{cell.value === null || cell.value === '' ? <span className="workbook-empty-cell">—</span> : String(cell.value)}</span>
+                                  {match && match.proposedValue !== undefined && <small>提案: {proposedText}</small>}
+                                  {cell.truncated && <small className="workbook-context-truncated">一部省略</small>}
+                                </td>;
+                              })}</tr>;
+                            })}</tbody>
+                          </table>
+                        </div>
+                        <small className="workbook-context-disclosure">元ファイルから読み込んだ値です。列記号で表示し、見出し行は推測しません。Agentには送信しません。{contextPreview.data.viewMode === 'range' ? '範囲を切り替えて提案全体を確認してください。' : ''}長いセルは300文字で省略します。</small>
+                      </div>}
+                      {currentApproval && <div className="workbook-change-actions"><button className="candidate-add" type="button" disabled={working} onClick={() => void decideSpreadsheetChange(change, true)}><Check size={13} />{change.approvalRunId ? '承認して続行' : '承認して反映'}</button><button className="candidate-reject" type="button" disabled={working} onClick={() => void decideSpreadsheetChange(change, false)}>却下</button></div>}
                     </article>;
                   })}
                 </div>}
               </section>}
-              <div className="agent-mode-picker">
-                <div className="agent-mode-heading"><span>Agent mode</span><span className={`agent-status-pill is-${agentStatus}`}>{agentStatus === 'ready' ? 'Ready' : agentStatus === 'running' ? 'Working' : agentStatus === 'waiting' ? 'Review needed' : agentStatus === 'error' ? 'Stopped' : 'Complete'}</span></div>
-                <div className="agent-mode-grid" role="group" aria-label="Agent mode">
-                  {AGENT_MODES.map((mode) => <button key={mode.id} type="button" className={`agent-mode-option${agentMode === mode.id ? ' is-selected' : ''}`} aria-pressed={agentMode === mode.id} onClick={() => { setAgentMode(mode.id); invalidateTaskPlan(); setAgentContinuation(null); setAgentStatus('ready'); setSaved(false); }}><strong>{mode.label}</strong><span>{mode.description}</span></button>)}
-                </div>
+              {pendingAnnotationOperations.length > 0 && <section className="annotation-operation-list" aria-label="Agent proposed annotation changes">
+                <div className="section-heading"><div><h3>既存注釈への変更</h3><span>{pendingAnnotationOperations.length} 件が確認待ち</span></div></div>
+                {pendingAnnotationOperations.map((operation) => {
+                  const canDecide = operation.status === 'needs_review'
+                    && Boolean(agentContinuation?.approvalRunId)
+                    && agentContinuation?.approvalId === operation.approvalId;
+                  const statusLabel = operation.status === 'needs_review' ? '承認待ち' : operation.status === 'approved' ? '承認済み' : '却下';
+                  return <article className={`candidate-card annotation-operation-card${operation.status === 'needs_review' ? ' is-pending' : ''}`} key={operation.id} style={{ '--annotation-color': '#9275d3' } as CSSProperties}>
+                    <div className="candidate-top"><span className="candidate-color" /><span className="candidate-label">{operation.operation === 'update' ? '注釈の変更' : '注釈の削除'}</span><span className="review-priority-badge">{statusLabel}</span><button type="button" className="candidate-page" onClick={() => goToPage(operation.pageNumber)}>P.{operation.pageNumber}</button></div>
+                    <p>{operation.existingLabel}{operation.operation === 'update' ? ` → ${operation.proposedLabel ?? operation.existingLabel}` : ' を削除'}</p>
+                    {operation.operation === 'update' && operation.proposedNote !== operation.existingNote && <p>{operation.existingNote} → {operation.proposedNote}</p>}
+                    <div className="candidate-reason"><strong>理由</strong> {operation.reason}</div>
+                    {canDecide && <div className="candidate-actions"><button type="button" className="candidate-add" disabled={working} onClick={() => decideAnnotationOperation(operation, true)}><Check size={14} /> 承認して続行</button><button type="button" className="candidate-reject" disabled={working} onClick={() => decideAnnotationOperation(operation, false)}>却下</button></div>}
+                  </article>;
+                })}
+              </section>}
+              {(candidates.length > 0 || Boolean(agentContinuation)) && <div className="candidate-section has-review" ref={candidateSectionRef}>
+                <div className="section-heading"><div><h3>人の確認が必要</h3><span>{candidates.length} 件</span></div></div>
+                {agentContinuation && <div className="continuation-note"><ShieldAlert size={14} /><span>ページ {agentContinuation.blockedPage} の判断を待っています。確認すると、同じAgent Runの作業を再開します。</span></div>}
+                {aiMode === 'demo' && <div className="demo-note">デモ候補です。実モデルの解析結果ではありません。</div>}
+                {candidates.length ? (
+                  <div className="candidate-list">
+                    {candidates.map((candidate) => (
+                      <article className="candidate-card" key={candidate.id} style={{ '--annotation-color': candidate.color } as CSSProperties}>
+                        <div className="candidate-top"><span className="candidate-color" /><span className="candidate-label">{candidate.label}</span><span className="review-priority-badge">確認優先度 {reviewPriorityLabel(candidate.reviewPriority, true)}</span><button type="button" className="candidate-page" onClick={() => goToPage(candidate.pageNumber)}>P.{candidate.pageNumber}</button></div>
+                        <p>{candidate.note}</p>
+                        {candidate.reason && <div className="candidate-reason"><strong>理由</strong> {candidate.reason}</div>}
+                        {candidate.excerpt && <blockquote className="candidate-excerpt">「{candidate.excerpt}」</blockquote>}
+                        <details className="candidate-correction-editor">
+                          <summary>修正内容を編集</summary>
+                          <label>修正ラベル<input value={candidateCorrections[candidate.id]?.label ?? candidate.label} onChange={(event) => updateCandidateCorrection(candidate.id, { label: event.target.value, note: candidateCorrections[candidate.id]?.note ?? candidate.note })} maxLength={60} /></label>
+                          <label>修正メモ<textarea value={candidateCorrections[candidate.id]?.note ?? candidate.note} onChange={(event) => updateCandidateCorrection(candidate.id, { label: candidateCorrections[candidate.id]?.label ?? candidate.label, note: event.target.value })} maxLength={500} /></label>
+                          <label>修正の適用範囲<select value={candidateCorrectionScopes[candidate.id] ?? 'item'} onChange={(event) => setCandidateCorrectionScopes((items) => ({ ...items, [candidate.id]: event.target.value as HumanDecisionScope }))}><option value="item">この候補だけ（初期設定）</option><option value="remaining_pages" disabled={!agentContinuation?.remainingPages.length}>残りのページにも適用するルール</option></select></label>
+                          <small>{agentContinuation?.remainingPages.length ? 'この候補だけの修正は別ページへ適用しません。ルールにすると、適用開始ページと版番号を履歴に保存します。' : '残りのページはありません。修正はこの候補だけに適用します。'}</small>
+                          {renderCorrectionRuleControls(candidate)}
+                          <button type="button" className="candidate-add" disabled={working} onClick={() => correctCandidate(candidate)}><Check size={14} /> 変更を反映して続行</button>
+                        </details>
+                        <div className="candidate-actions"><button type="button" className="candidate-add" onClick={() => addCandidate(candidate)}><Check size={14} /> 確認して追加</button><button type="button" className="candidate-edit" onClick={(event) => { const details = event.currentTarget.closest('.candidate-card')?.querySelector<HTMLDetailsElement>('.candidate-correction-editor'); if (details) { details.open = true; details.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); details.querySelector<HTMLInputElement>('input')?.focus({ preventScroll: true }); } }}><Pencil size={13} /> 修正</button><button type="button" className="candidate-reject" onClick={() => rejectCandidate(candidate)}>却下</button></div>
+                      </article>
+                    ))}
+                  </div>
+                ) : null}
+              </div>}
+              <div className="task-preset-control">
+                <label className="field-label" htmlFor="task-preset">タスクの例</label>
+                <div className="model-select-wrap"><select id="task-preset" value={taskPresetId} onChange={(event) => {
+                  const preset = TASK_PRESETS.find((item) => item.id === event.target.value);
+                  setTaskPresetId(event.target.value);
+                  if (preset) { setPrompt(preset.prompt); setGuidelines(preset.guidelines); invalidateTaskPlan(); setRejectedCandidates([]); setAgentContinuation(null); setAgentStatus('ready'); setSaved(false); }
+                }}><option value="">例を選択…</option>{TASK_PRESETS.map((preset) => <option key={preset.id} value={preset.id}>{preset.label}</option>)}</select><ChevronDown size={15} /></div>
+                <small>選ぶと指示とガイドラインを入力できます。内容は実行前に編集できます。</small>
               </div>
-              <label className="field-label" htmlFor="task-preset">タスク例</label>
-              <div className="model-select-wrap"><select id="task-preset" value={taskPresetId} onChange={(event) => {
-                const preset = TASK_PRESETS.find((item) => item.id === event.target.value);
-                setTaskPresetId(event.target.value);
-                if (preset) { setPrompt(preset.prompt); setGuidelines(preset.guidelines); invalidateTaskPlan(); setRejectedCandidates([]); setAgentContinuation(null); setAgentStatus('ready'); setSaved(false); }
-              }}><option value="">タスク例を選択…</option>{TASK_PRESETS.map((preset) => <option key={preset.id} value={preset.id}>{preset.label}</option>)}</select><ChevronDown size={15} /></div>
-              <label className="field-label" htmlFor="model-choice">使用モデル</label>
-              <div className="model-select-wrap"><select id="model-choice" value={settings.model} onChange={(event) => changeSettings({ model: event.target.value as ModelId })}>{modelCatalog.map((modelItem) => {
-                const available = settings.provider !== 'codex-app-server' || !codexModels.length || codexModels.some((item) => item.id === modelItem.id || item.model === modelItem.id);
-                return <option key={modelItem.id} value={modelItem.id} disabled={!available}>{modelItem.label}{available ? '' : '（Codex未検出）'}</option>;
-              })}</select><ChevronDown size={15} /></div>
-              <div className="reasoning-readout"><span>推論レベル <strong>{settings.reasoningEffort}</strong></span><button type="button" onClick={() => setSettingsOpen(true)}>変更</button></div>
-              <label className="field-label prompt-label" htmlFor="ai-prompt">抽出の指示</label>
+              <details className="agent-settings-details">
+                <summary><span>タスクとモデル設定</span><small>{selectedModelLabel}</small><ChevronDown className="agent-settings-chevron" size={15} /></summary>
+                <div className="agent-settings-body">
+                  <div className="agent-control-grid agent-model-grid">
+                    <div><label className="field-label" htmlFor="model-choice">使用モデル</label>
+                      <div className="model-select-wrap"><select id="model-choice" value={settings.model} onChange={(event) => changeSettings({ model: event.target.value as ModelId })}>{modelCatalog.map((modelItem) => {
+                        const available = settings.provider !== 'codex-app-server' || !codexModels.length || codexModels.some((item) => item.id === modelItem.id || item.model === modelItem.id);
+                        return <option key={modelItem.id} value={modelItem.id} disabled={!available}>{modelItem.label}{available ? '' : '（Codex未検出）'}</option>;
+                      })}</select><ChevronDown size={15} /></div>
+                    </div>
+                  </div>
+                  <div className="reasoning-readout"><span>推論レベル <strong>{settings.reasoningEffort}</strong></span><button type="button" onClick={() => setSettingsOpen(true)}>変更</button></div>
+                </div>
+              </details>
+              <label className="field-label prompt-label" htmlFor="ai-prompt">Agentへの指示</label>
               <textarea id="ai-prompt" className="prompt-input" value={prompt} onChange={(event) => { setPrompt(event.target.value); invalidateTaskPlan(); setRejectedCandidates([]); setAgentContinuation(null); setAgentStatus('ready'); setSaved(false); }} maxLength={2000} placeholder="例：安全上の警告、締結トルクの値を探してください" />
-              <div className="prompt-meta"><span>{documentData?.fileType.toLowerCase() === 'xlsx' ? `${workbookSummary?.sheets.length ?? 0}シートを読込み · Agentは表の意味を調べてセルを分類` : aiConfiguredForSession && settings.provider !== 'codex-app-server' ? `${documentData?.pageCount ?? 0}ページ · Agentが検索結果から文書内を移動して確認` : `${documentData?.pageCount ?? 0}ページを順に解析 · 1ページごとにAPIを実行`}</span><span>{prompt.length} / 2000</span></div>
-              <label className="field-label prompt-label" htmlFor="annotation-guidelines">アノテーションガイドライン</label>
-              <textarea id="annotation-guidelines" className="guideline-input" value={guidelines} onChange={(event) => { setGuidelines(event.target.value); invalidateTaskPlan(); setRejectedCandidates([]); setAgentContinuation(null); setAgentStatus('ready'); setSaved(false); }} maxLength={4000} placeholder="ラベルの定義、判断基準、例外を入力" />
+              <div className="prompt-meta"><span>{fileTypeKey === 'xlsx' ? `${workbookSummary?.sheets.length ?? 0}シート · 表の意味を確認してセルを分類` : agentMode === 'observe' ? `${documentCountLabel} · 読み取りのみ。注釈は変更しません` : agentMode === 'suggest' ? `${documentCountLabel} · 候補を提示して人が確認` : agentMode === 'autopilot' ? `${documentCountLabel} · 高優先度は報告し、曖昧な箇所だけ確認` : `${documentCountLabel} · 明確な箇所を注釈し、あいまいなら確認`}</span><span>{prompt.length} / 2000</span></div>
+              <details className="guideline-details">
+                <summary><span>ガイドラインと読み込み</span><small>{guidelines.length}文字 · 任意</small><ChevronDown className="guideline-details-chevron" size={15} /></summary>
+                <div className="guideline-details-body">
+                  <label className="field-label" htmlFor="annotation-guidelines">判断基準・例外・例</label>
+                  <textarea id="annotation-guidelines" className="guideline-input" value={guidelines} onChange={(event) => { setGuidelines(event.target.value); invalidateTaskPlan(); setRejectedCandidates([]); setAgentContinuation(null); setAgentStatus('ready'); setSaved(false); }} maxLength={4000} placeholder="ラベルの定義、判断基準、例外を入力" />
+                  <input ref={guidelineFileInputRef} className="visually-hidden" type="file" accept=".pdf,.docx,.pptx,.xlsx" onChange={(event) => void onGuidelineFileSelected(event.target.files?.[0])} />
+                  <button className="button button-secondary guideline-import-button" type="button" onClick={() => guidelineFileInputRef.current?.click()} disabled={guidelineImporting || working || batchProgress?.status === 'running'}>
+                    {guidelineImporting ? <LoaderCircle className="spin" size={14} /> : <Upload size={14} />}{guidelineImporting ? 'ガイドラインを読込中…' : 'PDF / Officeから読み込む'}
+                  </button>
+                </div>
+              </details>
               <div className="task-plan-actions">
-                <input ref={guidelineFileInputRef} className="visually-hidden" type="file" accept=".pdf,.docx,.pptx,.xlsx" onChange={(event) => void onGuidelineFileSelected(event.target.files?.[0])} />
-                <button className="button button-secondary guideline-import-button" type="button" onClick={() => guidelineFileInputRef.current?.click()} disabled={guidelineImporting || working || batchProgress?.status === 'running'}>
-                  {guidelineImporting ? <LoaderCircle className="spin" size={13} /> : <Upload size={13} />}{guidelineImporting ? 'ガイドラインを読込中…' : 'ガイドライン文書を読み込む'}
-                </button>
                 <button className="button button-secondary task-plan-button" type="button" onClick={() => void prepareTaskPlan(prompt, guidelines, correction, agentMode)} disabled={!prompt.trim() || taskPlanLoading || working || batchProgress?.status === 'running'}>
-                  {taskPlanLoading ? <LoaderCircle className="spin" size={13} /> : <Sparkles size={13} />}{taskPlanLoading ? '指示を整理中…' : '指示をTaskに整理'}
+                  {taskPlanLoading ? <LoaderCircle className="spin" size={14} /> : <Sparkles size={14} />}{taskPlanLoading ? '指示を整理中…' : 'AI向けの作業仕様を確認'}
                 </button>
               </div>
               {taskPlan && <section className="task-plan-card" aria-label="Annotation Task Plan" aria-live="polite">
-                <div className="task-plan-heading"><strong>Annotation Task</strong><span className={`task-plan-source is-${taskPlan.source}`}>{taskPlan.source === 'model' ? 'AIで整理' : 'ローカル下書き'}</span></div>
+                <div className="task-plan-heading"><div><strong>Annotation Task</strong><span className={`task-plan-source is-${taskPlan.source}`}>{taskPlan.manualEdits ? '人が編集' : taskPlan.source === 'model' ? 'AIで整理' : 'ローカル下書き'}</span></div><button className="task-plan-edit-toggle" type="button" aria-expanded={taskPlanEditorOpen} onClick={() => setTaskPlanEditorOpen((open) => !open)}>{taskPlanEditorOpen ? '編集を閉じる' : 'ラベルと条件を編集'}</button></div>
                 <h3>{taskPlan.plan.title}</h3>
                 <p>{taskPlan.plan.objective}</p>
                 <div className="task-plan-labels">{taskPlan.plan.labels.map((label) => <span key={label.name}><strong>{label.name}</strong>{label.description}</span>)}</div>
                 <p><strong>操作:</strong> {taskPlan.plan.actions.join(' · ')}</p>
+                <p className="task-plan-evidence"><strong>根拠:</strong> 画面上の正確な抜粋とページ・セル位置を記録します。数値は単位を保ち、文書にない情報は推測しません。</p>
                 <p><strong>曖昧な場合:</strong> {taskPlan.plan.uncertaintyPolicy}</p>
                 <ol>{taskPlan.plan.workflow.map((step, index) => <li key={`${index}-${step}`}>{step}</li>)}</ol>
+                {taskPlan.source === 'local' && <small className="task-plan-disclosure">ローカル規則による下書きです。AIモデルの解釈ではないため、ラベルと条件を確認してください。</small>}
+                {taskPlanEditorOpen && <div className="task-plan-editor" aria-label="作業仕様の編集">
+                  <label>目的<textarea value={taskPlan.plan.objective} maxLength={500} onChange={(event) => updateTaskPlanDraft((plan) => ({ ...plan, objective: event.target.value }))} /></label>
+                  <fieldset className="task-plan-label-editor-list"><legend>出力ラベルと判定条件</legend>
+                    {taskPlan.plan.labels.map((label, index) => <div className="task-plan-label-editor" key={`${index}-${label.name}`}>
+                      <label>ラベル<input value={label.name} maxLength={60} onChange={(event) => updateTaskPlanDraft((plan) => ({ ...plan, labels: plan.labels.map((item, itemIndex) => itemIndex === index ? { ...item, name: event.target.value } : item) }))} /></label>
+                      <label>定義<textarea value={label.description} maxLength={240} onChange={(event) => updateTaskPlanDraft((plan) => ({ ...plan, labels: plan.labels.map((item, itemIndex) => itemIndex === index ? { ...item, description: event.target.value } : item) }))} /></label>
+                    </div>)}
+                  </fieldset>
+                  <label>曖昧な場合の扱い<textarea value={taskPlan.plan.uncertaintyPolicy} maxLength={400} onChange={(event) => updateTaskPlanDraft((plan) => ({ ...plan, uncertaintyPolicy: event.target.value }))} /></label>
+                </div>}
               </section>}
-              <button className="button button-primary ai-run-button" type="button" onClick={() => void analyzeDocument('all')} disabled={working || uploading || !documentData || Boolean(agentContinuation)}>
-                {working ? <LoaderCircle className="spin" size={16} /> : <Sparkles size={16} />}{working ? 'Agentが作業中…' : agentMode === 'observe' ? '文書を読み取る' : agentMode === 'suggest' ? '候補を提案' : agentMode === 'autopilot' ? 'Autopilotを開始' : 'Assistで全ページを実行'}
-              </button>
-              <button className="button button-secondary page-run-button" type="button" onClick={() => void analyzeDocument('current')} disabled={working || uploading || !currentPage || agentMode === 'autopilot' || Boolean(agentContinuation)}>
-                {working ? 'Agentが作業中…' : `現在のページ（${pageNumber}）だけ実行`}
-              </button>
-              {workspaceProject && <button className="button button-secondary workspace-run-button" type="button" onClick={() => void runWorkspaceBatch()} disabled={working || uploading || batchProgress?.status === 'running' || !workspaceProject.connected || !workspaceProject.documents.some((item) => item.selected)}><FolderTree size={14} /> プロジェクトの選択文書を一括実行（{workspaceProject.documents.filter((item) => item.selected).length}件）</button>}
               {batchProgress && <div className="scan-progress workspace-progress" role="status"><div className="progress-copy"><span>{batchProgress.status === 'running' ? `${batchProgress.fileName} を処理中` : batchProgress.status === 'stopped' ? '一括実行を停止しました' : 'プロジェクトを処理しました'}</span><span>{batchProgress.current} / {batchProgress.total}</span></div><div className="progress-track"><span style={{ width: `${Math.round(batchProgress.current / Math.max(1, batchProgress.total) * 100)}%` }} /></div>{batchProgress.status === 'running' && <button className="workspace-stop-button" type="button" onClick={stopWorkspaceBatch}><StopCircle size={13} /> 現在の文書後に停止</button>}</div>}
               {scanProgress && <div className="scan-progress" role="status"><div className="progress-copy"><span>{scanProgress.scope === 'all' ? '文書全体を解析中' : 'ページを解析中'}</span><span>{scanProgress.current} / {scanProgress.total}</span></div><div className="progress-track"><span style={{ width: `${Math.round(scanProgress.current / scanProgress.total * 100)}%` }} /></div></div>}
               {exportProgress && <div className="scan-progress" role="status"><div className="progress-copy"><span>PDFを書き出し中</span><span>{exportProgress.current} / {exportProgress.total}</span></div><div className="progress-track"><span style={{ width: `${Math.round(exportProgress.current / exportProgress.total * 100)}%` }} /></div></div>}
-              <section className="agent-activity-panel" ref={activityPanelRef} aria-label="Agent Activity" aria-live="polite">
-                <div className="agent-activity-heading"><div><span className="activity-kicker">LIVE RUN</span><h3>Agent Activity</h3></div><span className={`agent-status-pill is-${agentStatus}`}>{agentStatus === 'ready' ? 'Ready' : agentStatus === 'running' ? 'Working' : agentStatus === 'waiting' ? 'Waiting' : agentStatus === 'error' ? 'Stopped' : 'Complete'}</span></div>
+              <section ref={agentActivityPanelRef} className="agent-activity-panel" aria-label="Agent Activity" aria-live="polite">
+                <div className="agent-activity-heading"><div><span className="activity-kicker">作業ログ</span><h3>Agentの作業ログ</h3></div><span className={`agent-status-pill is-${visibleAgentStatus}`}>{agentStatusLabel(visibleAgentStatus)}</span></div>
                 {agentActivity.length ? (
                   <ol className="agent-activity-list" ref={activityLogRef}>
-                    {agentActivity.slice(-24).map((event) => (
+                {agentActivity.slice(-48).map((event) => (
                       <li key={event.id} className={`agent-activity-entry is-${event.status}`}>
                         <span className="activity-marker">{event.status === 'active' ? <LoaderCircle className="spin" size={12} /> : event.status === 'waiting' ? <ShieldAlert size={12} /> : event.status === 'error' ? <X size={12} /> : <Check size={12} />}</span>
-                        <div className="activity-copy"><div><strong>{event.phase}</strong><span>{event.pageNumber ? `P.${event.pageNumber}` : ''}</span></div><p>{event.detail}</p></div>
+                        <div className="activity-copy"><div><strong>{AGENT_PHASE_LABELS[event.phase]}</strong><span>{event.pageNumber ? `${navigationUnit} ${event.pageNumber}` : ''}</span></div><p>{event.detail}</p></div>
                       </li>
                     ))}
                   </ol>
-                ) : <p className="agent-activity-empty">Planning → Navigating → Reading → Searching → Annotating → Reviewing → Asking → Exporting</p>}
+                ) : <p className="agent-activity-empty">タスクを実行すると、計画・ページ移動・読み取り・検索・注釈・人の確認が時系列で表示されます。</p>}
                 {agentRunHistory.length > 0 && (
                   <details className="correction-details run-history-details">
                     <summary>過去の作業履歴（{agentRunHistory.length}件）・この端末に自動保存</summary>
@@ -3255,8 +4562,10 @@ function App() {
                             <div className="run-page-coverage-heading"><strong>ページ確認範囲</strong><span>{(run.pageCoverage ?? []).filter((item) => item.status === 'checked').length}/{run.pageCoverageTargets?.length ?? run.totalPages} テキスト確認</span></div>
                             <p className="run-page-coverage-summary">
                               該当なし {(run.pageCoverage ?? []).filter((item) => item.status === 'checked' && item.findingCount === 0 && item.reviewCount === 0).length}ページ
-                              {(run.pageCoverage ?? []).some((item) => item.warningCount > 0) ? ` · 変換警告 ${(run.pageCoverage ?? []).filter((item) => item.warningCount > 0).length}ページ` : ''}
-                              {(run.pageCoverage ?? []).some((item) => item.status === 'image_only') ? ` · 画像のみ ${(run.pageCoverage ?? []).filter((item) => item.status === 'image_only').length}ページ` : ''}
+                              {(run.pageCoverage ?? []).some((item) => item.warningCount > 0 && !item.warningAcknowledged) ? ` · 未確認の変換警告 ${(run.pageCoverage ?? []).filter((item) => item.warningCount > 0 && !item.warningAcknowledged).length}ページ` : ''}
+                              {(run.pageCoverage ?? []).some((item) => item.warningCount > 0 && item.warningAcknowledged) ? ` · 変換警告を人が確認済み ${(run.pageCoverage ?? []).filter((item) => item.warningCount > 0 && item.warningAcknowledged).length}ページ` : ''}
+                              {(run.pageCoverage ?? []).some((item) => item.status === 'image_only' && !item.humanReviewed) ? ` · 画像のみ・人の確認待ち ${(run.pageCoverage ?? []).filter((item) => item.status === 'image_only' && !item.humanReviewed).length}ページ` : ''}
+                              {(run.pageCoverage ?? []).some((item) => item.status === 'image_only' && item.humanReviewed) ? ` · 画像のみ・人が確認済み ${(run.pageCoverage ?? []).filter((item) => item.status === 'image_only' && item.humanReviewed).length}ページ` : ''}
                               {(run.pageCoverage ?? []).some((item) => item.status === 'failed') ? ` · 失敗 ${(run.pageCoverage ?? []).filter((item) => item.status === 'failed').length}ページ` : ''}
                             </p>
                             <ol className="run-page-coverage-list">
@@ -3265,6 +4574,16 @@ function App() {
                                 <span className="run-page-coverage-status">{PAGE_COVERAGE_LABELS[coverage.status]}</span>
                                 <span className="run-page-coverage-counts">{coverage.findingCount}件該当{coverage.reviewCount ? ` · ${coverage.reviewCount}件確認待ち` : ''}{coverage.warningCount ? ` · 警告${coverage.warningCount}` : ''}{coverage.textBlockCount !== undefined ? ` · テキスト${coverage.textBlockCount}ブロック` : ''}</span>
                                 {coverage.detail && <small>{coverage.detail}</small>}
+                                {coverage.humanReviewed && <small>ページ画像を人が確認済みとして記録しました。</small>}
+                                {coverage.warningAcknowledged && <small>変換警告を人が確認済みとして記録しました。</small>}
+                                {run.status === 'waiting' && run.fileName === documentData?.fileName && run.sourceHash === documentData?.sourceHash
+                                  && ((coverage.status === 'image_only' && !coverage.humanReviewed)
+                                    || (coverage.status === 'checked' && coverage.warningCount > 0 && !coverage.warningAcknowledged))
+                                  && <button type="button" className="candidate-recheck" disabled={working} onClick={() => acknowledgeRunCoverage(run.id, coverage.pageNumber)}>
+                                    {coverage.status === 'image_only' && !coverage.humanReviewed && coverage.warningCount > 0 && !coverage.warningAcknowledged ? '画像と変換警告を確認済みにする'
+                                      : coverage.status === 'image_only' && !coverage.humanReviewed ? '画像を確認済みにする'
+                                        : '変換警告を確認済みにする'}
+                                  </button>}
                                 {(coverage.status !== 'checked' || coverage.warningCount > 0) && <button type="button" className="candidate-recheck" disabled={working || !documentData} onClick={() => recheckCoveragePage(coverage.pageNumber, run)}>このページを再確認</button>}
                               </li>)}
                             </ol>
@@ -3289,7 +4608,7 @@ function App() {
                             {run.events.map((event) => (
                               <li key={event.id} className={`agent-activity-entry is-${event.status}`}>
                                 <span className="activity-marker">{event.status === 'error' ? <X size={12} /> : event.status === 'waiting' ? <ShieldAlert size={12} /> : <Check size={12} />}</span>
-                                <div className="activity-copy"><div><strong>{event.phase}</strong><span>{event.pageNumber ? `P.${event.pageNumber}` : ''}</span></div><p>{event.detail}</p></div>
+                                <div className="activity-copy"><div><strong>{AGENT_PHASE_LABELS[event.phase]}</strong><span>{event.pageNumber ? `${navigationUnit} ${event.pageNumber}` : ''}</span></div><p>{event.detail}</p></div>
                               </li>
                             ))}
                           </ol>
@@ -3337,19 +4656,27 @@ function App() {
                 </details>}
               </section>}
 
-              {consistencyIssues.length > 0 && <section className="consistency-panel" aria-label="Annotation consistency review">
-                <div className="consistency-heading"><div><span className="activity-kicker">FINAL REVIEW</span><h3>一貫性チェック</h3></div><span>{consistencyIssues.length}件</span></div>
-                <p className="consistency-intro">同じ抜粋、似た表現、根拠の弱い注釈を確認候補にまとめました。類似判定とValidator Agentの指摘は確認ヒントなので、ページの文脈を見てください。</p>
-                {consistencyIssues.slice(0, 12).map((issue) => <article className="consistency-issue" key={issue.id}>
-                  <blockquote>{issue.kind === 'model_review' ? issue.validatorTitle : `${issue.kind === 'same_excerpt' ? '同じ抜粋' : '似た抜粋の候補'}：「${issue.excerpt}」`}</blockquote>
-                  {issue.validatorReason && <p className="consistency-validator-note"><strong>Validator Agent</strong> · {issue.validatorReason}</p>}
-                  {issue.reviewPriority && <span className="consistency-review-priority">確認優先度: {reviewPriorityLabel(issue.reviewPriority)}</span>}
-                  <div className="consistency-occurrences">{issue.occurrences.map((occurrence) => <button type="button" key={`${issue.id}-${occurrence.annotationId}`} onClick={() => goToPage(occurrence.pageNumber)}><span>P.{occurrence.pageNumber} · {occurrence.label}</span>{issue.kind !== 'same_excerpt' && <small>「{occurrence.excerpt}」</small>}</button>)}</div>
-                </article>)}
-                {consistencyIssues.length > 12 && <small className="consistency-overflow">ほか {consistencyIssues.length - 12} 件はActivity履歴で確認できます。</small>}
+              {(consistencyIssues.length > 0 || validatorSnapshot.annotations.length > 0) && <section className="consistency-panel" aria-label="Annotation consistency review">
+                <div className="consistency-heading">
+                  <div><span className="activity-kicker">FINAL REVIEW</span><h3>一貫性チェック</h3></div>
+                  <div className="consistency-heading-actions"><span>{consistencyIssues.length}件</span><button data-testid="rerun-validator" className="consistency-rerun-button" type="button" onClick={() => void reviewCurrentAnnotations()} disabled={working || currentManualValidatorReview?.status === 'running' || !validatorSnapshot.annotations.length || !aiConfiguredForSession}>{currentManualValidatorReview?.status === 'running' ? '再チェック中…' : 'Validator Agentで再チェック'}</button></div>
+                </div>
+                <p className="consistency-intro">既存の注釈と確認候補を読み取り専用で確認します。注釈を編集せず、ページ解析やAnnotatorの実行も行いません。確認候補を開いて文脈を見てください。</p>
+                {!aiConfiguredForSession && <p className="validator-connection-hint">Validator Agentを使うには接続設定でAIプロバイダーを設定してください。</p>}
+                {currentManualValidatorReview && <p className={`validator-run-status is-${currentManualValidatorReview.status}`} data-testid="validator-status" role="status">{currentManualValidatorReview.message}</p>}
+                <div data-testid="validator-findings">
+                  {consistencyIssues.slice(0, 12).map((issue) => <article className="consistency-issue" key={issue.id}>
+                    <blockquote>{issue.kind === 'model_review' ? issue.validatorTitle : `${issue.kind === 'same_excerpt' ? '同じ抜粋' : '似た抜粋の候補'}：「${issue.excerpt}」`}</blockquote>
+                    {issue.validatorReason && <p className="consistency-validator-note"><strong>Validator Agent</strong> · {issue.validatorReason}</p>}
+                    {issue.reviewPriority && <span className="consistency-review-priority">確認優先度: {reviewPriorityLabel(issue.reviewPriority)}</span>}
+                    <div className="consistency-occurrences">{issue.occurrences.map((occurrence) => <button type="button" key={`${issue.id}-${occurrence.annotationId}`} onClick={() => goToPage(occurrence.pageNumber)}><span>P.{occurrence.pageNumber} · {occurrence.label}</span>{issue.kind !== 'same_excerpt' && <small>「{occurrence.excerpt}」</small>}</button>)}</div>
+                  </article>)}
+                  {consistencyIssues.length === 0 && currentManualValidatorReview?.status === 'complete' && <p className="validator-empty-state">確認候補は見つかりませんでした。</p>}
+                  {consistencyIssues.length > 12 && <small className="consistency-overflow">ほか {consistencyIssues.length - 12} 件はActivity履歴で確認できます。</small>}
+                </div>
               </section>}
 
-              {annotationOperations.length > 0 && <section className="annotation-operation-list" aria-label="Agent proposed annotation changes">
+              {pendingReviewCount === 0 && annotationOperations.length > 0 && <section className="annotation-operation-list" aria-label="過去の注釈変更">
                 <div className="section-heading"><div><h3>既存注釈への変更</h3><span>{annotationOperations.filter((operation) => operation.status === 'needs_review').length} 件が確認待ち</span></div></div>
                 {annotationOperations.slice(-12).map((operation) => {
                   const canDecide = operation.status === 'needs_review'
@@ -3366,7 +4693,7 @@ function App() {
                 })}
               </section>}
 
-              <div className="candidate-section" ref={candidateSectionRef}>
+              {pendingReviewCount === 0 && <div className="candidate-section is-empty" ref={candidateSectionRef}>
                 <div className="section-heading"><div><h3>人の確認が必要</h3><span>{candidates.length} 件</span></div></div>
                 {agentContinuation && <div className="continuation-note"><ShieldAlert size={14} /><span>ページ {agentContinuation.blockedPage} の判断を待っています。確認すると、同じAgent Runの作業を再開します。</span></div>}
                 {aiMode === 'demo' && <div className="demo-note">デモ候補です。実モデルの解析結果ではありません。</div>}
@@ -3379,21 +4706,22 @@ function App() {
                         {candidate.reason && <div className="candidate-reason"><strong>理由</strong> {candidate.reason}</div>}
                         {candidate.excerpt && <blockquote className="candidate-excerpt">「{candidate.excerpt}」</blockquote>}
                         <details className="candidate-correction-editor">
-                          <summary>変更して確定</summary>
-                          <label>修正ラベル<input value={candidateCorrections[candidate.id]?.label ?? candidate.label} onChange={(event) => setCandidateCorrections((items) => ({ ...items, [candidate.id]: { label: event.target.value, note: items[candidate.id]?.note ?? candidate.note } }))} maxLength={60} /></label>
-                          <label>修正メモ<textarea value={candidateCorrections[candidate.id]?.note ?? candidate.note} onChange={(event) => setCandidateCorrections((items) => ({ ...items, [candidate.id]: { label: items[candidate.id]?.label ?? candidate.label, note: event.target.value } }))} maxLength={500} /></label>
+                          <summary>修正内容を編集</summary>
+                          <label>修正ラベル<input value={candidateCorrections[candidate.id]?.label ?? candidate.label} onChange={(event) => updateCandidateCorrection(candidate.id, { label: event.target.value, note: candidateCorrections[candidate.id]?.note ?? candidate.note })} maxLength={60} /></label>
+                          <label>修正メモ<textarea value={candidateCorrections[candidate.id]?.note ?? candidate.note} onChange={(event) => updateCandidateCorrection(candidate.id, { label: candidateCorrections[candidate.id]?.label ?? candidate.label, note: event.target.value })} maxLength={500} /></label>
                           <label>修正の適用範囲<select value={candidateCorrectionScopes[candidate.id] ?? 'item'} onChange={(event) => setCandidateCorrectionScopes((items) => ({ ...items, [candidate.id]: event.target.value as HumanDecisionScope }))}><option value="item">この候補だけ（初期設定）</option><option value="remaining_pages" disabled={!agentContinuation?.remainingPages.length}>残りのページにも適用するルール</option></select></label>
                           <small>{agentContinuation?.remainingPages.length ? 'この候補だけの修正は別ページへ適用しません。ルールにすると、適用開始ページと版番号を履歴に保存します。' : '残りのページはありません。修正はこの候補だけに適用します。'}</small>
+                          {renderCorrectionRuleControls(candidate)}
                           <button type="button" className="candidate-add" disabled={working} onClick={() => correctCandidate(candidate)}><Check size={14} /> 変更を反映して続行</button>
                         </details>
-                        <div className="candidate-actions"><button type="button" className="candidate-add" onClick={() => addCandidate(candidate)}><Check size={14} /> 確認して追加</button><button type="button" className="candidate-reject" onClick={() => rejectCandidate(candidate)}>却下</button></div>
+                        <div className="candidate-actions"><button type="button" className="candidate-add" onClick={() => addCandidate(candidate)}><Check size={14} /> 確認して追加</button><button type="button" className="candidate-edit" onClick={(event) => { const details = event.currentTarget.closest('.candidate-card')?.querySelector<HTMLDetailsElement>('.candidate-correction-editor'); if (details) { details.open = true; details.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); details.querySelector<HTMLInputElement>('input')?.focus({ preventScroll: true }); } }}><Pencil size={13} /> 修正</button><button type="button" className="candidate-reject" onClick={() => rejectCandidate(candidate)}>却下</button></div>
                       </article>
                     ))}
                   </div>
                 ) : (
                   <div className="candidate-empty"><div className="candidate-empty-icon"><ScanLine size={16} /></div><p>{documentData?.fileType.toLowerCase() === 'xlsx' && agentContinuation?.approvalId ? '領域注釈の候補はありません。Excelセル変更は上のWorkbook欄で確認できます。' : '全ページの解析後、判断が曖昧な候補だけここに表示します。'}</p></div>
                 )}
-              </div>
+              </div>}
             </div>
           ) : activeTab === 'workspace' ? (
             <div className="panel-content workspace-project-content">
@@ -3455,7 +4783,7 @@ function App() {
                   <input id="annotation-label" className="text-input" value={selectedAnnotation.label} onChange={(event) => updateSelected({ label: event.target.value })} maxLength={60} placeholder="例：安全上の注意" />
                   <label className="field-label" htmlFor="annotation-note">テキスト注釈</label>
                   <textarea id="annotation-note" className="note-input" value={selectedAnnotation.note} onChange={(event) => updateSelected({ note: event.target.value })} maxLength={500} placeholder="この範囲についてのメモや判断理由を記入" />
-                  {(selectedAnnotation.reason || selectedAnnotation.excerpt || selectedAnnotation.reviewPriority) && <div className="annotation-evidence">{selectedAnnotation.source === 'ai' && <strong>レビュー優先度 {reviewPriorityLabel(selectedAnnotation.reviewPriority, selectedAnnotation.requiresReview)}</strong>}{selectedAnnotation.reason && <span>判断理由：{selectedAnnotation.reason}</span>}{selectedAnnotation.excerpt && <span>原文：「{selectedAnnotation.excerpt}」</span>}</div>}
+                  {(selectedAnnotation.reason || selectedAnnotation.excerpt || selectedAnnotation.reviewPriority) && <div className="annotation-evidence">{selectedAnnotation.source !== 'manual' && <strong>{selectedAnnotation.source === 'demo' ? 'デモ分類・確認優先度' : 'レビュー優先度'} {reviewPriorityLabel(selectedAnnotation.reviewPriority, selectedAnnotation.requiresReview)}</strong>}{selectedAnnotation.reason && <span>判断理由：{selectedAnnotation.reason}</span>}{selectedAnnotation.excerpt && <span>原文：「{selectedAnnotation.excerpt}」</span>}</div>}
                   <span className="field-label color-label">ラベルの色</span>
                   <div className="color-picker">{LABEL_COLORS.map((color) => <button key={color.value} type="button" className={`color-swatch${selectedAnnotation.color === color.value ? ' is-selected' : ''}`} style={{ '--swatch-color': color.value } as CSSProperties} aria-label={`${color.name}を選択`} aria-pressed={selectedAnnotation.color === color.value} onClick={() => updateSelected({ color: color.value })} />)}</div>
                   <div className="editor-actions"><button className="button button-primary" type="button" onClick={saveAnnotations}><Check size={15} /> 保存</button><button className="button button-secondary" type="button" onClick={exportSelection}><Download size={15} /> 範囲を抽出</button></div>
@@ -3496,9 +4824,17 @@ function App() {
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowGuide(false); }}>
           <section className="guide-modal" role="dialog" aria-modal="true" aria-labelledby="guide-title">
             <div className="guide-header"><div><span className="eyebrow">ANNOTATION STUDIO</span><h2 id="guide-title">文書の必要な箇所だけを残す</h2></div><button className="icon-button" type="button" aria-label="ガイドを閉じる" onClick={() => setShowGuide(false)}><X size={18} /></button></div>
-            <div className="guide-tabs"><button type="button" className={guideTab === 'workflow' ? 'is-active' : ''} onClick={() => setGuideTab('workflow')}>使い方</button><button type="button" className={guideTab === 'concept' ? 'is-active' : ''} onClick={() => setGuideTab('concept')}>画面イメージ</button></div>
-            <img className="guide-image" src={guideTab === 'workflow' ? '/examples/annotation-workflow-guide-v2.png' : '/examples/annotation-workspace-concept.png'} alt={guideTab === 'workflow' ? '文書読み込み、AIへの指示、候補確認、必要部分抽出の4ステップ' : 'Annotation Studioのデスクトップ画面コンセプト'} />
-            <div className="guide-caption">{guideTab === 'workflow' ? '候補を確認・修正してから保存できます。AIの提案はいつでも人が編集できます。' : 'デザイン検討用のコンセプト画像です。現在の操作画面はこのプレビュー内で動作します。'}</div>
+            <div className="guide-tabs">
+              <button type="button" className={guideTab === 'workflow' ? 'is-active' : ''} onClick={() => setGuideTab('workflow')}>使い方</button>
+              <button type="button" className={guideTab === 'formats' ? 'is-active' : ''} onClick={() => setGuideTab('formats')}>ファイル形式</button>
+              <button type="button" className={guideTab === 'concept' ? 'is-active' : ''} onClick={() => setGuideTab('concept')}>画面イメージ</button>
+            </div>
+            <img
+              className={`guide-image${guideTab === 'formats' ? ' is-format-workflow' : ''}`}
+              src={guideTab === 'workflow' ? '/examples/annotation-workflow-guide-v2.png' : guideTab === 'concept' ? '/examples/annotation-workspace-concept.png' : '/examples/agent-format-workflow.png'}
+              alt={guideTab === 'workflow' ? '文書読み込み、AIへの指示、候補確認、必要部分抽出の4ステップ' : guideTab === 'concept' ? 'Annotation Studioのデスクトップ画面コンセプト' : 'PDF、Excel、Word、PowerPointでAgentが注釈する場所と人が確認する箇所の違い'}
+            />
+            <div className="guide-caption">{guideTab === 'workflow' ? '候補を確認・修正してから保存できます。AIの提案はいつでも人が編集できます。' : guideTab === 'concept' ? 'デザイン検討用のコンセプト画像です。現在の操作画面はこのプレビュー内で動作します。' : 'PDFはページ範囲、Excelはセル、Wordは文章、PowerPointはスライドを対象にします。Agentの判断が曖昧な箇所だけ、人が確認してから元形式や一覧に書き出せます。'}</div>
           </section>
         </div>
       )}

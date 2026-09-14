@@ -12,19 +12,22 @@ import { preview, type PreviewReport } from 'document-svg';
 import { previewRasterImage, rasterImageExtensions } from './imagePreview';
 import { createAnnotationTaskPlan } from './taskPlanner';
 import { parseTaskPlan } from '../src/taskPlan';
-import { annotateWithCodexAppServer, listCodexModels, planTaskWithCodexAppServer, validateAnnotationsWithCodexAppServer } from './codexAppServer';
+import { annotateWithCodexAppServer, draftCorrectionRuleWithCodexAppServer, listCodexModels, planTaskWithCodexAppServer, proposeWorkbookChangesWithCodexAppServer, validateAnnotationsWithCodexAppServer } from './codexAppServer';
 import { getPendingAgentDocumentIds, getPendingAgentRunInfo, hasLivePendingAgentRun, prunePersistedPendingAgentRuns, restorePendingAgentRun, resumeDocumentAgentRun, runDocumentAgent, type ExistingAnnotation } from './documentAgent';
 import { runAnnotationValidator, sanitizeValidatorFindings, type ValidatorAnnotation } from './annotationValidator';
+import { createCorrectionRuleDraft, parseCorrectionRuleDraft, type CorrectionRuleInput } from './correctionRulePlanner';
 import { SpreadsheetDocumentAdapter } from './spreadsheetAdapter';
 import { PagedDocumentAdapter, type DocumentAdapter } from './documentAdapter';
 import { documentExportStore } from './documentExportStore';
 import type { DocumentAnnotationRecord, NormalizedTextBox } from '../src/types';
 import { privateRecordStore } from './privateRecordStore';
+import { isAllowedRequestOrigin, maxUploadMegabytesFromEnvironment } from './requestSecurity';
+import { inspectionScopeKey, mergeInspectionCheckpoint, sanitizeInspectionCheckpoints, type InspectionCheckpoint } from './inspectionCheckpoint';
 
 const app = express();
 const port = Number(process.env.PORT ?? 3001);
 const host = process.env.HOST ?? '127.0.0.1';
-const maxUploadMb = Math.min(Math.max(Number(process.env.MAX_UPLOAD_MB ?? 30), 1), 100);
+const maxUploadMb = maxUploadMegabytesFromEnvironment(process.env.MAX_UPLOAD_MB);
 const documentExtensions = new Set(['.pdf', '.docx', '.pptx', '.xlsx']);
 const allowedExtensions = new Set([...documentExtensions, ...rasterImageExtensions]);
 const maxDocumentSessions = 20;
@@ -53,9 +56,7 @@ app.use((request, response, next) => {
     next();
     return;
   }
-  let sameOrigin = false;
-  try { sameOrigin = new URL(origin).host === request.get('host'); } catch { /* A non-URL Origin is rejected below. */ }
-  if (!sameOrigin && !allowedOrigins.has(origin)) {
+  if (!isAllowedRequestOrigin(origin, request.get('host'), allowedOrigins)) {
     response.status(403).json({ error: 'このアプリのOriginからの要求だけを受け付けています。' });
     return;
   }
@@ -122,9 +123,22 @@ const validationAnnotationsSchema = z.array(z.object({
   reviewPriority: z.enum(['low', 'medium', 'high']),
   status: z.enum(['auto', 'approved', 'corrected', 'needs_review']),
 }).strict()).max(500);
+const correctionRuleInputSchema = z.object({
+  task: z.string().min(2).max(2000),
+  taskPlan: z.string().max(5000),
+  guidelines: z.string().max(4000),
+  sourceCandidate: z.object({
+    pageNumber: z.number().int().min(1).max(120),
+    label: z.string().max(60),
+    note: z.string().max(500),
+    reason: z.string().max(500),
+    excerpt: z.string().max(1000),
+  }).strict(),
+  correction: z.object({ label: z.string().max(60), note: z.string().max(500) }).strict(),
+}).strict();
 const modelIds: ModelId[] = ['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'];
 const reasoningEfforts: ReasoningEffort[] = ['none', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
-type DocumentSession = { id: string; fileName: string; sourceHash: string; report: PreviewReport; pageAdapter: PagedDocumentAdapter; createdAt: number; sourceBuffer?: Buffer; workbookBuffer?: Buffer; wordBuffer?: Buffer; presentationBuffer?: Buffer; spreadsheet?: SpreadsheetDocumentAdapter };
+type DocumentSession = { id: string; fileName: string; sourceHash: string; report: PreviewReport; pageAdapter: PagedDocumentAdapter; createdAt: number; inspectionCheckpoints?: Record<string, InspectionCheckpoint>; sourceBuffer?: Buffer; workbookBuffer?: Buffer; wordBuffer?: Buffer; presentationBuffer?: Buffer; spreadsheet?: SpreadsheetDocumentAdapter; originalSpreadsheetPromise?: Promise<SpreadsheetDocumentAdapter>; originalSpreadsheetReaders?: number; originalSpreadsheetIdleTimer?: NodeJS.Timeout };
 type PersistedDocumentSession = {
   version: 1;
   id: string;
@@ -133,17 +147,41 @@ type PersistedDocumentSession = {
   createdAt: number;
   report: PreviewReport;
   sourceBuffer: string;
+  inspectionCheckpoints?: Record<string, InspectionCheckpoint>;
   spreadsheetState?: { buffer: string; changes: Awaited<ReturnType<SpreadsheetDocumentAdapter['getChanges']>> };
 };
 const documentSessions = new Map<string, DocumentSession>();
+const pendingAgentRunRebindings = new Map<string, Promise<boolean>>();
+const pendingWorkbookChangeDecisions = new Set<string>();
+const activeWorkbookMutationSessions = new Set<string>();
+const activeApprovalRunIds = new Set<string>();
 let demoSessionId: string | undefined;
+let terminationDemoSessionId: string | undefined;
+let liveTerminationDemoSessionId: string | undefined;
+let customerFeedbackDemoSessionId: string | undefined;
+let customerChurnDemoSessionId: string | undefined;
+
+function tryLockWorkbookSession(sessionId: string) {
+  if (activeWorkbookMutationSessions.has(sessionId)) return false;
+  activeWorkbookMutationSessions.add(sessionId);
+  return true;
+}
+
+function unlockWorkbookSession(sessionId: string) {
+  activeWorkbookMutationSessions.delete(sessionId);
+}
 
 function pruneDocumentSessions() {
   const expireBefore = Date.now() - documentSessionTtlMs;
   for (const [id, session] of documentSessions) {
     if (session.createdAt < expireBefore) {
+      if (session.originalSpreadsheetIdleTimer) clearTimeout(session.originalSpreadsheetIdleTimer);
       documentSessions.delete(id);
       if (demoSessionId === id) demoSessionId = undefined;
+      if (terminationDemoSessionId === id) terminationDemoSessionId = undefined;
+      if (liveTerminationDemoSessionId === id) liveTerminationDemoSessionId = undefined;
+      if (customerFeedbackDemoSessionId === id) customerFeedbackDemoSessionId = undefined;
+      if (customerChurnDemoSessionId === id) customerChurnDemoSessionId = undefined;
     }
   }
 }
@@ -196,6 +234,18 @@ function configuredModel(model: ModelId, settings?: AISettings): { client: OpenA
   };
 }
 
+function providerCredentialFingerprint(settings: AISettings, config: { deployment: string; provider: ProviderId }, model: ModelId) {
+  const mode = config.provider;
+  const apiKey = settings.apiKey?.trim() || (mode === 'azure-openai' ? process.env.AZURE_OPENAI_API_KEY : process.env.OPENAI_API_KEY) || '';
+  const endpoint = settings.endpoint?.trim()
+    || (mode === 'azure-openai' ? process.env.AZURE_OPENAI_ENDPOINT : process.env.OPENAI_BASE_URL)
+    || (mode === 'openai-api' ? 'https://api.openai.com/v1' : '');
+  const normalized = normalizeEndpoint(endpoint, mode);
+  // Keep this hash in memory only. It lets a live run detect when no durable
+  // snapshot exists to safely rebind to newly supplied credentials.
+  return createHash('sha256').update([mode, model, config.deployment, normalized, apiKey].join('\0')).digest('hex');
+}
+
 function sourceHash(buffer: Buffer) {
   return createHash('sha256').update(buffer).digest('hex');
 }
@@ -240,8 +290,14 @@ function storeDocument(fileName: string, report: PreviewReport, demo: boolean, s
   while (documentSessions.size > maxDocumentSessions) {
     const oldestId = documentSessions.keys().next().value as string | undefined;
     if (!oldestId) break;
+    const oldest = documentSessions.get(oldestId);
+    if (oldest?.originalSpreadsheetIdleTimer) clearTimeout(oldest.originalSpreadsheetIdleTimer);
     documentSessions.delete(oldestId);
     if (demoSessionId === oldestId) demoSessionId = undefined;
+    if (terminationDemoSessionId === oldestId) terminationDemoSessionId = undefined;
+    if (liveTerminationDemoSessionId === oldestId) liveTerminationDemoSessionId = undefined;
+    if (customerFeedbackDemoSessionId === oldestId) customerFeedbackDemoSessionId = undefined;
+    if (customerChurnDemoSessionId === oldestId) customerChurnDemoSessionId = undefined;
   }
   return pagePayload(id, fileName, documentHash, report, demo);
 }
@@ -253,9 +309,54 @@ async function getSpreadsheet(session: DocumentSession) {
   return session.spreadsheet;
 }
 
+async function rebindPendingAgentRun(args: Omit<Parameters<typeof restorePendingAgentRun>[0], 'forceRestore'>) {
+  const existing = pendingAgentRunRebindings.get(args.runId);
+  if (existing) return existing;
+  const operation = restorePendingAgentRun({ ...args, forceRestore: true });
+  pendingAgentRunRebindings.set(args.runId, operation);
+  try {
+    return await operation;
+  } finally {
+    if (pendingAgentRunRebindings.get(args.runId) === operation) pendingAgentRunRebindings.delete(args.runId);
+  }
+}
+
+async function withOriginalSpreadsheet<T>(session: DocumentSession, action: (spreadsheet: SpreadsheetDocumentAdapter) => T | Promise<T>) {
+  if (!session.workbookBuffer) throw Object.assign(new Error('The original workbook is no longer available in this session.'), { status: 410 });
+  if (session.originalSpreadsheetIdleTimer) clearTimeout(session.originalSpreadsheetIdleTimer);
+  delete session.originalSpreadsheetIdleTimer;
+  const promise = session.originalSpreadsheetPromise
+    ?? (session.originalSpreadsheetPromise = SpreadsheetDocumentAdapter.fromBuffer(session.fileName, session.workbookBuffer, session.id));
+  session.originalSpreadsheetReaders = (session.originalSpreadsheetReaders ?? 0) + 1;
+  let sourceLoaded = false;
+  try {
+    const originalWorkbook = await promise;
+    sourceLoaded = true;
+    return await action(originalWorkbook);
+  } finally {
+    session.originalSpreadsheetReaders = Math.max(0, (session.originalSpreadsheetReaders ?? 1) - 1);
+    if (session.originalSpreadsheetReaders === 0 && session.originalSpreadsheetPromise === promise) {
+      if (sourceLoaded) {
+        const idleTimer = setTimeout(() => {
+          if (session.originalSpreadsheetReaders === 0 && session.originalSpreadsheetPromise === promise) {
+            delete session.originalSpreadsheetPromise;
+            delete session.originalSpreadsheetIdleTimer;
+          }
+        }, 120_000);
+        idleTimer.unref?.();
+        session.originalSpreadsheetIdleTimer = idleTimer;
+      } else {
+        delete session.originalSpreadsheetPromise;
+      }
+    }
+  }
+}
+
 async function persistDocumentSession(session: DocumentSession) {
   if (!session.sourceBuffer) return false;
   const spreadsheet = session.spreadsheet;
+  const totalPages = Math.max(1, session.report.pages.length);
+  const inspectionCheckpoints = sanitizeInspectionCheckpoints(session.inspectionCheckpoints, session.sourceHash, totalPages);
   const record: PersistedDocumentSession = {
     version: 1,
     id: session.id,
@@ -264,6 +365,7 @@ async function persistDocumentSession(session: DocumentSession) {
     createdAt: Date.now(),
     report: session.report,
     sourceBuffer: session.sourceBuffer.toString('base64'),
+    ...(Object.keys(inspectionCheckpoints).length ? { inspectionCheckpoints } : {}),
     ...(spreadsheet ? {
       spreadsheetState: {
         buffer: (await spreadsheet.writeBuffer()).toString('base64'),
@@ -350,6 +452,7 @@ async function restorePersistedDocumentSessions() {
         report: record.report,
         pageAdapter: new PagedDocumentAdapter(record.fileName, record.report, record.id, sourceBuffer),
         createdAt: record.createdAt,
+        inspectionCheckpoints: sanitizeInspectionCheckpoints(record.inspectionCheckpoints, computedSourceHash, Math.max(1, record.report.pages.length)),
         sourceBuffer,
         ...(extension === '.xlsx' ? { workbookBuffer: sourceBuffer } : {}),
         ...(extension === '.docx' ? { wordBuffer: sourceBuffer } : {}),
@@ -414,6 +517,78 @@ app.get('/api/demo', demoFileRateLimit, async (_request, response, next) => {
     }
     if (!currentDemo) throw new Error('サンプル文書を準備できませんでした。');
     response.json(pagePayload(currentDemo.id, currentDemo.fileName, currentDemo.sourceHash, currentDemo.report, true));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/demo/termination-contract', demoFileRateLimit, async (_request, response, next) => {
+  try {
+    let currentDemo = terminationDemoSessionId ? documentSessions.get(terminationDemoSessionId) : undefined;
+    if (!currentDemo) {
+      const fileName = 'fictional-termination-contract.pdf';
+      const pdf = await readFile(resolve('public', fileName));
+      const report = await convertBuffer(fileName, pdf);
+      const payload = storeDocument(fileName, report, true, pdf);
+      terminationDemoSessionId = payload.documentId;
+      currentDemo = documentSessions.get(payload.documentId);
+    }
+    if (!currentDemo) throw new Error('契約書デモを準備できませんでした。');
+    response.set('Cache-Control', 'no-store').json(pagePayload(currentDemo.id, currentDemo.fileName, currentDemo.sourceHash, currentDemo.report, true));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/demo/termination-contract-live', demoFileRateLimit, async (_request, response, next) => {
+  try {
+    let currentDemo = liveTerminationDemoSessionId ? documentSessions.get(liveTerminationDemoSessionId) : undefined;
+    if (!currentDemo) {
+      const fileName = 'fictional-termination-contract-live.pdf';
+      const source = await readFile(resolve('public/demos/product-hunt-termination-contract.pdf'));
+      const report = await convertBuffer(fileName, source);
+      const payload = storeDocument(fileName, report, true, source);
+      liveTerminationDemoSessionId = payload.documentId;
+      currentDemo = documentSessions.get(payload.documentId);
+    }
+    if (!currentDemo) throw new Error('Live contract demo could not be prepared.');
+    response.set('Cache-Control', 'no-store').json(pagePayload(currentDemo.id, currentDemo.fileName, currentDemo.sourceHash, currentDemo.report, true));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/demo/customer-feedback', demoFileRateLimit, async (_request, response, next) => {
+  try {
+    let currentDemo = customerFeedbackDemoSessionId ? documentSessions.get(customerFeedbackDemoSessionId) : undefined;
+    if (!currentDemo) {
+      const fileName = 'customer-feedback-demo.xlsx';
+      const source = await readFile(resolve('public/demos', fileName));
+      const report = await convertBuffer(fileName, source);
+      const payload = storeDocument(fileName, report, true, source);
+      customerFeedbackDemoSessionId = payload.documentId;
+      currentDemo = documentSessions.get(payload.documentId);
+    }
+    if (!currentDemo) throw new Error('Customer feedback demo could not be prepared.');
+    response.set('Cache-Control', 'no-store').json(pagePayload(currentDemo.id, currentDemo.fileName, currentDemo.sourceHash, currentDemo.report, true));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/demo/customer-churn-risk', demoFileRateLimit, async (_request, response, next) => {
+  try {
+    let currentDemo = customerChurnDemoSessionId ? documentSessions.get(customerChurnDemoSessionId) : undefined;
+    if (!currentDemo) {
+      const fileName = 'customer-churn-risk-demo.xlsx';
+      const source = await readFile(resolve('public/demos', fileName));
+      const report = await convertBuffer(fileName, source);
+      const payload = storeDocument(fileName, report, true, source);
+      customerChurnDemoSessionId = payload.documentId;
+      currentDemo = documentSessions.get(payload.documentId);
+    }
+    if (!currentDemo) throw new Error('Customer churn-risk demo could not be prepared.');
+    response.set('Cache-Control', 'no-store').json(pagePayload(currentDemo.id, currentDemo.fileName, currentDemo.sourceHash, currentDemo.report, true));
   } catch (error) {
     next(error);
   }
@@ -489,6 +664,103 @@ app.post('/api/convert', upload.single('file'), async (request, response, next) 
   }
 });
 
+app.post('/api/documents/:documentId/workbook/restore', async (request, response, next) => {
+  let lockedSessionId: string | undefined;
+  try {
+    pruneDocumentSessions();
+    const session = documentSessions.get(request.params.documentId);
+    if (!session) { response.status(410).json({ error: 'Workbook session expired. Reopen the source workbook.' }); return; }
+    if (!tryLockWorkbookSession(session.id)) { response.status(409).json({ error: 'This workbook session is already processing a change.' }); return; }
+    lockedSessionId = session.id;
+    const body = request.body as Record<string, unknown>;
+    if (typeof body.sourceHash !== 'string' || !/^[\da-f]{64}$/i.test(body.sourceHash)) {
+      response.status(400).json({ error: 'Restoring workbook changes requires the source-file hash.' });
+      return;
+    }
+    if (body.sourceHash !== session.sourceHash) { response.status(409).json({ error: 'This workbook has changed since the saved changes were created.' }); return; }
+    const parsed = documentAnnotationRecordsSchema.safeParse(body.documentAnnotations);
+    if (!parsed.success) { response.status(400).json({ error: 'Saved workbook changes are invalid or exceed 500 items.' }); return; }
+    if (new Set(parsed.data.map((record) => record.id)).size !== parsed.data.length) { response.status(400).json({ error: 'Saved workbook change IDs must be unique.' }); return; }
+    if (parsed.data.some((record) => record.documentId !== session.id || record.target.kind !== 'sheet' ||
+      record.sourceHash !== session.sourceHash ||
+      !['write_cell', 'write_range', 'create_column'].includes(String(record.operation)))) {
+      response.status(409).json({ error: 'Saved changes must belong to this workbook version and target valid spreadsheet cells.' });
+      return;
+    }
+    if (!session.workbookBuffer || extname(session.fileName).toLowerCase() !== '.xlsx') {
+      response.status(415).json({ error: 'The active document is not an XLSX workbook.' });
+      return;
+    }
+    const activeSpreadsheet = await getSpreadsheet(session);
+    if (!activeSpreadsheet) { response.status(415).json({ error: 'The active document is not an XLSX workbook.' }); return; }
+    const activeChanges = activeSpreadsheet.getChanges();
+    if (activeChanges.length) {
+      const activeIds = new Set(activeChanges.map((change) => change.id));
+      if (parsed.data.every((record) => activeIds.has(record.id))) {
+        response.set('Cache-Control', 'no-store').json({ fileName: session.fileName, sheets: activeSpreadsheet.listSheets(), changes: activeChanges });
+        return;
+      }
+      response.status(409).json({ error: 'This workbook session already contains different edits; reopening it would discard them.' });
+      return;
+    }
+    const spreadsheet = await SpreadsheetDocumentAdapter.fromBuffer(session.fileName, session.workbookBuffer, session.id);
+    spreadsheet.replaceAnnotations(parsed.data as DocumentAnnotationRecord[]);
+    session.spreadsheet = spreadsheet;
+    await persistDocumentSession(session);
+    response.set('Cache-Control', 'no-store').json({ fileName: session.fileName, sheets: spreadsheet.listSheets(), changes: spreadsheet.getChanges() });
+  } catch (error) { next(error); }
+  finally { if (lockedSessionId) unlockWorkbookSession(lockedSessionId); }
+});
+
+app.get('/api/documents/:documentId/workbook/changes/:changeId/context', async (request, response, next) => {
+  try {
+    pruneDocumentSessions();
+    const session = documentSessions.get(request.params.documentId);
+    if (!session) { response.status(404).json({ error: '文書セッションの有効期限が切れました。文書を開き直してください。' }); return; }
+    const spreadsheet = await getSpreadsheet(session);
+    if (!spreadsheet || !session.workbookBuffer) { response.status(415).json({ error: 'この文書はExcelブックではありません。' }); return; }
+    const pageParam = typeof request.query.page === 'string' ? request.query.page : '0';
+    if (!/^\d{1,4}$/u.test(pageParam)) { response.status(400).json({ error: 'Review context page is invalid.' }); return; }
+    const context = await withOriginalSpreadsheet(session, (originalWorkbook) => spreadsheet.readChangeContext(request.params.changeId, originalWorkbook, Number(pageParam)));
+    response.set('Cache-Control', 'no-store').json(context);
+  } catch (error) { next(error); }
+});
+
+app.post('/api/documents/:documentId/workbook/changes/:changeId/decision', async (request, response, next) => {
+  let decisionKey: string | undefined;
+  let lockedSessionId: string | undefined;
+  let ownsDecisionLock = false;
+  try {
+    pruneDocumentSessions();
+    const session = documentSessions.get(request.params.documentId);
+    if (!session) { response.status(410).json({ error: 'Workbook session expired. Reopen the source workbook.' }); return; }
+    if (!tryLockWorkbookSession(session.id)) { response.status(409).json({ error: 'This workbook session is already processing a change.' }); return; }
+    lockedSessionId = session.id;
+    decisionKey = `${session.id}:${request.params.changeId}`;
+    if (pendingWorkbookChangeDecisions.has(decisionKey)) { response.status(409).json({ error: 'This workbook proposal is already being reviewed.' }); return; }
+    pendingWorkbookChangeDecisions.add(decisionKey);
+    ownsDecisionLock = true;
+    const body = request.body as Record<string, unknown>;
+    if (typeof body.approved !== 'boolean' || typeof body.sourceHash !== 'string' || !/^[\da-f]{64}$/i.test(body.sourceHash)) {
+      response.status(400).json({ error: 'A workbook decision requires an approval choice and source hash.' });
+      return;
+    }
+    if (body.sourceHash !== session.sourceHash) { response.status(409).json({ error: 'This workbook has changed since the proposed edit was created.' }); return; }
+    const spreadsheet = await getSpreadsheet(session);
+    if (!spreadsheet) { response.status(415).json({ error: 'The active document is not an XLSX workbook.' }); return; }
+    const change = spreadsheet.getChanges().find((item) => item.id === request.params.changeId);
+    if (!change) { response.status(404).json({ error: 'Workbook proposal not found.' }); return; }
+    if (!change.requiresReview || change.approved || change.rejected) { response.status(409).json({ error: 'This workbook proposal no longer needs a decision.' }); return; }
+    const decided = body.approved ? spreadsheet.approveChange(change.id) : spreadsheet.rejectChange(change.id);
+    await persistDocumentSession(session);
+    response.set('Cache-Control', 'no-store').json({ change: decided, fileName: session.fileName, sourceHash: session.sourceHash });
+  } catch (error) { next(error); }
+  finally {
+    if (ownsDecisionLock && decisionKey) pendingWorkbookChangeDecisions.delete(decisionKey);
+    if (lockedSessionId) unlockWorkbookSession(lockedSessionId);
+  }
+});
+
 app.get('/api/documents/:documentId/workbook', async (request, response, next) => {
   try {
     pruneDocumentSessions();
@@ -539,10 +811,15 @@ app.get('/api/documents/:documentId/workbook/export', async (request, response, 
 });
 
 app.post('/api/documents/:documentId/export', async (request, response, next) => {
+  let lockedSessionId: string | undefined;
   try {
     pruneDocumentSessions();
     const session = documentSessions.get(request.params.documentId);
     if (!session) { response.status(410).json({ error: '文書セッションの有効期限が切れました。文書を開き直してください。' }); return; }
+    if (extname(session.fileName).toLowerCase() === '.xlsx') {
+      if (!tryLockWorkbookSession(session.id)) { response.status(409).json({ error: 'This workbook session is already processing a change.' }); return; }
+      lockedSessionId = session.id;
+    }
     const body = request.body as Record<string, unknown>;
     const format = z.enum(['annotations-json', 'annotations-csv', 'native-annotated']).safeParse(body.format);
     if (!format.success) { response.status(400).json({ error: 'Export format must be annotations-json, annotations-csv, or native-annotated.' }); return; }
@@ -565,6 +842,7 @@ app.post('/api/documents/:documentId/export', async (request, response, next) =>
     if (extname(session.fileName).toLowerCase() === '.xlsx') await persistDocumentSession(session).catch(() => false);
     sendDocumentExport(response, result);
   } catch (error) { next(error); }
+  finally { if (lockedSessionId) unlockWorkbookSession(lockedSessionId); }
 });
 
 app.get('/api/document-exports/:exportId', async (request, response, next) => {
@@ -618,7 +896,7 @@ function parseAnnotationOutput(outputText: string, pageNumber: number) {
           excerpt: String(entry.excerpt ?? '').slice(0, 1000),
           ...(confidence !== undefined ? { confidence } : {}),
           reviewPriority,
-          requiresReview: Boolean(entry.requiresReview) || reviewPriority === 'high',
+          requiresReview: Boolean(entry.requiresReview),
           color: '#278779',
           pageNumber: Math.max(1, Math.min(120, pageNumber)),
           source: 'ai' as const,
@@ -770,6 +1048,47 @@ app.post('/api/ai/plan', async (request, response, next) => {
   }
 });
 
+app.post('/api/ai/correction-rule', async (request, response, next) => {
+  try {
+    const body = request.body as Record<string, unknown>;
+    const { settings, model, effort } = readAIRequest(body);
+    const parsedInput = correctionRuleInputSchema.safeParse(body.input);
+    if (!parsedInput.success) {
+      response.status(400).json({ error: '修正ルール案の入力が不正か、文字数の上限を超えています。' });
+      return;
+    }
+    const input = parsedInput.data as CorrectionRuleInput;
+    if (settings.provider === 'codex-app-server') {
+      const result = await draftCorrectionRuleWithCodexAppServer({ input, model, reasoningEffort: effort });
+      let parsed: unknown;
+      try { parsed = JSON.parse(result.outputText); } catch { throw new Error('Codex App Server returned invalid correction-rule JSON.'); }
+      const draft = parseCorrectionRuleDraft(parsed);
+      if (!draft) throw new Error('Codex App Server returned an invalid correction-rule draft.');
+      response.json({ draft, provider: 'codex-app-server', model, usage: result.usage });
+      return;
+    }
+    const config = configuredModel(model, settings);
+    if (!config) {
+      response.status(503).json({ error: 'APIキー、エンドポイント、またはAzure deploymentを設定してください。', aiConfigured: false });
+      return;
+    }
+    const result = await createCorrectionRuleDraft({
+      client: config.client,
+      model: config.deployment,
+      reasoningEffort: effort,
+      input,
+    });
+    response.json({ draft: result.draft, provider: config.provider, model, usage: normalizeUsage(result.usage as Parameters<typeof normalizeUsage>[0]) });
+  } catch (error) {
+    const settings = (request.body as Record<string, unknown> | undefined)?.settings;
+    if (settings && typeof settings === 'object' && (settings as Record<string, unknown>).provider === 'codex-app-server') {
+      response.status(502).json({ error: safeCodexAppServerError(error) });
+      return;
+    }
+    next(error);
+  }
+});
+
 app.post('/api/ai/validate', async (request, response, next) => {
   try {
     const body = request.body as Record<string, unknown>;
@@ -835,13 +1154,14 @@ app.post('/api/ai/validate', async (request, response, next) => {
 app.post('/api/ai/annotate', async (request, response, next) => {
   const body = request.body as Record<string, unknown>;
   let streamActive = false;
+  let lockedWorkbookSessionId: string | undefined;
   const emit = (eventName: string, value: unknown) => {
     if (!streamActive || response.writableEnded || response.destroyed) return;
     try { response.write(`event: ${eventName}\ndata: ${JSON.stringify(value)}\n\n`); } catch { /* Stop writing after a client disconnect. */ }
   };
   try {
     const { settings, model, effort } = readAIRequest(body);
-    const { instruction, taskPlan, guidelines, correction, humanDecisions, pageText, imageDataUrl, pageNumber, totalPages, agentMode, requireToolApproval, selectedAnnotationId, viewerAspectRatio, viewerViewport, documentId, documentScope, exportScope } = body as {
+    const { instruction, taskPlan, guidelines, correction, humanDecisions, pageText, imageDataUrl, pageNumber, totalPages, agentMode, requireToolApproval, selectedAnnotationId, viewerAspectRatio, viewerViewport, documentId, documentScope, exportScope, alreadyInspectedPages: rawAlreadyInspectedPages } = body as {
       instruction?: string;
       taskPlan?: string;
       guidelines?: string;
@@ -859,6 +1179,7 @@ app.post('/api/ai/annotate', async (request, response, next) => {
       documentId?: string;
       documentScope?: string;
       exportScope?: string;
+      alreadyInspectedPages?: unknown;
     };
     if (typeof instruction !== 'string' || instruction.trim().length < 2 || instruction.length > 2000) {
       response.status(400).json({ error: 'AIへの指示を2〜2000文字で入力してください。' });
@@ -927,9 +1248,10 @@ app.post('/api/ai/annotate', async (request, response, next) => {
       response.status(400).json({ error: 'Existing annotation summary is invalid or exceeds 500 items.' });
       return;
     }
-    const boundedTotalPages = Math.max(1, Math.min(120, Number(totalPages) || 1));
-    if (existingAnnotationsResult.data.some((annotation) => annotation.pageNumber > boundedTotalPages)) {
-      response.status(400).json({ error: 'Existing annotation summary references a page outside this document.' });
+    const requestedTotalPages = Math.max(1, Math.min(120, Number(totalPages) || 1));
+    const alreadyInspectedPagesResult = z.array(z.number().int().min(1).max(120)).max(120).safeParse(rawAlreadyInspectedPages ?? []);
+    if (!alreadyInspectedPagesResult.success || new Set(alreadyInspectedPagesResult.data).size !== alreadyInspectedPagesResult.data.length) {
+      response.status(400).json({ error: 'Previously inspected pages must be unique valid pages in the current document.' });
       return;
     }
     if (documentId !== undefined && (typeof documentId !== 'string' || documentId.length > 100)) {
@@ -947,14 +1269,62 @@ app.post('/api/ai/annotate', async (request, response, next) => {
     }
 
     const selectedPage = Math.max(1, Math.min(120, Number(pageNumber) || 1));
+    let boundedTotalPages = requestedTotalPages;
+    let alreadyInspectedPages: number[] = [];
+    let inspectionCheckpointKey: string | undefined;
     let spreadsheet: SpreadsheetDocumentAdapter | undefined;
+    let activeDocumentSession: DocumentSession | undefined;
     const documentAdapters: DocumentAdapter[] = [];
     let documentSourceHash: string | undefined;
     if (documentId) {
       pruneDocumentSessions();
       const session = documentSessions.get(documentId);
       if (!session) { response.status(410).json({ error: '文書セッションの有効期限が切れました。文書を開き直してください。' }); return; }
+      const isWorkbookSession = extname(session.fileName).toLowerCase() === '.xlsx';
+      const serverPageCount = Math.max(1, Math.min(120, session.report.pages.length));
+      if (!isWorkbookSession && Number(totalPages) !== serverPageCount) {
+        response.status(409).json({ error: '要求されたページ数がサーバーで開いた文書と一致しません。文書を開き直してください。' });
+        return;
+      }
+      boundedTotalPages = isWorkbookSession ? requestedTotalPages : serverPageCount;
+      if (!isWorkbookSession && selectedPage > serverPageCount) {
+        response.status(400).json({ error: '選択したページが現在の文書範囲外です。' });
+        return;
+      }
+      if (!isWorkbookSession && alreadyInspectedPagesResult.data.some((page) => page > serverPageCount)) {
+        response.status(400).json({ error: 'Previously inspected pages must be inside the current document.' });
+        return;
+      }
+      if (!isWorkbookSession && existingAnnotationsResult.data.some((annotation) => annotation.pageNumber > serverPageCount)) {
+        response.status(400).json({ error: 'Existing annotation summary references a page outside this document.' });
+        return;
+      }
+      if (canonicalAnnotations?.some((annotation) => (annotation.target.kind === 'page' ? annotation.target.page : annotation.target.kind === 'slide' ? annotation.target.slide : 1) > serverPageCount)) {
+        response.status(409).json({ error: 'A canonical annotation target is outside the pages opened for this document.' });
+        return;
+      }
+      if (exportScope === 'all' && !isWorkbookSession && session.report.pages.length < session.report.pageCount) {
+        response.status(409).json({ error: 'This document exceeds the available page-inspection limit; full-document export is blocked.' });
+        return;
+      }
+      if (isWorkbookSession) {
+        if (!tryLockWorkbookSession(session.id)) { response.status(409).json({ error: 'This workbook session is already processing a change.' }); return; }
+        lockedWorkbookSessionId = session.id;
+      }
+      activeDocumentSession = session;
       documentSourceHash = session.sourceHash;
+      if (exportScope === 'all' && !isWorkbookSession) {
+        inspectionCheckpointKey = inspectionScopeKey({
+          documentId: session.id,
+          sourceHash: session.sourceHash,
+          totalPages: serverPageCount,
+          instruction: instruction.trim(),
+          taskPlan: taskPlan?.trim() ?? '',
+          guidelines: guidelines?.trim() ?? '',
+          mode: selectedMode,
+        });
+        alreadyInspectedPages = session.inspectionCheckpoints?.[inspectionCheckpointKey]?.pages ?? [];
+      }
       documentAdapters.push(session.pageAdapter);
       spreadsheet = await getSpreadsheet(session);
       if (spreadsheet) documentAdapters.push(spreadsheet);
@@ -983,6 +1353,56 @@ app.post('/api/ai/annotate', async (request, response, next) => {
       }
     }
     if (settings.provider === 'codex-app-server') {
+      if (spreadsheet) {
+        if (!activeDocumentSession) { response.status(410).json({ error: 'Workbook session is unavailable.' }); return; }
+        if (body.stream === true) {
+          response.status(200)
+            .set('Content-Type', 'text/event-stream; charset=utf-8')
+            .set('Cache-Control', 'no-cache, no-transform')
+            .set('Connection', 'keep-alive')
+            .set('X-Accel-Buffering', 'no');
+          response.flushHeaders();
+          streamActive = true;
+          emit('activity', { toolName: 'codex_app_server', phase: 'Reading', detail: 'Inspecting workbook structure and bounded cell evidence with the selected Codex model.', status: 'active', pageNumber: selectedPage });
+        }
+        const workbookResult = await proposeWorkbookChangesWithCodexAppServer({
+          instruction: instruction.trim(),
+          taskPlan: taskPlan?.trim() ?? '',
+          guidelines: guidelines?.trim() ?? '',
+          correction: correction?.trim() ?? '',
+          humanDecisions: humanDecisions?.trim() ?? '',
+          mode: selectedMode,
+          spreadsheet,
+          model,
+          reasoningEffort: effort,
+        });
+        if (workbookResult.changes.length) await persistDocumentSession(activeDocumentSession).catch(() => false);
+        const pendingChanges = workbookResult.changes.filter((change) => change.requiresReview && !change.approved && !change.rejected);
+        const workbookPayload = {
+          annotations: [],
+          spreadsheetChanges: workbookResult.changes,
+          spreadsheetReviewCount: pendingChanges.length,
+          annotationOperations: [],
+          exports: [],
+          toolEvents: workbookResult.toolEvents.map((event) => ({ ...event, pageNumber: selectedPage })),
+          status: 'complete',
+          visitedPages: [selectedPage],
+          pageCoverage: [{ pageNumber: selectedPage, status: 'checked', findingCount: 0, reviewCount: pendingChanges.length, warningCount: 0, textBlockCount: 0 }],
+          model,
+          provider: 'codex-app-server',
+          reasoningEffort: effort,
+          usage: workbookResult.usage,
+        };
+        if (streamActive) {
+          for (const event of workbookPayload.toolEvents) emit('activity', event);
+          emit('result', workbookPayload);
+          emit('done', {});
+          response.end();
+        } else {
+          response.json(workbookPayload);
+        }
+        return;
+      }
       const selectedViewerAnnotation = selectedAnnotationId
         ? existingAnnotationsResult.data.find((annotation) => annotation.id === selectedAnnotationId)
         : undefined;
@@ -1070,6 +1490,7 @@ app.post('/api/ai/annotate', async (request, response, next) => {
       model: config.deployment,
       modelId: model,
       providerName: config.provider,
+      providerConfigFingerprint: providerCredentialFingerprint(settings, config, model),
       reasoningEffort: effort,
       instruction: instruction.trim(),
       taskPlan: taskPlan?.trim() ?? '',
@@ -1085,6 +1506,8 @@ app.post('/api/ai/annotate', async (request, response, next) => {
       pageNumber: selectedPage,
       totalPages: boundedTotalPages,
       requestedScope: exportScope === 'all' ? 'all' : 'current',
+      alreadyInspectedPages,
+      ...(inspectionCheckpointKey ? { inspectionCheckpointKey } : {}),
       existingAnnotations: existingAnnotationsResult.data as ExistingAnnotation[],
       ...(selectedAnnotationId ? { selectedAnnotationId } : {}),
       ...(viewerAspectRatio ? { viewerAspectRatio } : {}),
@@ -1094,6 +1517,16 @@ app.post('/api/ai/annotate', async (request, response, next) => {
       mode: selectedMode,
       requireToolApproval: requireToolApproval !== false,
     });
+    if (activeDocumentSession && inspectionCheckpointKey && agentResult.inspectedPages) {
+      activeDocumentSession.inspectionCheckpoints = mergeInspectionCheckpoint(
+        activeDocumentSession.inspectionCheckpoints,
+        inspectionCheckpointKey,
+        activeDocumentSession.sourceHash,
+        boundedTotalPages,
+        agentResult.inspectedPages,
+      );
+      try { await persistDocumentSession(activeDocumentSession); } catch { /* Keep the in-memory verified checkpoint if local storage is unavailable. */ }
+    }
     if (agentResult.status === 'interrupted' && typeof documentId === 'string') {
       const session = documentSessions.get(documentId);
       if (session) {
@@ -1111,6 +1544,9 @@ app.post('/api/ai/annotate', async (request, response, next) => {
       approvalId: agentResult.approvalId,
       blockedPage: agentResult.blockedPage,
       visitedPages: agentResult.visitedPages,
+      inspectedPages: agentResult.inspectedPages,
+      remainingPages: agentResult.remainingPages,
+      validator: agentResult.validator,
       model,
       provider: config.provider,
       reasoningEffort: effort,
@@ -1140,12 +1576,16 @@ app.post('/api/ai/annotate', async (request, response, next) => {
       return;
     }
     next(error);
+  } finally {
+    if (lockedWorkbookSessionId) unlockWorkbookSession(lockedWorkbookSessionId);
   }
 });
 
 app.post('/api/ai/approve', async (request, response, next) => {
   const body = request.body as Record<string, unknown>;
   let streamActive = false;
+  let lockedRunId: string | undefined;
+  let lockedWorkbookSessionId: string | undefined;
   const emit = (eventName: string, value: unknown) => {
     if (!streamActive || response.writableEnded || response.destroyed) return;
     try { response.write(`event: ${eventName}\ndata: ${JSON.stringify(value)}\n\n`); } catch { /* Stop writing after a client disconnect. */ }
@@ -1155,6 +1595,12 @@ app.post('/api/ai/approve', async (request, response, next) => {
       response.status(400).json({ error: 'Agent approval payload is invalid.' });
       return;
     }
+    if (activeApprovalRunIds.has(body.runId)) {
+      response.status(409).json({ error: 'This Agent Run is already being resumed. Wait for the active approval request to finish.' });
+      return;
+    }
+    activeApprovalRunIds.add(body.runId);
+    lockedRunId = body.runId;
     if (body.stream !== undefined && typeof body.stream !== 'boolean') {
       response.status(400).json({ error: 'Agent stream setting is invalid.' });
       return;
@@ -1176,44 +1622,60 @@ app.post('/api/ai/approve', async (request, response, next) => {
         return;
       }
     }
-    if (!hasLivePendingAgentRun(body.runId)) {
-      const info = pendingRunInfo;
-      if (info) {
-        const suppliedSettings = body.settings && typeof body.settings === 'object' && !Array.isArray(body.settings)
-          ? body.settings as AISettings
-          : {};
-        const mergedSettings: AISettings = {
-          ...suppliedSettings,
-          provider: suppliedSettings.provider ?? info.providerName as ProviderId,
-          reasoningEffort: info.reasoningEffort as ReasoningEffort,
-          ...(info.providerName === 'azure-openai' && !suppliedSettings.azureDeployment ? { azureDeployment: info.model } : {}),
-        };
-        const { model } = readAIRequest({ model: info.modelId, settings: mergedSettings });
-        const config = configuredModel(model, mergedSettings);
-        if (!config) {
-          response.status(503).json({ error: '承認待ちRunを再開するには、Run開始時と同じAPIキーとエンドポイントを設定してください。' });
-          return;
-        }
-        if (config.provider !== info.providerName || config.deployment !== info.model) {
-          response.status(409).json({ error: '承認待ちRunのモデル設定と一致しません。Run開始時のプロバイダー、モデル、deploymentを選んでください。' });
-          return;
-        }
-        let session: DocumentSession | undefined;
-        if (info.documentId) {
-          session = documentSessions.get(info.documentId);
-          if (!session) {
-            response.status(410).json({ error: '承認対象の文書セッションが復元できませんでした。文書を開き直してAgentを再実行してください。' });
-            return;
-          }
-        }
-        const spreadsheet = session ? await getSpreadsheet(session) : undefined;
-        await restorePendingAgentRun({
-          runId: body.runId,
-          client: config.client,
-          providerName: config.provider,
-          ...(session ? { documentAdapters: [session.pageAdapter, ...(spreadsheet ? [spreadsheet] : [])] } : {}),
-          ...(spreadsheet ? { spreadsheet } : {}),
-        });
+    if (!pendingRunInfo) {
+      response.status(410).json({ error: '承認待ちAgent Runの保存状態がありません。文書を再実行してください。' });
+      return;
+    }
+    const liveRun = hasLivePendingAgentRun(body.runId);
+    const info = pendingRunInfo;
+    const suppliedSettings = body.settings && typeof body.settings === 'object' && !Array.isArray(body.settings)
+      ? body.settings as AISettings
+      : {};
+    const mergedSettings: AISettings = {
+      ...suppliedSettings,
+      provider: suppliedSettings.provider ?? info.providerName as ProviderId,
+      reasoningEffort: info.reasoningEffort as ReasoningEffort,
+      ...(info.providerName === 'azure-openai' && !suppliedSettings.azureDeployment ? { azureDeployment: info.model } : {}),
+    };
+    const { model } = readAIRequest({ model: info.modelId, settings: mergedSettings });
+    const config = configuredModel(model, mergedSettings);
+    if (!config) {
+      response.status(503).json({ error: '承認待ちRunを再開するための有効なAPIキー、エンドポイント、deploymentを設定してください。' });
+      return;
+    }
+    if (config.provider !== info.providerName || config.deployment !== info.model) {
+      response.status(409).json({ error: '承認待ちRunのモデル設定と一致しません。Run開始時のプロバイダー、モデル、deploymentを選んでください。' });
+      return;
+    }
+    const currentFingerprint = providerCredentialFingerprint(mergedSettings, config, model);
+    let session: DocumentSession | undefined;
+    if (info.documentId) {
+      session = documentSessions.get(info.documentId);
+      if (!session) {
+        response.status(410).json({ error: '承認対象の文書セッションが復元できませんでした。文書を開き直してAgentを再実行してください。' });
+        return;
+      }
+    }
+    if (session && extname(session.fileName).toLowerCase() === '.xlsx') {
+      if (!tryLockWorkbookSession(session.id)) { response.status(409).json({ error: 'This workbook session is already processing a change.' }); return; }
+      lockedWorkbookSessionId = session.id;
+    }
+    const spreadsheet = session ? await getSpreadsheet(session) : undefined;
+    const shouldRebind = !liveRun || info.liveProviderConfigFingerprint !== currentFingerprint;
+    if (shouldRebind) {
+      const rebound = await rebindPendingAgentRun({
+        runId: body.runId,
+        client: config.client,
+        providerName: config.provider,
+        providerConfigFingerprint: currentFingerprint,
+        ...(session ? { documentAdapters: [session.pageAdapter, ...(spreadsheet ? [spreadsheet] : [])] } : {}),
+        ...(spreadsheet ? { spreadsheet } : {}),
+      });
+      if (!rebound && (!liveRun || info.liveProviderConfigFingerprint !== currentFingerprint)) {
+        response.status(liveRun ? 503 : 410).json({ error: liveRun
+          ? '承認待ちRunの保存に失敗し、現在の認証情報で再接続できません。文書を再読み込みしてAgentを再実行してください。'
+          : '承認対象のRun状態を復元できませんでした。文書を開き直してAgentを再実行してください。' });
+        return;
       }
     }
     if (body.stream === true) {
@@ -1235,6 +1697,15 @@ app.post('/api/ai/approve', async (request, response, next) => {
     if (pendingRunInfo?.documentId) {
       const session = documentSessions.get(pendingRunInfo.documentId);
       if (session) {
+        if (pendingRunInfo.inspectionCheckpointKey && result.inspectedPages) {
+          session.inspectionCheckpoints = mergeInspectionCheckpoint(
+            session.inspectionCheckpoints,
+            pendingRunInfo.inspectionCheckpointKey,
+            session.sourceHash,
+            Math.max(1, Math.min(120, session.report.pages.length)),
+            result.inspectedPages,
+          );
+        }
         try { await persistDocumentSession(session); } catch { /* Keep the active review available in memory if local storage is unavailable. */ }
       }
     }
@@ -1255,6 +1726,9 @@ app.post('/api/ai/approve', async (request, response, next) => {
       return;
     }
     next(error);
+  } finally {
+    if (lockedRunId) activeApprovalRunIds.delete(lockedRunId);
+    if (lockedWorkbookSessionId) unlockWorkbookSession(lockedWorkbookSessionId);
   }
 });
 

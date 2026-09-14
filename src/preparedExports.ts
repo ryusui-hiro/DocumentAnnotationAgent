@@ -22,6 +22,7 @@ export function restorePreparedDocumentExports(value: unknown, sourceDocumentNam
       sourceDocumentName: item.sourceDocumentName,
       fileName: item.fileName,
       format: item.format as PreparedDocumentExport['format'],
+      ...(typeof item.snapshotSignature === 'string' && /^[\da-f]{64}$/i.test(item.snapshotSignature) ? { snapshotSignature: item.snapshotSignature } : {}),
       annotationsExported: Math.max(0, Math.floor(Number(item.annotationsExported))),
       skippedCount: Math.max(0, Math.floor(Number(item.skippedCount))),
       expiresAt: Number(item.expiresAt),

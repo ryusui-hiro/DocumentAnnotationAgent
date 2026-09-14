@@ -4,16 +4,36 @@ import { posix } from 'node:path';
 import type { Annotation } from '../src/types';
 import { annotationReviewStatus } from '../src/annotationStatus';
 
-const presentationNamespace = 'http://schemas.openxmlformats.org/presentationml/2006/main';
-const drawingNamespace = 'http://schemas.openxmlformats.org/drawingml/2006/main';
-const relationshipNamespace = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
 const packageRelationshipsNamespace = 'http://schemas.openxmlformats.org/package/2006/relationships';
 const contentTypesNamespace = 'http://schemas.openxmlformats.org/package/2006/content-types';
-const tagsRelationshipType = `${relationshipNamespace}/tags`;
 const tagsContentType = 'application/vnd.openxmlformats-officedocument.presentationml.tags+xml';
 const maxXmlPartLength = 25_000_000;
 type XmlDocument = ReturnType<DOMParser['parseFromString']>;
 type XmlElement = NonNullable<XmlDocument['documentElement']>;
+
+interface PptxNamespaceProfile {
+  presentation: string;
+  drawing: string;
+  relationships: string;
+  slideRelationshipType: string;
+  tagsRelationshipType: string;
+}
+
+const transitionalNamespaces: PptxNamespaceProfile = {
+  presentation: 'http://schemas.openxmlformats.org/presentationml/2006/main',
+  drawing: 'http://schemas.openxmlformats.org/drawingml/2006/main',
+  relationships: 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
+  slideRelationshipType: 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide',
+  tagsRelationshipType: 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/tags',
+};
+
+const strictNamespaces: PptxNamespaceProfile = {
+  presentation: 'http://purl.oclc.org/ooxml/presentationml/main',
+  drawing: 'http://purl.oclc.org/ooxml/drawingml/main',
+  relationships: 'http://purl.oclc.org/ooxml/officeDocument/relationships',
+  slideRelationshipType: 'http://purl.oclc.org/ooxml/officeDocument/relationships/slide',
+  tagsRelationshipType: 'http://purl.oclc.org/ooxml/officeDocument/relationships/tags',
+};
 
 export interface PptxAnnotationExportResult {
   buffer: Buffer;
@@ -55,6 +75,12 @@ function parseXml(xml: string, partName: string) {
   return document;
 }
 
+function pptxNamespacesForPresentation(namespace: string | null | undefined) {
+  if (namespace === transitionalNamespaces.presentation) return transitionalNamespaces;
+  if (namespace === strictNamespaces.presentation) return strictNamespaces;
+  return undefined;
+}
+
 function clamp(value: number, minimum: number, maximum: number) {
   return Math.min(maximum, Math.max(minimum, Number.isFinite(value) ? value : minimum));
 }
@@ -65,12 +91,12 @@ function safeHexColor(value?: string, priority?: Annotation['reviewPriority']) {
   return priority === 'high' ? 'C64E57' : priority === 'low' ? '147F78' : 'C0842D';
 }
 
-function setDrawingTransform(shapeProperties: XmlElement, x: number, y: number, width: number, height: number) {
-  const transform = shapeProperties.ownerDocument!.createElementNS(drawingNamespace, 'a:xfrm');
-  const offset = shapeProperties.ownerDocument!.createElementNS(drawingNamespace, 'a:off');
+function setDrawingTransform(shapeProperties: XmlElement, x: number, y: number, width: number, height: number, namespaces: PptxNamespaceProfile) {
+  const transform = shapeProperties.ownerDocument!.createElementNS(namespaces.drawing, 'a:xfrm');
+  const offset = shapeProperties.ownerDocument!.createElementNS(namespaces.drawing, 'a:off');
   offset.setAttribute('x', String(x));
   offset.setAttribute('y', String(y));
-  const extent = shapeProperties.ownerDocument!.createElementNS(drawingNamespace, 'a:ext');
+  const extent = shapeProperties.ownerDocument!.createElementNS(namespaces.drawing, 'a:ext');
   extent.setAttribute('cx', String(width));
   extent.setAttribute('cy', String(height));
   transform.appendChild(offset);
@@ -78,70 +104,78 @@ function setDrawingTransform(shapeProperties: XmlElement, x: number, y: number, 
   shapeProperties.appendChild(transform);
 }
 
-function addGeometry(shapeProperties: XmlElement) {
+function addGeometry(shapeProperties: XmlElement, namespaces: PptxNamespaceProfile) {
   const document = shapeProperties.ownerDocument!;
-  const geometry = document.createElementNS(drawingNamespace, 'a:prstGeom');
+  const geometry = document.createElementNS(namespaces.drawing, 'a:prstGeom');
   geometry.setAttribute('prst', 'rect');
-  geometry.appendChild(document.createElementNS(drawingNamespace, 'a:avLst'));
+  geometry.appendChild(document.createElementNS(namespaces.drawing, 'a:avLst'));
   shapeProperties.appendChild(geometry);
 }
 
-function addNonVisualProperties(document: XmlDocument, shape: XmlElement, id: number, name: string, description: string, textBox: boolean) {
-  const nonVisual = document.createElementNS(presentationNamespace, 'p:nvSpPr');
-  const cNvPr = document.createElementNS(presentationNamespace, 'p:cNvPr');
+function addNonVisualProperties(document: XmlDocument, shape: XmlElement, id: number, name: string, description: string, textBox: boolean, namespaces: PptxNamespaceProfile) {
+  const nonVisual = document.createElementNS(namespaces.presentation, 'p:nvSpPr');
+  const cNvPr = document.createElementNS(namespaces.presentation, 'p:cNvPr');
   cNvPr.setAttribute('id', String(id));
   cNvPr.setAttribute('name', xmlSafe(name).slice(0, 120));
   cNvPr.setAttribute('descr', xmlSafe(description).slice(0, 1000));
-  const cNvSpPr = document.createElementNS(presentationNamespace, 'p:cNvSpPr');
+  const cNvSpPr = document.createElementNS(namespaces.presentation, 'p:cNvSpPr');
   if (textBox) cNvSpPr.setAttribute('txBox', '1');
-  const nvPr = document.createElementNS(presentationNamespace, 'p:nvPr');
+  const nvPr = document.createElementNS(namespaces.presentation, 'p:nvPr');
   nonVisual.appendChild(cNvPr);
   nonVisual.appendChild(cNvSpPr);
   nonVisual.appendChild(nvPr);
   shape.appendChild(nonVisual);
 }
 
-function appendOutline(document: XmlDocument, shapeTree: XmlElement, annotation: Annotation, id: number, x: number, y: number, width: number, height: number, color: string) {
-  const shape = document.createElementNS(presentationNamespace, 'p:sp');
-  addNonVisualProperties(document, shape, id, `Annotation region ${id}`, `${annotation.label}. ${annotation.reason ?? annotation.note}. ${annotation.excerpt ?? ''}`, false);
-  const properties = document.createElementNS(presentationNamespace, 'p:spPr');
-  setDrawingTransform(properties, x, y, width, height);
-  addGeometry(properties);
-  properties.appendChild(document.createElementNS(drawingNamespace, 'a:noFill'));
-  const line = document.createElementNS(drawingNamespace, 'a:ln');
+function annotationShapeDescription(annotation: Annotation, part: string, fragmentIndex?: number, fragmentCount?: number) {
+  const target = `Slide ${annotation.pageNumber}; region ${annotation.x.toFixed(4)},${annotation.y.toFixed(4)},${annotation.width.toFixed(4)},${annotation.height.toFixed(4)}`;
+  const fragment = fragmentIndex === undefined ? '' : `; fragment ${fragmentIndex + 1} of ${fragmentCount}`;
+  return `[AnnotationStudio ID: ${annotation.id}] ${annotation.label}. ${part}${fragment}. ${target}. ${annotation.reason ?? annotation.note}. Evidence: ${annotation.excerpt ?? ''}`;
+}
+
+function appendOutline(document: XmlDocument, shapeTree: XmlElement, annotation: Annotation, id: number, fragmentIndex: number, fragmentCount: number, x: number, y: number, width: number, height: number, color: string, namespaces: PptxNamespaceProfile) {
+  const shape = document.createElementNS(namespaces.presentation, 'p:sp');
+  const safeId = xmlSafe(annotation.id).slice(0, 100);
+  addNonVisualProperties(document, shape, id, `AS ${safeId} region ${fragmentIndex + 1}`, annotationShapeDescription(annotation, 'region', fragmentIndex, fragmentCount), false, namespaces);
+  const properties = document.createElementNS(namespaces.presentation, 'p:spPr');
+  setDrawingTransform(properties, x, y, width, height, namespaces);
+  addGeometry(properties, namespaces);
+  properties.appendChild(document.createElementNS(namespaces.drawing, 'a:noFill'));
+  const line = document.createElementNS(namespaces.drawing, 'a:ln');
   line.setAttribute('w', '19050');
-  const lineFill = document.createElementNS(drawingNamespace, 'a:solidFill');
-  const lineColor = document.createElementNS(drawingNamespace, 'a:srgbClr');
+  const lineFill = document.createElementNS(namespaces.drawing, 'a:solidFill');
+  const lineColor = document.createElementNS(namespaces.drawing, 'a:srgbClr');
   lineColor.setAttribute('val', color);
   lineFill.appendChild(lineColor);
   line.appendChild(lineFill);
-  const dash = document.createElementNS(drawingNamespace, 'a:prstDash');
+  const dash = document.createElementNS(namespaces.drawing, 'a:prstDash');
   dash.setAttribute('val', 'solid');
   line.appendChild(dash);
   properties.appendChild(line);
   shape.appendChild(properties);
-  const extensionList = Array.from(shapeTree.childNodes).find((node) => node.nodeType === node.ELEMENT_NODE && (node as XmlElement).namespaceURI === presentationNamespace && (node as XmlElement).localName === 'extLst') ?? null;
+  const extensionList = Array.from(shapeTree.childNodes).find((node) => node.nodeType === node.ELEMENT_NODE && (node as XmlElement).namespaceURI === namespaces.presentation && (node as XmlElement).localName === 'extLst') ?? null;
   shapeTree.insertBefore(shape, extensionList);
 }
 
-function appendLabel(document: XmlDocument, shapeTree: XmlElement, annotation: Annotation, id: number, x: number, y: number, width: number, height: number, color: string) {
-  const shape = document.createElementNS(presentationNamespace, 'p:sp');
-  addNonVisualProperties(document, shape, id, `Annotation label ${id}`, `${annotation.label}. ${annotation.reason ?? annotation.note}. ${annotation.excerpt ?? ''}`, true);
-  const properties = document.createElementNS(presentationNamespace, 'p:spPr');
-  setDrawingTransform(properties, x, y, width, height);
-  addGeometry(properties);
-  const fill = document.createElementNS(drawingNamespace, 'a:solidFill');
-  const fillColor = document.createElementNS(drawingNamespace, 'a:srgbClr');
+function appendLabel(document: XmlDocument, shapeTree: XmlElement, annotation: Annotation, id: number, x: number, y: number, width: number, height: number, color: string, namespaces: PptxNamespaceProfile) {
+  const shape = document.createElementNS(namespaces.presentation, 'p:sp');
+  const safeId = xmlSafe(annotation.id).slice(0, 100);
+  addNonVisualProperties(document, shape, id, `AS ${safeId} label`, annotationShapeDescription(annotation, 'label'), true, namespaces);
+  const properties = document.createElementNS(namespaces.presentation, 'p:spPr');
+  setDrawingTransform(properties, x, y, width, height, namespaces);
+  addGeometry(properties, namespaces);
+  const fill = document.createElementNS(namespaces.drawing, 'a:solidFill');
+  const fillColor = document.createElementNS(namespaces.drawing, 'a:srgbClr');
   fillColor.setAttribute('val', color);
   fill.appendChild(fillColor);
   properties.appendChild(fill);
-  const line = document.createElementNS(drawingNamespace, 'a:ln');
-  line.appendChild(document.createElementNS(drawingNamespace, 'a:noFill'));
+  const line = document.createElementNS(namespaces.drawing, 'a:ln');
+  line.appendChild(document.createElementNS(namespaces.drawing, 'a:noFill'));
   properties.appendChild(line);
   shape.appendChild(properties);
 
-  const textBody = document.createElementNS(presentationNamespace, 'p:txBody');
-  const bodyProperties = document.createElementNS(drawingNamespace, 'a:bodyPr');
+  const textBody = document.createElementNS(namespaces.presentation, 'p:txBody');
+  const bodyProperties = document.createElementNS(namespaces.drawing, 'a:bodyPr');
   bodyProperties.setAttribute('wrap', 'none');
   bodyProperties.setAttribute('lIns', '45720');
   bodyProperties.setAttribute('rIns', '45720');
@@ -149,43 +183,43 @@ function appendLabel(document: XmlDocument, shapeTree: XmlElement, annotation: A
   bodyProperties.setAttribute('bIns', '22860');
   bodyProperties.setAttribute('anchor', 'ctr');
   textBody.appendChild(bodyProperties);
-  textBody.appendChild(document.createElementNS(drawingNamespace, 'a:lstStyle'));
-  const paragraph = document.createElementNS(drawingNamespace, 'a:p');
-  const paragraphProperties = document.createElementNS(drawingNamespace, 'a:pPr');
+  textBody.appendChild(document.createElementNS(namespaces.drawing, 'a:lstStyle'));
+  const paragraph = document.createElementNS(namespaces.drawing, 'a:p');
+  const paragraphProperties = document.createElementNS(namespaces.drawing, 'a:pPr');
   paragraphProperties.setAttribute('algn', 'l');
-  const defaultRunProperties = document.createElementNS(drawingNamespace, 'a:defRPr');
+  const defaultRunProperties = document.createElementNS(namespaces.drawing, 'a:defRPr');
   defaultRunProperties.setAttribute('sz', '900');
   defaultRunProperties.setAttribute('b', '1');
-  const defaultFill = document.createElementNS(drawingNamespace, 'a:solidFill');
-  const defaultTextColor = document.createElementNS(drawingNamespace, 'a:srgbClr');
+  const defaultFill = document.createElementNS(namespaces.drawing, 'a:solidFill');
+  const defaultTextColor = document.createElementNS(namespaces.drawing, 'a:srgbClr');
   defaultTextColor.setAttribute('val', 'FFFFFF');
   defaultFill.appendChild(defaultTextColor);
   defaultRunProperties.appendChild(defaultFill);
   paragraphProperties.appendChild(defaultRunProperties);
   paragraph.appendChild(paragraphProperties);
-  const run = document.createElementNS(drawingNamespace, 'a:r');
-  const runProperties = document.createElementNS(drawingNamespace, 'a:rPr');
+  const run = document.createElementNS(namespaces.drawing, 'a:r');
+  const runProperties = document.createElementNS(namespaces.drawing, 'a:rPr');
   runProperties.setAttribute('lang', 'ja-JP');
   runProperties.setAttribute('sz', '900');
   runProperties.setAttribute('b', '1');
-  const runFill = document.createElementNS(drawingNamespace, 'a:solidFill');
-  const textColor = document.createElementNS(drawingNamespace, 'a:srgbClr');
+  const runFill = document.createElementNS(namespaces.drawing, 'a:solidFill');
+  const textColor = document.createElementNS(namespaces.drawing, 'a:srgbClr');
   textColor.setAttribute('val', 'FFFFFF');
   runFill.appendChild(textColor);
   runProperties.appendChild(runFill);
-  const eastAsianFont = document.createElementNS(drawingNamespace, 'a:ea');
+  const eastAsianFont = document.createElementNS(namespaces.drawing, 'a:ea');
   eastAsianFont.setAttribute('typeface', 'Yu Gothic');
   runProperties.appendChild(eastAsianFont);
   run.appendChild(runProperties);
-  const text = document.createElementNS(drawingNamespace, 'a:t');
+  const text = document.createElementNS(namespaces.drawing, 'a:t');
   text.appendChild(document.createTextNode(xmlSafe(annotation.label).slice(0, 80)));
   run.appendChild(text);
   paragraph.appendChild(run);
-  paragraph.appendChild(document.createElementNS(drawingNamespace, 'a:endParaRPr'));
+  paragraph.appendChild(document.createElementNS(namespaces.drawing, 'a:endParaRPr'));
   textBody.appendChild(paragraph);
   shape.appendChild(textBody);
 
-  const extensionList = Array.from(shapeTree.childNodes).find((node) => node.nodeType === node.ELEMENT_NODE && (node as XmlElement).namespaceURI === presentationNamespace && (node as XmlElement).localName === 'extLst') ?? null;
+  const extensionList = Array.from(shapeTree.childNodes).find((node) => node.nodeType === node.ELEMENT_NODE && (node as XmlElement).namespaceURI === namespaces.presentation && (node as XmlElement).localName === 'extLst') ?? null;
   shapeTree.insertBefore(shape, extensionList);
 }
 
@@ -214,6 +248,13 @@ function annotationSemanticTags(items: Array<{ annotation: Annotation }>): PptxS
   const findings = items.map(({ annotation }) => ({
     id: xmlSafe(annotation.id).slice(0, 100),
     category: xmlSafe(annotation.label).slice(0, 60),
+    target: {
+      kind: 'slide',
+      slide: annotation.pageNumber,
+      boundingBox: { x: annotation.x, y: annotation.y, width: annotation.width, height: annotation.height },
+      ...(annotation.fragments?.length ? { fragments: annotation.fragments.slice(0, 32) } : {}),
+      ...(annotation.textAnchor ? { textAnchor: annotation.textAnchor } : {}),
+    },
     evidence: xmlSafe(annotation.excerpt ?? '').slice(0, 1000),
     explanation: xmlSafe(annotation.reason || annotation.note).slice(0, 1000),
     reviewPriority: annotation.reviewPriority ?? (annotation.requiresReview ? 'high' : 'medium'),
@@ -239,7 +280,7 @@ function nextRelationshipId(root: XmlElement) {
   return `rIdAnnotationStudioTags${counter}`;
 }
 
-async function updateSlideTags(zip: JSZip, slidePath: string, tags: PptxSemanticTag[]) {
+async function updateSlideTags(zip: JSZip, slidePath: string, tags: PptxSemanticTag[], namespaces: PptxNamespaceProfile) {
   const slideDirectory = posix.dirname(slidePath);
   const slideFileName = posix.basename(slidePath);
   const relationshipsPath = posix.join(slideDirectory, '_rels', `${slideFileName}.rels`);
@@ -252,7 +293,7 @@ async function updateSlideTags(zip: JSZip, slidePath: string, tags: PptxSemantic
     throw Object.assign(new Error('PowerPoint slide relationships are invalid.'), { status: 415 });
   }
   let tagRelationship = Array.from(relationshipsRoot.getElementsByTagNameNS(packageRelationshipsNamespace, 'Relationship'))
-    .find((relationship) => relationship.getAttribute('Type') === tagsRelationshipType);
+    .find((relationship) => relationship.getAttribute('Type') === namespaces.tagsRelationshipType);
   let tagsPath: string;
   if (tagRelationship) {
     if (tagRelationship.getAttribute('TargetMode') === 'External') {
@@ -265,7 +306,7 @@ async function updateSlideTags(zip: JSZip, slidePath: string, tags: PptxSemantic
     const target = posix.relative(slideDirectory, tagsPath);
     tagRelationship = relationships.createElementNS(packageRelationshipsNamespace, 'Relationship');
     tagRelationship.setAttribute('Id', nextRelationshipId(relationshipsRoot));
-    tagRelationship.setAttribute('Type', tagsRelationshipType);
+    tagRelationship.setAttribute('Type', namespaces.tagsRelationshipType);
     tagRelationship.setAttribute('Target', target);
     relationshipsRoot.appendChild(tagRelationship);
   }
@@ -273,20 +314,20 @@ async function updateSlideTags(zip: JSZip, slidePath: string, tags: PptxSemantic
   const existingTagsFile = zip.file(tagsPath);
   const tagsDocument = existingTagsFile
     ? parseXml(await existingTagsFile.async('string'), tagsPath)
-    : parseXml(`<p:tagLst xmlns:p="${presentationNamespace}"/>`, tagsPath);
+    : parseXml(`<p:tagLst xmlns:p="${namespaces.presentation}"/>`, tagsPath);
   const tagsRoot = tagsDocument.documentElement;
-  if (!tagsRoot || tagsRoot.namespaceURI !== presentationNamespace || tagsRoot.localName !== 'tagLst') {
+  if (!tagsRoot || tagsRoot.namespaceURI !== namespaces.presentation || tagsRoot.localName !== 'tagLst') {
     throw Object.assign(new Error('PowerPoint user-defined tags part is invalid.'), { status: 415 });
   }
-  const existingTags = Array.from(tagsRoot.getElementsByTagNameNS(presentationNamespace, 'tag'));
+  const existingTags = Array.from(tagsRoot.getElementsByTagNameNS(namespaces.presentation, 'tag'));
   for (const tag of tags) {
-    const matches = existingTags.filter((item) => item.getAttribute('name')?.toLocaleLowerCase() === tag.name.toLocaleLowerCase());
+    const matches = existingTags.filter((item) => item.getAttribute('name')?.toLowerCase() === tag.name.toLowerCase());
     const existing = matches[0];
     if (existing) {
       existing.setAttribute('val', tag.value);
       for (const duplicate of matches.slice(1)) tagsRoot.removeChild(duplicate);
     } else {
-      const element = tagsDocument.createElementNS(presentationNamespace, 'p:tag');
+      const element = tagsDocument.createElementNS(namespaces.presentation, 'p:tag');
       element.setAttribute('name', tag.name);
       element.setAttribute('val', tag.value);
       tagsRoot.appendChild(element);
@@ -331,24 +372,29 @@ export async function exportPowerPointAnnotations(source: Buffer, annotations: A
   const relationships = parseXml(await relationshipsFile.async('string'), 'ppt/_rels/presentation.xml.rels');
   const presentationRoot = presentation.documentElement;
   const relationshipsRoot = relationships.documentElement;
-  if (!presentationRoot || presentationRoot.namespaceURI !== presentationNamespace || presentationRoot.localName !== 'presentation'
+  const namespaces = pptxNamespacesForPresentation(presentationRoot?.namespaceURI);
+  if (!presentationRoot || !namespaces || presentationRoot.localName !== 'presentation'
     || !relationshipsRoot || relationshipsRoot.namespaceURI !== packageRelationshipsNamespace || relationshipsRoot.localName !== 'Relationships') {
     throw Object.assign(new Error('PowerPoint presentation structure is invalid.'), { status: 415 });
   }
-  const slideSize = presentationRoot.getElementsByTagNameNS(presentationNamespace, 'sldSz').item(0);
+  const slideSize = presentationRoot.getElementsByTagNameNS(namespaces.presentation, 'sldSz').item(0);
   const slideWidth = Number(slideSize?.getAttribute('cx'));
   const slideHeight = Number(slideSize?.getAttribute('cy'));
   if (!Number.isFinite(slideWidth) || slideWidth <= 0 || !Number.isFinite(slideHeight) || slideHeight <= 0) {
     throw Object.assign(new Error('PowerPoint slide dimensions could not be read.'), { status: 415 });
   }
-  const relationshipMap = new Map(Array.from(relationshipsRoot.getElementsByTagNameNS(packageRelationshipsNamespace, 'Relationship')).map((item) => [item.getAttribute('Id') ?? '', item.getAttribute('Target') ?? '']));
-  const slideIds = Array.from(presentationRoot.getElementsByTagNameNS(presentationNamespace, 'sldId'));
+  const relationshipMap = new Map(Array.from(relationshipsRoot.getElementsByTagNameNS(packageRelationshipsNamespace, 'Relationship')).map((item) => [item.getAttribute('Id') ?? '', {
+    target: item.getAttribute('Target') ?? '',
+    type: item.getAttribute('Type') ?? '',
+  }]));
+  const slideIds = Array.from(presentationRoot.getElementsByTagNameNS(namespaces.presentation, 'sldId'));
   const slidePaths = slideIds.map((slideId) => {
-    const relationshipId = slideId.getAttributeNS(relationshipNamespace, 'id');
-    return relationshipId ? relationshipMap.get(relationshipId) : undefined;
+    const relationshipId = slideId.getAttributeNS(namespaces.relationships, 'id');
+    const relationship = relationshipId ? relationshipMap.get(relationshipId) : undefined;
+    return relationship?.type === namespaces.slideRelationshipType ? relationship.target : undefined;
   }).map((target) => target ? resolveSlidePart(target) : null);
   const skipped: PptxAnnotationExportResult['skipped'] = [];
-  const groups = new Map<string, Array<{ annotation: Annotation; x: number; y: number; width: number; height: number; color: string }>>();
+  const groups = new Map<string, Array<{ annotation: Annotation; x: number; y: number; width: number; height: number; outlineBoxes: Array<{ x: number; y: number; width: number; height: number }>; color: string }>>();
   for (const annotation of annotations) {
     const slidePath = slidePaths[annotation.pageNumber - 1];
     if (!slidePath) {
@@ -363,8 +409,31 @@ export async function exportPowerPointAnnotations(source: Buffer, annotations: A
       skipped.push({ annotationId: annotation.id, label: annotation.label, reason: 'invalid_region' });
       continue;
     }
+    const sourceFragments = annotation.fragments?.length ? annotation.fragments.slice(0, 32) : [{ x: annotation.x, y: annotation.y, width: annotation.width, height: annotation.height }];
+    const fragmentsAreValid = sourceFragments.every((fragment) =>
+      Number.isFinite(fragment.x) && Number.isFinite(fragment.y) && Number.isFinite(fragment.width) && Number.isFinite(fragment.height)
+      && fragment.x >= 0 && fragment.y >= 0 && fragment.width > 0 && fragment.height > 0
+      && fragment.x + fragment.width <= 1.001 && fragment.y + fragment.height <= 1.001);
+    if (!fragmentsAreValid) {
+      skipped.push({ annotationId: annotation.id, label: annotation.label, reason: 'invalid_region' });
+      continue;
+    }
+    const outlineBoxes = sourceFragments.map((fragment) => {
+      const fragmentX = clamp(fragment.x, 0, 0.98);
+      const fragmentY = clamp(fragment.y, 0, 0.98);
+      return {
+        x: fragmentX,
+        y: fragmentY,
+        width: Math.min(1 - fragmentX, clamp(fragment.width, 0.005, 1)),
+        height: Math.min(1 - fragmentY, clamp(fragment.height, 0.005, 1)),
+      };
+    });
+    if (outlineBoxes.some((box) => box.width <= 0 || box.height <= 0)) {
+      skipped.push({ annotationId: annotation.id, label: annotation.label, reason: 'invalid_region' });
+      continue;
+    }
     const items = groups.get(slidePath) ?? [];
-    items.push({ annotation, x, y, width, height, color: safeHexColor(annotation.color, annotation.reviewPriority) });
+    items.push({ annotation, x, y, width, height, outlineBoxes, color: safeHexColor(annotation.color, annotation.reviewPriority) });
     groups.set(slidePath, items);
   }
 
@@ -380,28 +449,28 @@ export async function exportPowerPointAnnotations(source: Buffer, annotations: A
     }
     const slide = parseXml(await file.async('string'), slidePath);
     const slideRoot = slide.documentElement;
-    const shapeTree = slideRoot?.getElementsByTagNameNS(presentationNamespace, 'spTree').item(0);
+    const shapeTree = slideRoot?.getElementsByTagNameNS(namespaces.presentation, 'spTree').item(0);
     if (!shapeTree) {
       for (const item of items) skipped.push({ annotationId: item.annotation.id, label: item.annotation.label, reason: 'slide_missing' });
       continue;
     }
-    const maxShapeId = Array.from(shapeTree.getElementsByTagNameNS(presentationNamespace, 'cNvPr'))
+    const maxShapeId = Array.from(shapeTree.getElementsByTagNameNS(namespaces.presentation, 'cNvPr'))
       .reduce((maximum, properties) => Math.max(maximum, Number(properties.getAttribute('id')) || 0), 0);
     let nextId = maxShapeId + 1;
     for (const item of items) {
       const left = Math.round(item.x * slideWidth);
       const top = Math.round(item.y * slideHeight);
-      const width = Math.max(1, Math.round(item.width * slideWidth));
-      const height = Math.max(1, Math.round(item.height * slideHeight));
-      appendOutline(slide, shapeTree, item.annotation, nextId++, left, top, width, height, item.color);
+      item.outlineBoxes.forEach((box, fragmentIndex) => {
+        appendOutline(slide, shapeTree, item.annotation, nextId++, fragmentIndex, item.outlineBoxes.length, Math.round(box.x * slideWidth), Math.round(box.y * slideHeight), Math.max(1, Math.round(box.width * slideWidth)), Math.max(1, Math.round(box.height * slideHeight)), item.color, namespaces);
+      });
       const tagHeight = Math.min(280_000, slideHeight);
       const tagTop = top >= tagHeight ? top - tagHeight : top;
       const tagWidth = Math.min(Math.max(1, slideWidth - left), Math.min(3_000_000, Math.max(500_000, item.annotation.label.length * 100_000)));
-      appendLabel(slide, shapeTree, item.annotation, nextId++, left, tagTop, tagWidth, tagHeight, item.color);
+      appendLabel(slide, shapeTree, item.annotation, nextId++, left, tagTop, tagWidth, tagHeight, item.color, namespaces);
       annotationsAdded += 1;
     }
     zip.file(slidePath, new XMLSerializer().serializeToString(slide));
-    tagValuesWritten += await updateSlideTags(zip, slidePath, annotationSemanticTags(items));
+    tagValuesWritten += await updateSlideTags(zip, slidePath, annotationSemanticTags(items), namespaces);
     slidesTagged += 1;
     slidesModified += 1;
   }

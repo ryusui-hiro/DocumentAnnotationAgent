@@ -41,7 +41,6 @@ const testEnvironment = {
   TMPDIR: tempRoot,
   ...runtimeDirectories,
   ANNOTATION_STUDIO_DATA_DIR: apiDataDirectory,
-  ANNOTATION_STUDIO_FORCE_SIDECAR: '1',
   AI_PROVIDER: 'openai',
   OPENAI_API_KEY: '',
   OPENAI_BASE_URL: '',
@@ -354,6 +353,9 @@ async function runScenario(scenario, fixture, index, total, apiBaseUrl) {
       element.dispatchEvent(new Event('input', { bubbles: true }));
       element.dispatchEvent(new Event('change', { bubbles: true }));
     };
+    const guidelineDetails = document.querySelector('.guideline-details');
+    if (!guidelineDetails) throw new Error('The guideline details disclosure is missing.');
+    guidelineDetails.open = true;
     setValue('#ai-prompt', 'Find torque limits and safety requirements on page 1. Ask me when the evidence is uncertain.');
     setValue('#annotation-guidelines', 'Use a concise label, quote the visible passage, and explain why it needs review.');
     document.querySelector('.task-plan-button')?.click();
@@ -377,7 +379,7 @@ async function runScenario(scenario, fixture, index, total, apiBaseUrl) {
   await waitForScript('page-one candidates and a waiting human-review state', `
     const activity = document.querySelector('section[aria-label="Agent Activity"]');
     const status = activity?.querySelector('.agent-status-pill')?.textContent.trim();
-    return status === 'Waiting' && document.querySelectorAll('.candidate-section .candidate-list .candidate-card').length === 2;
+    return status === '確認待ち' && document.querySelectorAll('.candidate-section .candidate-list .candidate-card').length === 2;
   `);
 
   const resourceUrls = await executeScript(`return performance.getEntriesByType('resource').map((entry) => entry.name);`);
@@ -387,12 +389,12 @@ async function runScenario(scenario, fixture, index, total, apiBaseUrl) {
   assert.deepEqual(scenarioAiRequests, [], `The ${scenario.action} run attempted a provider endpoint.`);
 
   const activityText = await executeScript(`return document.querySelector('section[aria-label="Agent Activity"]').innerText;`);
-  for (const phase of ['Planning', 'Navigating', 'Reading', 'Searching', 'Asking']) {
+  for (const phase of ['計画', 'ページ移動', '読み取り', '検索', '人の確認']) {
     assert.ok(activityText.includes(phase), `Visible Agent Activity is missing ${phase}.`);
   }
   assert.ok(await executeScript(`return document.querySelector('.candidate-section .demo-note')?.textContent.includes('デモ候補です。実モデルの解析結果ではありません。') ?? false;`), 'The app should disclose the deterministic demo candidates.');
   const activityRows = await executeScript(`return Array.from(document.querySelectorAll('section[aria-label="Agent Activity"] .agent-activity-list > li')).map((item) => item.innerText);`);
-  const visitedPages = new Set(activityRows.flatMap((row) => [...row.matchAll(/P\.(\d+)/g)].map((match) => Number(match[1]))));
+  const visitedPages = new Set(activityRows.flatMap((row) => [...row.matchAll(/(?:P\.|ページ\s*)(\d+)/g)].map((match) => Number(match[1]))));
   assert.deepEqual([...visitedPages], [1], 'This run should visit only page 1.');
 
   const decision = await executeScript(`
@@ -432,6 +434,9 @@ async function runScenario(scenario, fixture, index, total, apiBaseUrl) {
   `, [scenario.action]);
 
   const exportResult = await executeScript(`
+    const menuToggle = document.querySelector('.export-menu-toggle');
+    if (!menuToggle) throw new Error('The export menu control is missing.');
+    menuToggle.click();
     const button = Array.from(document.querySelectorAll('.export-popover button')).find((item) => item.textContent.trim() === '構造化JSONを保存');
     if (!button) throw new Error('The structured JSON export menu item is missing.');
     button.click();

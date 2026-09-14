@@ -18,7 +18,10 @@ export function resolveHumanReviewStatus(
   const covered = new Map((pageCoverage ?? []).map((item) => [item.pageNumber, item]));
   const coverageStillNeedsReview = (targets ?? []).some((page) => {
     const item = covered.get(page);
-    return !item || item.status !== 'checked' || item.warningCount > 0;
+    if (!item) return true;
+    const inspected = item.status === 'checked' || (item.status === 'image_only' && item.humanReviewed === true);
+    const warningsResolved = item.warningCount === 0 || item.warningAcknowledged === true;
+    return !inspected || !warningsResolved;
   });
   return { status: hasPendingReview || coverageStillNeedsReview ? 'waiting' : 'complete', coverageStillNeedsReview };
 }
@@ -115,6 +118,8 @@ function readPageCoverage(value: unknown): AgentPageCoverage[] {
       findingCount: Number.isFinite(item.findingCount) ? Math.max(0, Math.min(500, Math.floor(Number(item.findingCount)))) : 0,
       reviewCount: Number.isFinite(item.reviewCount) ? Math.max(0, Math.min(500, Math.floor(Number(item.reviewCount)))) : 0,
       warningCount: Number.isFinite(item.warningCount) ? Math.max(0, Math.min(100, Math.floor(Number(item.warningCount)))) : 0,
+      ...(item.humanReviewed === true ? { humanReviewed: true } : {}),
+      ...(item.warningAcknowledged === true ? { warningAcknowledged: true } : {}),
       ...(Number.isFinite(item.textBlockCount) ? { textBlockCount: Math.max(0, Math.min(2000, Math.floor(Number(item.textBlockCount)))) } : {}),
       ...(typeof item.detail === 'string' ? { detail: item.detail.slice(0, 500) } : {}),
     };

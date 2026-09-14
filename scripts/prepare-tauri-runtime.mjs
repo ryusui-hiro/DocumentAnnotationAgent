@@ -8,6 +8,8 @@ import { pipeline } from 'node:stream/promises';
 import JSZip from 'jszip';
 
 export const NODE_VERSION = 'v24.21.0';
+export const bundledDemoPdfNames = ['demo-specification.pdf', 'fictional-termination-contract.pdf', 'demos/product-hunt-termination-contract.pdf'];
+export const bundledDemoAssetNames = [...bundledDemoPdfNames, 'demos/customer-feedback-demo.xlsx', 'demos/customer-churn-risk-demo.xlsx'];
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const OUTPUT = join(ROOT, 'src-tauri', 'resources', 'desktop-runtime');
 const CACHE = join(ROOT, '.cache', 'desktop-runtime');
@@ -97,10 +99,19 @@ async function copyApiSources(runtimeDirectory) {
   await mkdir(sourceDirectory, { recursive: true });
   for (const name of ['annotationStatus.ts', 'taskPlan.ts', 'types.ts']) await cp(join(ROOT, 'src', name), join(sourceDirectory, name));
   await cp(join(ROOT, 'scripts', 'desktop-api-launcher.mjs'), join(runtimeDirectory, 'desktop-api-launcher.mjs'));
-  await mkdir(join(runtimeDirectory, 'public'), { recursive: true });
-  await cp(join(ROOT, 'public', 'demo-specification.pdf'), join(runtimeDirectory, 'public', 'demo-specification.pdf'));
+  await copyBundledDemoAssets(runtimeDirectory);
   await cp(join(ROOT, 'package.json'), join(runtimeDirectory, 'package.json'));
   await cp(join(ROOT, 'package-lock.json'), join(runtimeDirectory, 'package-lock.json'));
+}
+
+export async function copyBundledDemoAssets(runtimeDirectory) {
+  const destination = join(runtimeDirectory, 'public');
+  await mkdir(destination, { recursive: true });
+  for (const name of bundledDemoAssetNames) {
+    const target = join(destination, name);
+    await mkdir(dirname(target), { recursive: true });
+    await cp(join(ROOT, 'public', name), target);
+  }
 }
 
 export async function extractWindowsNodeArchive(archivePath, outputNode) {

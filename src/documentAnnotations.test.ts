@@ -47,6 +47,20 @@ test('review priority does not change with the optional numeric model estimate',
   assert.deepEqual(records.map((record) => record.reviewPriority), ['low', 'low']);
 });
 
+test('a high-priority clear finding remains automatically applied when review is not required', () => {
+  const records = normalizeDocumentAnnotationRecords({
+    documentId: 'autopilot-clear-high', fileType: 'PDF',
+    annotations: [{
+      id: 'important-result', pageNumber: 1, x: 0.1, y: 0.1, width: 0.4, height: 0.1,
+      label: 'HIGH RISK', note: 'The evidence is clear.', reason: 'The contract permits termination without cause.',
+      reviewPriority: 'high', requiresReview: false, color: '#c64e57', source: 'ai',
+    }],
+    candidates: [], rejectedCandidates: [], spreadsheetChanges: [],
+  });
+  assert.equal(records[0]?.status, 'auto');
+  assert.equal(restoreDocumentAnnotationRecords(records).annotations[0]?.requiresReview, false);
+});
+
 test('canonical annotation IDs are unique and the latest review state wins', () => {
   const records = normalizeDocumentAnnotationRecords({
     documentId: 'dedupe-test', fileType: 'PDF',

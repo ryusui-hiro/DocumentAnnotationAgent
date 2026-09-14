@@ -13,7 +13,7 @@ export default defineConfig({
       '/api': process.env.ANNOTATION_STUDIO_API_TARGET || 'http://127.0.0.1:3001',
     },
     watch: {
-      ignored: ['**/src-tauri/**'],
+      ignored: ['**/src-tauri/**', '**/.cache/**'],
     },
   },
   build: process.env.TAURI_ENV_PLATFORM ? {

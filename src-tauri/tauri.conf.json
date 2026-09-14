@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Annotation Studio",
+  "productName": "Astra Annotator",
   "version": "0.1.0",
   "identifier": "com.annotationstudio.desktop",
   "build": {
@@ -13,7 +13,7 @@
   "app": {
     "windows": [
       {
-        "title": "Annotation Studio",
+        "title": "Astra Annotator",
         "width": 1440,
         "height": 960,
         "minWidth": 960,

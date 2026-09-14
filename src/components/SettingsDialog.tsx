@@ -89,7 +89,7 @@ export default function SettingsDialog({
 
             {isCodex ? (
               <div className="settings-info-box codex-info">
-                <div><CircleHelp size={17} /><div><strong>Codex App Serverを使います</strong><p>このAnnotation Studio APIと同じ端末にCodex CLIがあり、Codexにログイン済みである必要があります。処理はread-onlyで起動し、文書内の指示はデータとして扱います。</p></div></div>
+                <div><CircleHelp size={17} /><div><strong>Codex App Serverを使います</strong><p>Astra Annotator APIと同じ端末にCodex CLIがあり、Codexにログイン済みである必要があります。処理はread-onlyで起動し、文書内の指示はデータとして扱います。</p></div></div>
                 <button className="button button-secondary settings-test-button" type="button" onClick={onRefreshCodexModels} disabled={codexModelsLoading}>
                   {codexModelsLoading ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}
                   {codexModelsLoading ? 'モデル一覧を確認中…' : 'モデル一覧を確認'}

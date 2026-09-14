@@ -10,6 +10,19 @@ test('turns a natural-language PII request into a bounded annotation plan', () =
   assert.match(taskPlanAsInstructions(plan), /Task: 個人情報/);
 });
 
+test('turns a safety-warning and torque extraction request into evidence-specific labels', () => {
+  const plan = localTaskPlan(
+    '安全上の警告と締結トルクを抽出',
+    '該当箇所を囲み、簡潔なラベルと文書上の根拠を付けてください。判断が曖昧な場合は確認が必要としてください。',
+  );
+  assert.deepEqual(plan.labels.map((label) => label.name), ['SAFETY_WARNING', 'FASTENING_TORQUE']);
+  assert.doesNotMatch(plan.labels.map((label) => label.name).join(' '), /CLAIM|EVIDENCE|ASSUMPTION|CITATION_NEEDED/);
+  assert.match(plan.actions.join(' '), /数値・単位/);
+  assert.match(plan.uncertaintyPolicy, /単位/);
+  assert.match(taskPlanAsInstructions(plan), /FASTENING_TORQUE/);
+  assert.match(taskPlanAsInstructions(plan), /preserve numeric units/);
+});
+
 test('task plan signature changes with the task or mode', () => {
   const base = taskPlanSignature('Find risks', 'High means severe', '', 'assist', 'gpt-6-astra', 'openai-api');
   assert.notEqual(base, taskPlanSignature('Find PII', 'High means severe', '', 'assist', 'gpt-6-astra', 'openai-api'));

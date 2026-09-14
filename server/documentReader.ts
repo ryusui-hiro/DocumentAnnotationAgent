@@ -4,8 +4,8 @@ import { z } from 'zod';
 export const documentReaderOutputSchema = z.object({
   pageSummary: z.string().max(1000),
   evidenceBlocks: z.array(z.object({
-    excerpt: z.string().max(800),
-    description: z.string().max(300),
+    excerpt: z.string().max(400),
+    description: z.string().max(180),
     boundingBox: z.object({
       x: z.number().min(0).max(1),
       y: z.number().min(0).max(1),
@@ -13,9 +13,11 @@ export const documentReaderOutputSchema = z.object({
       height: z.number().min(0).max(1),
     }).strict().nullable(),
     readingPriority: z.enum(['low', 'medium', 'high']),
-  }).strict()).max(12),
-  uncertainties: z.array(z.string().max(240)).max(8),
+  }).strict()).max(6),
+  uncertainties: z.array(z.string().max(160)).max(4),
 }).strict();
+
+export const documentReaderLimits = { maxDelegationsPerRun: 24 } as const;
 
 export type DocumentReaderOutput = z.infer<typeof documentReaderOutputSchema>;
 

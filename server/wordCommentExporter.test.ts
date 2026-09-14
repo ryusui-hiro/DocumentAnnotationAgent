@@ -74,6 +74,37 @@ test('the shared DocumentAdapter exports canonical records as Word comments', as
   assert.ok(zip.file('word/comments.xml'));
 });
 
+test('the shared DocumentAdapter passes text-anchor context to disambiguate a repeated Word excerpt', async () => {
+  const source = await makeDocx({ documentXml: `<w:document xmlns:w="${W}"><w:body><w:p><w:r><w:t>Context A: Repeated claim without evidence. first follow up.</w:t></w:r></w:p><w:p><w:r><w:t>Context B: Repeated claim without evidence. other follow up.</w:t></w:r></w:p><w:sectPr/></w:body></w:document>` });
+  const report = {
+    sourceFormat: 'DOCX', pageCount: 1,
+    pages: [{ number: 1, widthPoints: 612, heightPoints: 792, warningCount: 0, warnings: [], svg: '<svg/>' }],
+  } as unknown as PreviewReport;
+  const adapter = new PagedDocumentAdapter('contract.docx', report, 'doc-1', source);
+  const exact = 'Repeated claim without evidence.';
+  const prefix = 'Context B: ';
+  const suffix = ' other follow up.';
+  adapter.annotate({
+    id: 'adapter-word-context', documentId: 'doc-1',
+    target: {
+      kind: 'page', page: 1, boundingBox: { x: 0.1, y: 0.2, width: 0.5, height: 0.1 },
+      textAnchor: { quote: { exact, prefix, suffix }, position: { start: 10, end: 43, unit: 'normalized-page-text' } },
+    },
+    label: 'Supported claim', evidence: exact, explanation: 'The second occurrence is supported by context.',
+    reviewPriority: 'low', status: 'auto', excerpt: exact,
+  });
+
+  const exported = await adapter.export({ format: 'native-annotated' });
+  assert.equal(exported.annotationsExported, 1);
+  const zip = await JSZip.loadAsync(exported.buffer);
+  const document = new DOMParser().parseFromString(await zip.file('word/document.xml')!.async('string'), 'application/xml');
+  const start = document.getElementsByTagNameNS(W, 'commentRangeStart').item(0)!;
+  const paragraph = start.parentNode as unknown as TestXmlElement;
+  const paragraphText = Array.from(paragraph.getElementsByTagNameNS(W, 't')).map((node) => node.textContent ?? '').join('');
+  assert.match(paragraphText, /Context B:/u);
+  assert.doesNotMatch(paragraphText, /Context A:/u);
+});
+
 test('writes excerpt-anchored comments to a new DOCX copy and reports unmatched excerpts', async () => {
   const source = await makeDocx();
   const original = Buffer.from(source);
@@ -204,6 +235,22 @@ test('reports an excerpt repeated twice in one paragraph as ambiguous', async ()
   assert.deepEqual(exported.skipped, [{ annotationId: 'same-paragraph-duplicate', label: 'Termination', reason: 'ambiguous' }]);
 });
 
+test('does not let missing document-edge context select the wrong repeated Word excerpt', async () => {
+  const documentXml = `<w:document xmlns:w="${W}"><w:body><w:p><w:r><w:t>Repeated claim without evidence. matching suffix.</w:t></w:r></w:p><w:p><w:r><w:t>Context B: Repeated claim without evidence. incorrect suffix.</w:t></w:r></w:p><w:sectPr/></w:body></w:document>`;
+  const source = await makeDocx({ documentXml });
+  const exported = await exportWordComments(source, [{
+    id: 'edge-context-mismatch', label: 'Supported claim', note: '', excerpt: 'Repeated claim without evidence.',
+    textAnchor: {
+      quote: { exact: 'Repeated claim without evidence.', prefix: 'Context B: ', suffix: ' matching suffix.' },
+      position: { start: 0, end: 33, unit: 'normalized-page-text' },
+    },
+  }]);
+  assert.equal(exported.commentsAdded, 0);
+  assert.equal(exported.annotationsAnchored, 0);
+  assert.deepEqual(exported.skipped, [{ annotationId: 'edge-context-mismatch', label: 'Supported claim', reason: 'ambiguous' }]);
+  assert.deepEqual(exported.buffer, source);
+});
+
 test('preserves existing Word comments and allocates a new comment id', async () => {
   const source = await makeDocx({
     commentsRelationship: `<Relationship Id="rIdComments" Type="${COMMENT_REL}" Target="comments.xml"/>`,
@@ -223,4 +270,22 @@ test('preserves existing Word comments and allocates a new comment id', async ()
   assert.equal(entries.length, 2);
   assert.deepEqual(entries.map((comment) => comment.getAttributeNS(W, 'id')), ['0', '1']);
   assert.match(comments.documentElement?.textContent ?? '', /Existing comment/);
+});
+
+test('removes XML 1.0-invalid control characters from Word comment text fields', async () => {
+  const source = await makeDocx();
+  const exported = await exportWordComments(source, [{
+    id: 'xml-control', label: 'HIGH\u0001RISK', note: 'note\u0002 text',
+    reason: 'reason\u0003 text', excerpt: 'Either party\u000b may',
+  }]);
+  assert.equal(exported.commentsAdded, 1);
+  assert.equal(exported.annotationsAnchored, 1);
+  const zip = await JSZip.loadAsync(exported.buffer);
+  const commentsXml = await zip.file('word/comments.xml')!.async('string');
+  assert.doesNotMatch(commentsXml, /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/u);
+  const comments = new DOMParser().parseFromString(commentsXml, 'application/xml');
+  const text = Array.from(comments.getElementsByTagNameNS(W, 't')).map((node) => node.textContent ?? '').join('\n');
+  assert.match(text, /Label: HIGHRISK/u);
+  assert.match(text, /Reason: reason text/u);
+  assert.match(text, /Evidence: Either party may/u);
 });

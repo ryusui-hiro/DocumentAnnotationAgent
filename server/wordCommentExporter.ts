@@ -1,7 +1,7 @@
 import JSZip from 'jszip';
 import { DOMParser, XMLSerializer } from '@xmldom/xmldom';
 import { posix } from 'node:path';
-import type { Annotation } from '../src/types';
+import type { Annotation, TextAnchor } from '../src/types';
 
 const wordNamespace = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
 const packageRelationshipsNamespace = 'http://schemas.openxmlformats.org/package/2006/relationships';
@@ -14,7 +14,9 @@ type XmlDocument = ReturnType<DOMParser['parseFromString']>;
 type XmlElement = NonNullable<XmlDocument['documentElement']>;
 type XmlNode = NonNullable<XmlElement['firstChild']>;
 
-export interface WordCommentExportAnnotation extends Pick<Annotation, 'id' | 'label' | 'note' | 'reason' | 'excerpt' | 'reviewPriority'> {}
+export interface WordCommentExportAnnotation extends Pick<Annotation, 'id' | 'label' | 'note' | 'reason' | 'excerpt' | 'reviewPriority'> {
+  textAnchor?: TextAnchor;
+}
 
 export interface WordCommentExportResult {
   buffer: Buffer;
@@ -290,10 +292,25 @@ function setWordAttribute(element: XmlElement, localName: string, value: string)
   element.setAttributeNS(wordNamespace, `w:${localName}`, value);
 }
 
+function xmlSafe(value: string) {
+  let output = '';
+  for (const character of value) {
+    const codePoint = character.codePointAt(0) ?? 0;
+    if (codePoint === 0x9 || codePoint === 0xa || codePoint === 0xd
+      || (codePoint >= 0x20 && codePoint <= 0xd7ff)
+      || (codePoint >= 0xe000 && codePoint <= 0xfffd)
+      || (codePoint >= 0x10000 && codePoint <= 0x10ffff)) {
+      output += character;
+    }
+  }
+  return output;
+}
+
 function xmlText(document: XmlDocument, value: string) {
   const text = document.createElementNS(wordNamespace, 'w:t');
-  text.appendChild(document.createTextNode(value));
-  if (/^\s|\s$/.test(value)) text.setAttributeNS('http://www.w3.org/XML/1998/namespace', 'xml:space', 'preserve');
+  const safeValue = xmlSafe(value);
+  text.appendChild(document.createTextNode(safeValue));
+  if (/^\s|\s$/.test(safeValue)) text.setAttributeNS('http://www.w3.org/XML/1998/namespace', 'xml:space', 'preserve');
   return text;
 }
 
@@ -361,30 +378,37 @@ export async function exportWordComments(source: Buffer, annotations: WordCommen
   if (!contentTypesRoot || contentTypesRoot.namespaceURI !== contentTypesNamespace || contentTypesRoot.localName !== 'Types') throw Object.assign(new Error('The Word content types part is invalid.'), { status: 415 });
   const paragraphs = getParagraphs(document);
   const paragraphIndexes = new Map<XmlElement, ParagraphTextIndex>();
+  const paragraphStarts = new Map<XmlElement, number>();
+  let fullDocumentText = '';
+  for (const paragraph of paragraphs) {
+    if (fullDocumentText) fullDocumentText += ' ';
+    paragraphStarts.set(paragraph, fullDocumentText.length);
+    const index = paragraphTextIndex(paragraph);
+    paragraphIndexes.set(paragraph, index);
+    fullDocumentText += index.text;
+  }
   const groupsByParagraph = new Map<XmlElement, ParagraphCommentGroup[]>();
   const skipped: WordCommentExportResult['skipped'] = [];
 
   for (const annotation of annotations.slice(0, 500)) {
-    const excerpt = typeof annotation.excerpt === 'string' ? annotation.excerpt : '';
+    // The page text selector survives the canonical adapter. Use its exact quote for
+    // matching, then its surrounding quote to resolve repeated phrases when possible.
+    const excerpt = annotation.textAnchor?.quote.exact || (typeof annotation.excerpt === 'string' ? annotation.excerpt : '');
     const query = normalizedText(excerpt);
     if (!query) {
       skipped.push({ annotationId: annotation.id, label: annotation.label, reason: 'missing_excerpt' });
       continue;
     }
-    const matches: Array<{ paragraph: XmlElement; match: MatchedWordExcerpt; startIndex: number }> = [];
+    const matches: Array<{ paragraph: XmlElement; match: MatchedWordExcerpt; startIndex: number; globalStart: number }> = [];
     for (const paragraph of paragraphs) {
-      let index = paragraphIndexes.get(paragraph);
-      if (!index) {
-        index = paragraphTextIndex(paragraph);
-        paragraphIndexes.set(paragraph, index);
-      }
+      const index = paragraphIndexes.get(paragraph)!;
       let fromIndex = 0;
       while (fromIndex <= index.text.length - query.length) {
         const foundAt = index.text.indexOf(query, fromIndex);
         if (foundAt < 0) break;
         const start = index.positions[foundAt];
         const end = index.positions[foundAt + query.length - 1];
-        if (start && end) matches.push({ paragraph, match: { start, end }, startIndex: foundAt });
+        if (start && end) matches.push({ paragraph, match: { start, end }, startIndex: foundAt, globalStart: paragraphStarts.get(paragraph)! + foundAt });
         fromIndex = foundAt + 1;
       }
     }
@@ -392,11 +416,30 @@ export async function exportWordComments(source: Buffer, annotations: WordCommen
       skipped.push({ annotationId: annotation.id, label: annotation.label, reason: 'not_found' });
       continue;
     }
-    if (matches.length > 1) {
+    let resolvedMatches = matches;
+    const anchor = annotation.textAnchor?.quote;
+    if (matches.length > 1 && anchor && (anchor.prefix.trim() || anchor.suffix.trim())) {
+      const prefix = normalizedText(anchor.prefix);
+      const suffix = normalizedText(anchor.suffix);
+      const contextualMatches = matches.filter((candidate) => {
+        // The exported page anchor and Word XML can use different runs/whitespace.
+        // Read a few extra characters, then compare normalized context.
+        const before = normalizedText(fullDocumentText.slice(Math.max(0, candidate.globalStart - prefix.length - 4), candidate.globalStart));
+        const afterStart = candidate.globalStart + query.length;
+        const after = normalizedText(fullDocumentText.slice(afterStart, Math.min(fullDocumentText.length, afterStart + suffix.length + 4)));
+        const atDocumentStart = candidate.globalStart < prefix.length + 4;
+        const atDocumentEnd = afterStart + suffix.length + 4 >= fullDocumentText.length;
+        const prefixMatches = !prefix || (before.length > 0 && (before.endsWith(prefix) || (atDocumentStart && prefix.endsWith(before))));
+        const suffixMatches = !suffix || (after.length > 0 && (after.startsWith(suffix) || (atDocumentEnd && suffix.startsWith(after))));
+        return prefixMatches && suffixMatches;
+      });
+      if (contextualMatches.length) resolvedMatches = contextualMatches;
+    }
+    if (resolvedMatches.length > 1) {
       skipped.push({ annotationId: annotation.id, label: annotation.label, reason: 'ambiguous' });
       continue;
     }
-    const { paragraph, match, startIndex } = matches[0]!;
+    const { paragraph, match, startIndex } = resolvedMatches[0]!;
     const groups = groupsByParagraph.get(paragraph) ?? [];
     const endIndex = startIndex + query.length;
     const identicalRange = groups.find((group) => group.startIndex === startIndex && group.endIndex === endIndex);

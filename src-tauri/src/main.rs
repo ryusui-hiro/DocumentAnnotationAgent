@@ -187,18 +187,6 @@ fn start_local_api(app: &tauri::App<tauri::Wry>) -> Result<(), String> {
         return Err("The packaged document API entry point is missing.".to_owned());
     }
 
-    // Keep an existing Annotation Studio API configured on the old default
-    // port usable during upgrades; unrelated services are not accepted.
-    let force_bundled = std::env::var("ANNOTATION_STUDIO_FORCE_SIDECAR").as_deref() == Ok("1");
-    if !force_bundled && health_check(3001) {
-        *app.state::<LocalApi>()
-            .base_url
-            .lock()
-            .map_err(|_| "The local API startup state is unavailable.".to_owned())? =
-            DEFAULT_API_BASE_URL.to_owned();
-        return Ok(());
-    }
-
     let data_directory = match std::env::var_os("ANNOTATION_STUDIO_DATA_DIR") {
         Some(path) => PathBuf::from(path),
         None => app

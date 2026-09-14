@@ -344,6 +344,7 @@ export class PagedDocumentAdapter implements DocumentAdapter {
         reason: annotation.reason ?? annotation.explanation,
         excerpt: annotation.excerpt ?? annotation.evidence,
         reviewPriority: annotation.reviewPriority,
+        ...(annotation.target.kind !== 'sheet' && annotation.target.textAnchor ? { textAnchor: annotation.target.textAnchor } : {}),
       })));
       return {
         format: request.format,
@@ -368,6 +369,8 @@ export class PagedDocumentAdapter implements DocumentAdapter {
           y: annotation.target.boundingBox.y,
           width: annotation.target.boundingBox.width,
           height: annotation.target.boundingBox.height,
+          ...(annotation.target.fragments?.length ? { fragments: annotation.target.fragments } : {}),
+          ...(annotation.target.textAnchor ? { textAnchor: annotation.target.textAnchor } : {}),
           label: annotation.label,
           note: annotation.note ?? '',
           reason: annotation.reason ?? annotation.explanation,
@@ -400,40 +403,106 @@ export class PagedDocumentAdapter implements DocumentAdapter {
   }
 
   private async exportAnnotatedPdf(annotations: DocumentAnnotationRecord[], fileBase: string): Promise<DocumentExportResult> {
-    const { PDFDocument, StandardFonts, rgb } = await import('pdf-lib');
-    const pdf = await PDFDocument.create();
-    pdf.setTitle(`${this.fileName} · Annotated`);
-    pdf.setAuthor('Annotation Studio');
+    const { PDFDocument, StandardFonts, degrees, rgb } = await import('pdf-lib');
+    const preserveSourcePdf = this.report.sourceFormat.toLowerCase() === 'pdf' && this.sourceBuffer !== undefined;
+    const pdf = preserveSourcePdf
+      ? await PDFDocument.load(Uint8Array.from(this.sourceBuffer!))
+      : await PDFDocument.create();
+    if (!preserveSourcePdf) {
+      pdf.setTitle(`${this.fileName} · Annotated`);
+      pdf.setAuthor('Annotation Studio');
+    }
     const font = await pdf.embedFont(StandardFonts.Helvetica);
     let annotationsExported = 0;
     const skipped: DocumentExportResult['skipped'] = [];
+
+    const sourcePages = preserveSourcePdf ? pdf.getPages() : [];
     for (const sourcePage of this.report.pages) {
-      const width = Math.max(1, sourcePage.widthPoints);
-      const height = Math.max(1, sourcePage.heightPoints);
-      const page = pdf.addPage([width, height]);
-      const png = await sharp(Buffer.from(sourcePage.svg)).png().toBuffer();
-      const image = await pdf.embedPng(png);
-      page.drawImage(image, { x: 0, y: 0, width, height });
       const pageNumber = sourcePage.number;
-      const marks = annotations.filter((annotation) => (annotation.target.kind === 'page' ? annotation.target.page : annotation.target.kind === 'slide' ? annotation.target.slide : 0) === pageNumber);
+      let page: ReturnType<typeof pdf.getPage> | undefined;
+      let visualWidth: number;
+      let visualHeight: number;
+      let rotation = 0;
+      let toPdfRectangle: (box: { x: number; y: number; width: number; height: number }) => { x: number; y: number; width: number; height: number };
+      let toPdfPoint: (x: number, yFromTop: number) => { x: number; y: number };
+
+      if (preserveSourcePdf) {
+        page = Number.isInteger(pageNumber) && pageNumber > 0 && pageNumber <= sourcePages.length
+          ? sourcePages[pageNumber - 1]
+          : undefined;
+        if (!page) {
+          annotations.filter((annotation) =>
+            (annotation.target.kind === 'page' ? annotation.target.page : annotation.target.kind === 'slide' ? annotation.target.slide : 0) === pageNumber)
+            .forEach((annotation) => skipped.push({ annotationId: annotation.id, label: annotation.label, reason: 'source_page_missing' }));
+          continue;
+        }
+        const crop = page.getCropBox();
+        rotation = ((page.getRotation().angle % 360) + 360) % 360;
+        const swapsDimensions = rotation === 90 || rotation === 270;
+        visualWidth = swapsDimensions ? crop.height : crop.width;
+        visualHeight = swapsDimensions ? crop.width : crop.height;
+        toPdfRectangle = (box) => {
+          switch (rotation) {
+            case 90:
+              return { x: crop.x + box.y * crop.width, y: crop.y + box.x * crop.height, width: box.height * crop.width, height: box.width * crop.height };
+            case 180:
+              return { x: crop.x + (1 - box.x - box.width) * crop.width, y: crop.y + box.y * crop.height, width: box.width * crop.width, height: box.height * crop.height };
+            case 270:
+              return { x: crop.x + (1 - box.y - box.height) * crop.width, y: crop.y + (1 - box.x - box.width) * crop.height, width: box.height * crop.width, height: box.width * crop.height };
+            default:
+              return { x: crop.x + box.x * crop.width, y: crop.y + (1 - box.y - box.height) * crop.height, width: box.width * crop.width, height: box.height * crop.height };
+          }
+        };
+        toPdfPoint = (x, yFromTop) => {
+          switch (rotation) {
+            case 90: return { x: crop.x + yFromTop, y: crop.y + x };
+            case 180: return { x: crop.x + crop.width - x, y: crop.y + yFromTop };
+            case 270: return { x: crop.x + crop.width - yFromTop, y: crop.y + crop.height - x };
+            default: return { x: crop.x + x, y: crop.y + crop.height - yFromTop };
+          }
+        };
+      } else {
+        visualWidth = Math.max(1, sourcePage.widthPoints);
+        visualHeight = Math.max(1, sourcePage.heightPoints);
+        page = pdf.addPage([visualWidth, visualHeight]);
+        const png = await sharp(Buffer.from(sourcePage.svg)).png().toBuffer();
+        const image = await pdf.embedPng(png);
+        page.drawImage(image, { x: 0, y: 0, width: visualWidth, height: visualHeight });
+        toPdfRectangle = (box) => ({
+          x: box.x * visualWidth,
+          y: visualHeight - (box.y + box.height) * visualHeight,
+          width: box.width * visualWidth,
+          height: box.height * visualHeight,
+        });
+        toPdfPoint = (x, yFromTop) => ({ x, y: visualHeight - yFromTop });
+      }
+
+      const marks = annotations.filter((annotation) =>
+        (annotation.target.kind === 'page' ? annotation.target.page : annotation.target.kind === 'slide' ? annotation.target.slide : 0) === pageNumber);
       marks.forEach((annotation, index) => {
         const box = annotation.target.kind === 'page' || annotation.target.kind === 'slide' ? annotation.target.boundingBox : null;
         if (!box) { skipped.push({ annotationId: annotation.id, label: annotation.label, reason: 'invalid_target' }); return; }
-        const pending = annotation.status === 'needs_review';
-        const colorValue = pending ? 'E89A27' : annotation.color ?? '#278779';
+        const colorValue = annotation.status === 'needs_review' ? 'E89A27' : annotation.color ?? '#278779';
         const match = colorValue.replace(/^#/, '').match(/^[0-9a-f]{6}$/i);
         const color = match ? rgb(Number.parseInt(match[0].slice(0, 2), 16) / 255, Number.parseInt(match[0].slice(2, 4), 16) / 255, Number.parseInt(match[0].slice(4, 6), 16) / 255) : rgb(0.09, 0.5, 0.47);
-        const fragments = (annotation.target.kind === 'page' || annotation.target.kind === 'slide') && annotation.target.fragments?.length
-          ? annotation.target.fragments
+        const fragments = annotation.target.kind === 'page' || annotation.target.kind === 'slide'
+          ? annotation.target.fragments?.length ? annotation.target.fragments : [box]
           : [box];
         fragments.forEach((fragment, fragmentIndex) => {
-          const x = fragment.x * width;
-          const y = height - (fragment.y + fragment.height) * height;
-          page.drawRectangle({ x, y, width: Math.max(1, fragment.width * width), height: Math.max(1, fragment.height * height), borderColor: color, borderWidth: 1.5 });
+          const rect = toPdfRectangle(fragment);
+          page!.drawRectangle({ x: rect.x, y: rect.y, width: Math.max(1, rect.width), height: Math.max(1, rect.height), borderColor: color, borderWidth: 1.5 });
           if (fragmentIndex === 0) {
-            const tagY = Math.min(height - 13, Math.max(0, height - fragment.y * height - 13));
-            page.drawRectangle({ x, y: tagY, width: 15, height: 13, color });
-            page.drawText(String(index + 1), { x: x + 4, y: tagY + 3, size: 8, font, color: rgb(1, 1, 1) });
+            const tagX = fragment.x * visualWidth;
+            const tagY = Math.min(visualHeight - 13, Math.max(0, fragment.y * visualHeight));
+            const tag = toPdfRectangle({
+              x: tagX / visualWidth,
+              y: tagY / visualHeight,
+              width: Math.min(15, visualWidth - tagX) / visualWidth,
+              height: Math.min(13, visualHeight - tagY) / visualHeight,
+            });
+            page!.drawRectangle({ x: tag.x, y: tag.y, width: tag.width, height: tag.height, color });
+            const markerPoint = toPdfPoint(tagX + 4, tagY + 10);
+            page!.drawText(String(index + 1), { x: markerPoint.x, y: markerPoint.y, size: 8, font, color: rgb(1, 1, 1), rotate: degrees(-rotation) });
           }
         });
         annotationsExported += 1;

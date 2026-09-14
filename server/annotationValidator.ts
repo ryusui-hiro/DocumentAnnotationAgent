@@ -151,8 +151,6 @@ export async function runAnnotationValidator(args: {
         ].join('\n\n'),
       }],
     }], { maxTurns: 2, toolNotFoundBehavior: 'return_error_to_model' });
-    const parsed = validatorOutputSchema.safeParse(result.finalOutput);
-    if (!parsed.success) throw new Error('Validator Agent returned an invalid structured result.');
     const usage = result.state.usage as unknown as {
       requests?: number;
       inputTokens?: number;
@@ -163,16 +161,19 @@ export async function runAnnotationValidator(args: {
       requestUsageEntries?: unknown[];
     };
     const sumDetail = (details: Array<Record<string, number>> | undefined, ...keys: string[]) => (details ?? []).reduce((sum, item) => sum + keys.reduce((total, key) => total + Number(item[key] ?? 0), 0), 0);
+    const normalizedUsage = {
+      requests: Number(usage.requests ?? usage.requestUsageEntries?.length ?? 0),
+      inputTokens: Number(usage.inputTokens ?? 0),
+      outputTokens: Number(usage.outputTokens ?? 0),
+      reasoningTokens: sumDetail(usage.outputTokensDetails, 'reasoning_tokens', 'reasoningTokens'),
+      cachedInputTokens: sumDetail(usage.inputTokensDetails, 'cached_tokens', 'cachedTokens'),
+      totalTokens: Number(usage.totalTokens ?? 0),
+    };
+    const parsed = validatorOutputSchema.safeParse(result.finalOutput);
+    if (!parsed.success) throw Object.assign(new Error('Validator Agent returned an invalid structured result.'), { usage: normalizedUsage });
     return {
       findings: sanitizeValidatorFindings(parsed.data, args.annotations),
-      usage: {
-        requests: Number(usage.requests ?? usage.requestUsageEntries?.length ?? 0),
-        inputTokens: Number(usage.inputTokens ?? 0),
-        outputTokens: Number(usage.outputTokens ?? 0),
-        reasoningTokens: sumDetail(usage.outputTokensDetails, 'reasoning_tokens', 'reasoningTokens'),
-        cachedInputTokens: sumDetail(usage.inputTokensDetails, 'cached_tokens', 'cachedTokens'),
-        totalTokens: Number(usage.totalTokens ?? 0),
-      },
+      usage: normalizedUsage,
     };
   } finally {
     if (provider) await provider.close();

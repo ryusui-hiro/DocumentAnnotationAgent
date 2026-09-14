@@ -67,9 +67,40 @@ export function taskPlanSignature(instruction: string, guidelines: string, corre
 
 export function localTaskPlan(instruction: string, guidelines = ''): AnnotationTaskPlan {
   const normalized = instruction.trim();
-  const text = `${normalized}\n${guidelines}`.toLocaleLowerCase();
+  const taskText = normalized.toLocaleLowerCase();
+  const guidanceText = guidelines.toLocaleLowerCase();
+  const text = `${taskText}\n${guidanceText}`;
   let labels: AnnotationTaskPlan['labels'];
-  if (/個人情報|pii|personal information/.test(text)) {
+  let actions = ['該当領域をハイライト', 'ラベルと根拠を記録'];
+  let uncertaintyPolicy = /曖昧|不明|uncertain|ambiguous|確認|review/.test(text)
+    ? '曖昧、読み取れない、または基準が競合する場合は自動で確定せず、人の確認に回す。'
+    : '根拠が明確でない場合は推測せず、人の確認に回す。';
+  let workflow = ['文書の各ページを読み、候補箇所を探す。', '候補を分類し、画面上の領域を特定する。', '根拠と短い抜粋を付け、曖昧な候補は確認待ちにする。'];
+  const safetyExtraction = /安全|safety|warning|警告/.test(taskText) && /抽出|extract|find|locate|見つけ|探し/.test(taskText);
+  const torqueExtraction = /締結トルク|トルク|torque/.test(taskText) && /抽出|extract|find|locate|見つけ|探し/.test(taskText);
+  const safetyAndTorqueExtraction = safetyExtraction && torqueExtraction;
+  let objective = normalized.slice(0, 500) || '文書内の該当箇所を特定し、根拠を付ける。';
+  if (safetyAndTorqueExtraction) {
+    labels = [
+      { name: 'SAFETY_WARNING', description: '安全を守るために必要な警告、禁止事項、作業手順。必須条件の範囲を対象にする。' },
+      { name: 'FASTENING_TORQUE', description: '締結トルクの数値を原文どおり抽出し、単位と関連部品を含める。' },
+    ];
+    actions = ['警告文またはトルク値の範囲をハイライト', '正確な抜粋・数値・単位を記録'];
+    uncertaintyPolicy = '数値、単位、対象部品が欠けている、読み取れない、または一致しない場合は推測せず人に確認する。';
+    workflow = ['各ページの警告文と締結トルクを探す。', '根拠のある文または数値の正確な範囲を特定する。', '単位を保って短く引用し、不確かな箇所だけ人に確認する。'];
+    objective = '安全上の警告と締結トルク値を抽出し、原文の根拠と位置を付けて記録する。';
+  } else if (safetyExtraction) {
+    labels = [{ name: 'SAFETY_WARNING', description: '安全を守るために必要な警告、禁止事項、作業手順。必須条件の範囲を対象にする。' }];
+    actions = ['警告文または必須手順の範囲をハイライト', '正確な原文抜粋と理由を記録'];
+    workflow = ['各ページの安全警告と必須手順を探す。', '文書に書かれた警告の範囲だけを特定する。', '原文を短く引用し、不明な手順だけ人に確認する。'];
+    objective = '安全上の警告と必須手順を抽出し、原文の根拠と位置を付けて記録する。';
+  } else if (torqueExtraction) {
+    labels = [{ name: 'FASTENING_TORQUE', description: '締結トルクの数値を原文どおり抽出し、単位と関連部品を含める。' }];
+    actions = ['トルク値と関連部品の範囲をハイライト', '正確な数値・単位・原文抜粋を記録'];
+    uncertaintyPolicy = '数値、単位、または対象部品を特定できない場合は推測せず人に確認する。';
+    workflow = ['各ページのトルク値と単位を探す。', '対象部品との対応をページ画像で確認する。', '値・単位・短い抜粋を記録し、不明な対応だけ人に確認する。'];
+    objective = '締結トルク値を単位・対象部品とともに抽出し、原文の根拠と位置を記録する。';
+  } else if (/個人情報|pii|personal information/.test(taskText)) {
     labels = [
       { name: 'PERSON_NAME', description: '個人を特定できる氏名' },
       { name: 'EMAIL', description: 'メールアドレス' },
@@ -83,7 +114,7 @@ export function localTaskPlan(instruction: string, guidelines = ''): AnnotationT
       { name: 'MEDIUM', description: '条件、範囲、責任が不明確な箇所' },
       { name: 'LOW', description: '限定的で標準的な注意事項' },
     ];
-  } else if (/claim|主張|根拠|citation/.test(text)) {
+  } else if (/claim|主張|citation/.test(taskText)) {
     labels = [
       { name: 'CLAIM', description: '文書内の主要な主張' },
       { name: 'EVIDENCE', description: '主張を支える根拠' },
@@ -96,11 +127,11 @@ export function localTaskPlan(instruction: string, guidelines = ''): AnnotationT
   const humanReview = /曖昧|不明|uncertain|ambiguous|確認|review/.test(text);
   return {
     title: (normalized || '文書レビュー').slice(0, 120),
-    objective: normalized.slice(0, 500) || '文書内の該当箇所を特定し、根拠を付ける。',
+    objective,
     labels,
-    actions: ['該当領域をハイライト', 'ラベルと根拠を記録'],
-    uncertaintyPolicy: humanReview ? '曖昧、読み取れない、または基準が競合する場合は自動で確定せず、人の確認に回す。' : '根拠が明確でない場合は推測せず、人の確認に回す。',
-    workflow: ['文書の各ページを読み、候補箇所を探す。', '候補を分類し、画面上の領域を特定する。', '根拠と短い抜粋を付け、曖昧な候補は確認待ちにする。'],
+    actions,
+    uncertaintyPolicy: safetyAndTorqueExtraction ? uncertaintyPolicy : humanReview ? '曖昧、読み取れない、または基準が競合する場合は自動で確定せず、人の確認に回す。' : uncertaintyPolicy,
+    workflow,
   } satisfies AnnotationTaskPlan;
 }
 
@@ -110,6 +141,7 @@ export function taskPlanAsInstructions(plan: AnnotationTaskPlan) {
     `Objective: ${plan.objective}`,
     `Labels: ${plan.labels.map((item) => `${item.name} — ${item.description}`).join('; ')}`,
     `Actions: ${plan.actions.join('; ')}`,
+    'Evidence: use an exact visible excerpt or addressed cell values; retain page, slide, sheet, and range targets, preserve numeric units, explain the label, and never infer missing content.',
     `Uncertainty: ${plan.uncertaintyPolicy}`,
     `Workflow: ${plan.workflow.join(' → ')}`,
   ].join('\n');

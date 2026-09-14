@@ -38,6 +38,106 @@ test('opens workbook outline, inspects sheets, and reads bounded cell ranges', a
   assert.deepEqual(adapter.search('Mina')[0]?.location, { kind: 'sheet', sheetName: 'Customers', range: 'A3' });
 });
 
+test('preserves readable ISO dates for date-only cells while keeping formatted timestamps intact', async () => {
+  const workbook = new ExcelJS.Workbook();
+  const sheet = workbook.addWorksheet('Dates');
+  sheet.addRow(['Last login', 'Updated at']);
+  sheet.getCell('A2').value = new Date('2026-07-01T00:00:00.000Z');
+  sheet.getCell('A2').numFmt = 'yyyy-mm-dd';
+  sheet.getCell('B2').value = new Date('2026-07-01T12:34:56.000Z');
+  sheet.getCell('B2').numFmt = 'yyyy-mm-dd hh:mm:ss';
+  const adapter = await SpreadsheetDocumentAdapter.fromBuffer('dates.xlsx', Buffer.from(await workbook.xlsx.writeBuffer()));
+
+  assert.deepEqual(adapter.listSheets()[0]?.sampleRows[0]?.values, ['2026-07-01', '2026-07-01T12:34:56.000Z']);
+  assert.deepEqual(adapter.readRange('Dates', 'A2:B2').rows[0]?.map((cell) => cell.value), ['2026-07-01', '2026-07-01T12:34:56.000Z']);
+  const dateMatch = adapter.search('2026-07-01')[0];
+  assert.ok(dateMatch?.location.kind === 'sheet');
+  assert.equal(dateMatch.location.range, 'A2');
+});
+
+test('change context is a bounded original-source window that remains available after review', async () => {
+  const workbook = new ExcelJS.Workbook();
+  const sheet = workbook.addWorksheet('Customers');
+  sheet.addRow(['Name', 'Last login', 'Risk']);
+  for (let row = 2; row <= 40; row += 1) sheet.addRow([`Customer ${row}`, `2026-09-${String((row % 28) + 1).padStart(2, '0')}`, `source-${row}`]);
+  sheet.getCell('B25').value = 'source-neighborhood';
+  const source = Buffer.from(await workbook.xlsx.writeBuffer());
+  const baseline = await SpreadsheetDocumentAdapter.fromBuffer('customers.xlsx', source, 'document-1');
+  const active = await SpreadsheetDocumentAdapter.fromBuffer('customers.xlsx', source, 'document-1');
+  const pending = active.registerPendingChange({ id: 'pending-context', operation: 'write_cell', sheetName: 'Customers', range: 'C25', values: [['reviewed-25']], reason: 'Check the original row.', requiresReview: true });
+
+  const context = active.readChangeContext(pending.id, baseline);
+  assert.equal(context.range, 'A23:H27');
+  assert.equal(context.targetRange, 'C25');
+  assert.equal(context.viewMode, 'context');
+  assert.equal(context.pageCount, 1);
+  assert.equal(context.targetCellCount, 1);
+  assert.equal(context.cellCount, 40);
+  assert.equal(context.rows[2]?.find((cell) => cell.address === 'B25')?.value, 'source-neighborhood');
+  assert.equal(context.rows[2]?.find((cell) => cell.address === 'C25')?.value, 'source-25');
+  const otherSource = await SpreadsheetDocumentAdapter.fromBuffer('customers.xlsx', source, 'document-2');
+  assert.throws(() => active.readChangeContext('pending-context', otherSource), /original workbook from this document session/);
+
+  active.approveChange(pending.id);
+  assert.equal(active.readRange('Customers', 'C25').rows[0]?.[0]?.value, 'reviewed-25');
+  assert.equal(baseline.readRange('Customers', 'C25').rows[0]?.[0]?.value, 'source-25');
+  const approvedContext = active.readChangeContext(pending.id, baseline);
+  assert.equal(approvedContext.targetRange, 'C25');
+  assert.equal(approvedContext.rows[2]?.find((cell) => cell.address === 'C25')?.value, 'source-25');
+});
+
+test('large pending spreadsheet ranges expose every original cell through bounded context pages', async () => {
+  const workbook = new ExcelJS.Workbook();
+  const sheet = workbook.addWorksheet('Range');
+  sheet.addRow(Array.from({ length: 12 }, (_, index) => `Column ${index + 1}`));
+  for (let row = 2; row <= 12; row += 1) sheet.addRow(Array.from({ length: 12 }, (_, column) => `original-${row}-${column + 1}`));
+  const source = Buffer.from(await workbook.xlsx.writeBuffer());
+  const baseline = await SpreadsheetDocumentAdapter.fromBuffer('range.xlsx', source, 'range-document');
+  const active = await SpreadsheetDocumentAdapter.fromBuffer('range.xlsx', source, 'range-document');
+  const values = Array.from({ length: 10 }, (_, row) => Array.from({ length: 10 }, (_, column) => `proposal-${row + 2}-${column + 2}`));
+  const pending = active.registerPendingChange({ id: 'pending-range', operation: 'write_range', sheetName: 'Range', range: 'B2', values, reason: 'Review the complete selected matrix.', requiresReview: true });
+
+  assert.equal(pending.range, 'B2:K11', 'a pending write-range start address is normalized to its full proposed range');
+  const first = active.readChangeContext(pending.id, baseline, 0);
+  const second = active.readChangeContext(pending.id, baseline, 1);
+  const fourth = active.readChangeContext(pending.id, baseline, 3);
+  assert.equal(first.viewMode, 'range');
+  assert.equal(first.targetRange, 'B2:K11');
+  assert.equal(first.targetCellCount, 100);
+  assert.equal(first.pageCount, 4);
+  assert.equal(first.range, 'B2:I6');
+  assert.equal(second.range, 'J2:K6');
+  assert.equal(fourth.range, 'J7:K11');
+  assert.equal(fourth.rows[4]?.find((cell) => cell.address === 'K11')?.value, 'original-11-11');
+  assert.throws(() => active.readChangeContext(pending.id, baseline, 4), /Change context page is out of range/);
+
+  const raggedValues = [Array.from({ length: 50 }, (_, column) => `wide-${column + 1}`), ...Array.from({ length: 99 }, (_, row) => [`narrow-${row + 1}`])];
+  const ragged = active.registerPendingChange({ id: 'pending-ragged-range', operation: 'write_range', sheetName: 'Range', range: 'B2', values: raggedValues, reason: 'Ragged but valid matrix.', requiresReview: true });
+  const lastRaggedPage = active.readChangeContext(ragged.id, baseline, 139);
+  assert.equal(ragged.range, 'B2:AY101');
+  assert.equal(lastRaggedPage.pageCount, 140);
+  assert.equal(lastRaggedPage.targetCellCount, 149);
+  assert.equal(lastRaggedPage.range, 'AX97:AY101');
+});
+
+test('small context windows always include the complete proposal away from the workbook origin', async () => {
+  const workbook = new ExcelJS.Workbook();
+  const sheet = workbook.addWorksheet('Context');
+  sheet.getCell('I14').value = 'far-edge';
+  const source = Buffer.from(await workbook.xlsx.writeBuffer());
+  const baseline = await SpreadsheetDocumentAdapter.fromBuffer('context.xlsx', source, 'context-document');
+  const active = await SpreadsheetDocumentAdapter.fromBuffer('context.xlsx', source, 'context-document');
+  const values = Array.from({ length: 5 }, (_, row) => Array.from({ length: 8 }, (_, column) => `proposal-${row}-${column}`));
+  const change = active.registerPendingChange({ id: 'full-context', operation: 'write_range', sheetName: 'Context', range: 'B10', values, reason: 'Inspect every proposed cell.', requiresReview: true });
+  const context = active.readChangeContext(change.id, baseline);
+  assert.equal(context.viewMode, 'context');
+  assert.equal(context.targetRange, 'B10:I14');
+  assert.equal(context.range, 'B10:I14');
+  assert.equal(context.rows[0]?.[0]?.address, 'B10');
+  assert.equal(context.rows[4]?.[7]?.address, 'I14');
+  assert.equal(context.rows[4]?.[7]?.value, 'far-edge');
+});
+
 test('separates automatic application from human review outcomes in canonical workbook records', async () => {
   const source = await createSourceWorkbook();
   const adapter = await SpreadsheetDocumentAdapter.fromBuffer('customers.xlsx', source);
@@ -78,6 +178,27 @@ test('canonical spreadsheet status overrides stale operational and review flags'
   assert.equal(imported.approved, true, 'the automatic cell write stays operationally applied');
   assert.equal(imported.rejected, false);
   assert.deepEqual(adapter.readRange('Customers', 'D6').rows[0]?.[0], { address: 'D6', value: 'AUTO' });
+});
+
+test('restored write-range annotations must declare their complete bounded target', async () => {
+  const adapter = await SpreadsheetDocumentAdapter.fromBuffer('customers.xlsx', await createSourceWorkbook());
+  const baseRecord = {
+    documentId: '', label: 'Workbook cell update', evidence: '[]', explanation: 'Imported review proposal.',
+    reviewPriority: 'high' as const, status: 'needs_review' as const, operation: 'write_range' as const,
+    reason: 'Review the whole proposed matrix.', requiresReview: true,
+  };
+  assert.throws(() => adapter.annotate({
+    ...baseRecord, id: 'understated-range', target: { kind: 'sheet', sheet: 'Customers', cellRange: 'D6:D7' },
+    values: [['one', 'two'], ['three']],
+  }), /declared cell range must match/);
+  assert.deepEqual(adapter.getChanges(), [], 'an invalid saved range must not register or apply a partial proposal');
+
+  const accepted = adapter.annotate({
+    ...baseRecord, id: 'complete-ragged-range', target: { kind: 'sheet', sheet: 'Customers', cellRange: 'D6:E7' },
+    values: [['one', 'two'], ['three']],
+  });
+  assert.equal(accepted.status, 'needs_review', 'bounded ragged matrices remain supported when the target encloses their complete extent');
+  assert.equal(adapter.getChanges()[0]?.range, 'D6:E7');
 });
 
 test('supports a table header row beyond the initial preview sample', async () => {

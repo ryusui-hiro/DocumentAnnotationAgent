@@ -45,7 +45,7 @@ export function createDocumentExportStore(store: typeof privateRecordStore = pri
   };
 
   return {
-    async put(documentId: string, sourceDocumentName: string, result: DocumentExportResult): Promise<PreparedDocumentExport> {
+    async put(documentId: string, sourceDocumentName: string, result: DocumentExportResult, snapshotSignature?: string): Promise<PreparedDocumentExport> {
       if (result.buffer.byteLength > maxArtifactBytes) throw Object.assign(new Error('Agent-prepared export exceeds the 64 MiB download limit. Use the direct export action instead.'), { status: 413 });
       const createdAt = Date.now();
       await prune(result.buffer.byteLength);
@@ -55,6 +55,7 @@ export function createDocumentExportStore(store: typeof privateRecordStore = pri
         sourceDocumentName: sourceDocumentName.slice(0, 1000),
         fileName: result.fileName,
         format: result.format,
+        ...(snapshotSignature ? { snapshotSignature } : {}),
         annotationsExported: result.annotationsExported,
         skippedCount: result.skipped.length,
         expiresAt: createdAt + artifactTtlMs,
@@ -83,6 +84,7 @@ export function createDocumentExportStore(store: typeof privateRecordStore = pri
           sourceDocumentName: record.sourceDocumentName,
           fileName: record.fileName,
           format: record.format,
+          ...(record.snapshotSignature ? { snapshotSignature: record.snapshotSignature } : {}),
           annotationsExported: record.annotationsExported,
           skippedCount: record.skippedCount,
           expiresAt: record.expiresAt,

@@ -1,7 +1,26 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import test from 'node:test';
+import { PDFArray, PDFDocument, PDFRawStream, StandardFonts, decodePDFRawStream } from 'pdf-lib';
 import type { PreviewReport } from 'document-svg';
 import { PagedDocumentAdapter, searchDocumentAdapters, type DocumentAdapter } from './documentAdapter';
+
+async function decodedPageContentStreams(pdf: PDFDocument, pageIndex: number) {
+  const page = pdf.getPage(pageIndex);
+  const contents = page.node.Contents();
+  const entries = contents instanceof PDFArray ? contents.asArray() : contents ? [contents] : [];
+  return entries.map((entry) => {
+    const stream = pdf.context.lookup(entry);
+    assert.ok(stream instanceof PDFRawStream, 'page content entry resolves to a PDF stream');
+    return new TextDecoder().decode(decodePDFRawStream(stream).decode());
+  });
+}
+
+function readSimpleWinAnsiText(content: string) {
+  return [...content.matchAll(/<([0-9a-f]+)>\s*Tj/giu)]
+    .map((match) => Buffer.from(match[1]!, 'hex').toString('latin1'))
+    .join('');
+}
 
 test('paged adapter exposes structure, inspects page SVG, and searches text across pages', () => {
   const report = {
@@ -82,6 +101,47 @@ test('paged adapter keeps canonical review records and exports approved annotati
   const native = await adapter.export({ format: 'native-annotated' });
   assert.match(native.buffer.toString('latin1', 0, 8), /^%PDF-/);
   assert.equal(native.annotationsExported, 1, 'review-only records remain in JSON but are not applied to native exports');
+});
+
+test('PDF native export preserves searchable source content and adds vector annotations without changing the source', async () => {
+  const sourcePdf = await PDFDocument.create();
+  const sourcePage = sourcePdf.addPage([612, 792]);
+  const sourceFont = await sourcePdf.embedFont(StandardFonts.Helvetica);
+  sourcePage.drawText('Clause remains text-searchable in the exported PDF.', { x: 48, y: 700, size: 14, font: sourceFont });
+  const sourceBuffer = Buffer.from(await sourcePdf.save());
+  const originalBytes = Buffer.from(sourceBuffer);
+  const originalHash = createHash('sha256').update(sourceBuffer).digest('hex');
+  const sourceContentStreams = await decodedPageContentStreams(await PDFDocument.load(sourceBuffer), 0);
+  const report = {
+    sourceFormat: 'PDF', pageCount: 1,
+    pages: [{
+      number: 1, widthPoints: 612, heightPoints: 792, warningCount: 0, warnings: [],
+      svg: '<svg xmlns="http://www.w3.org/2000/svg" width="612" height="792"><text x="48" y="92">Clause remains text-searchable in the exported PDF.</text></svg>',
+    }],
+  } as unknown as PreviewReport;
+  const adapter = new PagedDocumentAdapter('searchable.pdf', report, 'searchable-pdf', sourceBuffer);
+  adapter.replaceAnnotations([{
+    id: 'source-pdf-annotation', documentId: 'searchable-pdf',
+    target: { kind: 'page', page: 1, boundingBox: { x: 0.1, y: 0.2, width: 0.4, height: 0.1 } },
+    label: 'TERMINATION', evidence: 'Clause remains text-searchable.', explanation: 'This clause is in scope.',
+    reviewPriority: 'low', status: 'auto', color: '#278779',
+  }]);
+
+  const result = await adapter.export({ format: 'native-annotated' });
+  const exportedPdf = await PDFDocument.load(result.buffer);
+  const exportedContentStreams = await decodedPageContentStreams(exportedPdf, 0);
+  const extractedText = readSimpleWinAnsiText(exportedContentStreams.join('\n'));
+
+  assert.equal(result.fileName, 'searchable-annotated.pdf');
+  assert.equal(result.annotationsExported, 1);
+  assert.equal(exportedPdf.getPageCount(), 1, 'export keeps the original page structure');
+  assert.match(extractedText, /Clause remains text-searchable in the exported PDF\./);
+  assert.ok(sourceContentStreams.some((stream) => exportedContentStreams.includes(stream)), 'the original page content stream remains in the output');
+  const overlayStreams = exportedContentStreams.filter((stream) => !sourceContentStreams.includes(stream)).join('\n');
+  assert.match(overlayStreams, /244\.8/, 'the annotation rectangle width was added as PDF vector content');
+  assert.match(overlayStreams, /79\.2/, 'the annotation rectangle height was added as PDF vector content');
+  assert.deepEqual(sourceBuffer, originalBytes, 'export does not mutate the supplied source bytes');
+  assert.equal(createHash('sha256').update(sourceBuffer).digest('hex'), originalHash, 'the original source hash is unchanged');
 });
 
 test('search combines matches from paged and spreadsheet adapters without changing target types', () => {

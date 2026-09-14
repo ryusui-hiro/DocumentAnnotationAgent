@@ -11,6 +11,9 @@ function visualTarget(annotation: Annotation, fileType: string): DocumentAnnotat
 }
 
 function visualStatus(annotation: Annotation): DocumentAnnotationRecord['status'] {
+  // Older workspaces encoded a pending decision as high priority without an
+  // explicit requiresReview flag. Keep that legacy state during migration.
+  if (annotation.requiresReview === undefined && annotation.reviewPriority === 'high' && annotation.source === 'ai' && !annotation.reviewedByHuman) return 'needs_review';
   return annotationReviewStatus(annotation);
 }
 
@@ -152,7 +155,7 @@ export function restoreDocumentAnnotationRecords(value: unknown) {
       const y = boundedNumber(target.boundingBox.y, 0, 0, 0.98);
       const width = Math.min(1 - x, boundedNumber(target.boundingBox.width, 0.02, 0.015, 1));
       const height = Math.min(1 - y, boundedNumber(target.boundingBox.height, 0.02, 0.01, 1));
-      const source = raw.source === 'manual' ? 'manual' : 'ai';
+      const source = raw.source === 'demo' ? 'demo' : raw.source === 'manual' ? 'manual' : 'ai';
       const requiresReview = hasCanonicalStatus ? status === 'needs_review' : Boolean(raw.requiresReview);
       const annotation: AnnotationCandidate = {
         id: raw.id.slice(0, 100), pageNumber, x, y, width, height,

@@ -30,6 +30,8 @@ export interface AgentPageCoverage {
   findingCount: number;
   reviewCount: number;
   warningCount: number;
+  humanReviewed?: boolean;
+  warningAcknowledged?: boolean;
   textBlockCount?: number;
   detail?: string;
 }
@@ -204,7 +206,7 @@ export interface Annotation {
   label: string;
   note: string;
   color: string;
-  source: 'manual' | 'ai';
+  source: 'manual' | 'ai' | 'demo';
   confidence?: number;
   reviewPriority?: AnnotationReviewPriority;
   reason?: string;
@@ -244,7 +246,7 @@ export interface DocumentAnnotationRecord {
   reason?: string;
   excerpt?: string;
   color?: string;
-  source?: 'manual' | 'ai';
+  source?: 'manual' | 'ai' | 'demo';
   requiresReview?: boolean;
   reviewedByHuman?: boolean;
   approvalRunId?: string;
@@ -263,6 +265,8 @@ export interface PreparedDocumentExport {
   sourceDocumentName: string;
   fileName: string;
   format: PreparedExportFormat;
+  /** Snapshot checked by the in-run Validator before this visual-document export. */
+  snapshotSignature?: string;
   annotationsExported: number;
   skippedCount: number;
   expiresAt: number;

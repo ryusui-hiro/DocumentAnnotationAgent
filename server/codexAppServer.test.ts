@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { parseTaskPlan, taskPlanJsonSchema } from '../src/taskPlan';
-import { annotationOutputSchema, planTaskWithCodexAppServer, readFinalAgentMessage, resolveCodexAppServerBinary } from './codexAppServer';
+import { annotationOutputSchema, codexWorkbookTurnJsonSchema, draftCorrectionRuleWithCodexAppServer, planTaskWithCodexAppServer, readFinalAgentMessage, resolveCodexAppServerBinary } from './codexAppServer';
+import { correctionRuleJsonSchema, parseCorrectionRuleDraft } from './correctionRulePlanner';
 
 test('Codex App Server binary override takes precedence over automatic discovery', () => {
   assert.equal(resolveCodexAppServerBinary('  /custom/codex  ', 'darwin', () => true), '/custom/codex');
@@ -35,6 +36,13 @@ function assertStrictObjectSchemas(schema: Record<string, unknown>, path = '$') 
 
 test('Codex annotation output schema satisfies strict structured-output requirements', () => {
   assertStrictObjectSchemas(annotationOutputSchema);
+});
+
+test('Codex workbook read/proposal turns export a strict bounded schema', () => {
+  assertStrictObjectSchemas(codexWorkbookTurnJsonSchema as Record<string, unknown>);
+  const properties = codexWorkbookTurnJsonSchema.properties as Record<string, unknown>;
+  assert.deepEqual(properties.phase, { type: 'string', enum: ['read_ranges', 'propose_changes'] });
+  assert.match(JSON.stringify(codexWorkbookTurnJsonSchema), /maximum|readRequests|changes/);
 });
 
 test('uses a completed notification message without a history read', async () => {
@@ -127,6 +135,67 @@ lines.on('line', (line) => {
     const turnStart = JSON.parse(await readFile(capturePath, 'utf8')) as { outputSchema?: unknown; model?: string };
     assert.equal(turnStart.model, 'local-test-model');
     assert.deepEqual(turnStart.outputSchema, taskPlanJsonSchema);
+  } finally {
+    if (previousBinary === undefined) delete process.env.CODEX_APP_SERVER_BIN;
+    else process.env.CODEX_APP_SERVER_BIN = previousBinary;
+    if (previousCapture === undefined) delete process.env.CODEX_APP_SERVER_CAPTURE;
+    else process.env.CODEX_APP_SERVER_CAPTURE = previousCapture;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('Codex correction-rule planner uses a read-only thread and the same strict proposal schema', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'annotation-codex-rule-planner-test-'));
+  const binaryPath = join(directory, 'fake-codex-app-server.js');
+  const capturePath = join(directory, 'turn-start.json');
+  const previousBinary = process.env.CODEX_APP_SERVER_BIN;
+  const previousCapture = process.env.CODEX_APP_SERVER_CAPTURE;
+  const draft = {
+    outcome: 'proposed_rule',
+    rule: 'Label a visible email address as EMAIL.',
+    basis: 'The task and guideline explicitly identify email addresses.',
+    reason: null,
+  };
+  const fakeServer = `#!/usr/bin/env node
+const readline = require('node:readline');
+const { writeFileSync } = require('node:fs');
+const draft = ${JSON.stringify(draft)};
+const lines = readline.createInterface({ input: process.stdin });
+const send = (message) => process.stdout.write(JSON.stringify(message) + '\\n');
+lines.on('line', (line) => {
+  const request = JSON.parse(line);
+  if (request.method === 'initialize') send({ id: request.id, result: {} });
+  if (request.method === 'thread/start') send({ id: request.id, result: { thread: { id: 'rule-thread' } } });
+  if (request.method === 'turn/start') {
+    writeFileSync(process.env.CODEX_APP_SERVER_CAPTURE, JSON.stringify(request.params));
+    send({ id: request.id, result: { turn: { id: 'rule-turn', status: 'inProgress', items: [] } } });
+    send({ method: 'turn/completed', params: { threadId: 'rule-thread', turn: { id: 'rule-turn', status: 'completed', items: [{ type: 'agentMessage', text: JSON.stringify(draft) }] } } });
+  }
+});
+`;
+  try {
+    await writeFile(binaryPath, fakeServer, { mode: 0o755 });
+    await chmod(binaryPath, 0o755);
+    process.env.CODEX_APP_SERVER_BIN = binaryPath;
+    process.env.CODEX_APP_SERVER_CAPTURE = capturePath;
+
+    const result = await draftCorrectionRuleWithCodexAppServer({
+      model: 'local-test-model', reasoningEffort: 'low',
+      input: {
+        task: 'Find visible email addresses.', taskPlan: 'Label complete addresses EMAIL.', guidelines: 'Only use EMAIL for a visible address.',
+        sourceCandidate: { pageNumber: 2, label: 'CONTACT', note: 'May be an email.', reason: 'It contains an at-sign.', excerpt: 'alex@example.test' },
+        correction: { label: 'EMAIL', note: 'This is a visible email address.' },
+      },
+    });
+
+    assert.deepEqual(parseCorrectionRuleDraft(JSON.parse(result.outputText)), {
+      outcome: 'proposed_rule', rule: draft.rule, basis: draft.basis,
+    });
+    const turnStart = JSON.parse(await readFile(capturePath, 'utf8')) as { outputSchema?: unknown; model?: string; input?: Array<{ text?: string }> };
+    assert.equal(turnStart.model, 'local-test-model');
+    assert.deepEqual(turnStart.outputSchema, correctionRuleJsonSchema);
+    assert.match(turnStart.input?.[0]?.text ?? '', /alex@example\.test/);
+    assert.match(turnStart.input?.[0]?.text ?? '', /A proposal is not an active rule/);
   } finally {
     if (previousBinary === undefined) delete process.env.CODEX_APP_SERVER_BIN;
     else process.env.CODEX_APP_SERVER_BIN = previousBinary;

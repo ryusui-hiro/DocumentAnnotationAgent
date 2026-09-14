@@ -121,6 +121,13 @@ function normalizeValue(value: unknown): SpreadsheetValue {
   return String(value).slice(0, 2000);
 }
 
+function normalizeCellValue(cell: ExcelJS.Cell): SpreadsheetValue {
+  if (cell.value instanceof Date && /y/iu.test(cell.numFmt) && !/[hs]/iu.test(cell.numFmt)) {
+    return cell.value.toISOString().slice(0, 10);
+  }
+  return normalizeValue(cell.value);
+}
+
 function excelDisplayWidth(value: string) {
   let width = 0;
   for (const character of value) {
@@ -157,12 +164,17 @@ function cellAddress(row: number, column: number) {
   return `${letters}${row}`;
 }
 
-function parseRange(range: string) {
+function parseRangeBounds(range: string) {
   const parts = range.trim().toUpperCase().split(':');
   if (parts.length < 1 || parts.length > 2) throw fail('Use a single cell or a rectangular range such as A1:D20.');
   const start = parseCellAddress(parts[0]!);
   const end = parseCellAddress(parts[1] ?? parts[0]!);
   if (end.row < start.row || end.column < start.column) throw fail('Range endpoints must be ordered from top-left to bottom-right.');
+  return { start, end };
+}
+
+function parseRange(range: string) {
+  const { start, end } = parseRangeBounds(range);
   const count = (end.row - start.row + 1) * (end.column - start.column + 1);
   if (count > maxRangeCells) throw fail(`A range may contain at most ${maxRangeCells} cells.`, 413);
   return { start, end, count };
@@ -219,9 +231,14 @@ export class SpreadsheetDocumentAdapter implements DocumentAdapter, SpreadsheetI
       if (!values.length || values.length > 100 || values.some((row) => !row.length || row.length > 50)) throw fail('Range values must be a non-empty matrix of at most 100 × 50 cells.');
       const cellCount = values.reduce((sum, row) => sum + row.length, 0);
       if (cellCount > maxRangeCells || start.row + values.length - 1 > maxWorkbookRows || start.column + Math.max(...values.map((row) => row.length)) - 1 > maxWorkbookColumns) throw fail(`A write range may contain at most ${maxRangeCells} cells and must fit within Excel limits.`, 413);
-      const end = cellAddress(start.row + values.length - 1, start.column + Math.max(...values.map((row) => row.length)) - 1);
+      const expectedEndRow = start.row + values.length - 1;
+      const expectedEndColumn = start.column + Math.max(...values.map((row) => row.length)) - 1;
+      const target = parseRangeBounds(annotation.target.cellRange);
+      if (target.start.row !== start.row || target.start.column !== start.column || target.end.row !== expectedEndRow || target.end.column !== expectedEndColumn) {
+        throw fail('The declared cell range must match the full write-range values.');
+      }
       change = this.recordChange({
-        operation: 'write_range', sheetName: worksheet.name, range: `${cellAddress(start.row, start.column)}:${end}`, values, reason,
+        operation: 'write_range', sheetName: worksheet.name, range: `${cellAddress(start.row, start.column)}:${cellAddress(expectedEndRow, expectedEndColumn)}`, values, reason,
         confidence: annotation.confidence, reviewPriority: annotation.reviewPriority, requiresReview,
         ...(approved ? { approved: true } : {}),
         ...(reviewOutcome ? { reviewOutcome } : {}),
@@ -323,7 +340,7 @@ export class SpreadsheetDocumentAdapter implements DocumentAdapter, SpreadsheetI
         row.eachCell({ includeEmpty: false }, (cell) => {
           if (stopped || results.length >= boundedLimit || visitedCells >= maxSearchCells) { stopped = true; return; }
           visitedCells += 1;
-          const value = normalizeValue(cell.value);
+          const value = normalizeCellValue(cell);
           if (value !== null && String(value).toLocaleLowerCase().includes(normalizedQuery)) {
             results.push({ location: { kind: 'sheet', sheetName: worksheet.name, range: cell.address }, excerpt: String(value).slice(0, 300), matchType: 'cell' });
           }
@@ -338,12 +355,12 @@ export class SpreadsheetDocumentAdapter implements DocumentAdapter, SpreadsheetI
     const worksheet = this.getWorksheet(sheetName);
     const rowCount = Math.min(worksheet.rowCount, maxWorkbookRows);
     const columnCount = Math.min(worksheet.columnCount, maxWorkbookColumns);
-    const headers = Array.from({ length: Math.min(columnCount, 80) }, (_, index) => normalizeValue(worksheet.getRow(1).getCell(index + 1).value) ?? '').map(String);
+    const headers = Array.from({ length: Math.min(columnCount, 80) }, (_, index) => normalizeCellValue(worksheet.getRow(1).getCell(index + 1)) ?? '').map(String);
     const sampleRows = Array.from({ length: Math.min(Math.max(0, rowCount - 1), 20) }, (_, index) => {
       const rowNumber = index + 2;
       return {
         rowNumber,
-        values: Array.from({ length: Math.min(columnCount, 80) }, (_, columnIndex) => normalizeValue(worksheet.getRow(rowNumber).getCell(columnIndex + 1).value)),
+        values: Array.from({ length: Math.min(columnCount, 80) }, (_, columnIndex) => normalizeCellValue(worksheet.getRow(rowNumber).getCell(columnIndex + 1))),
       };
     });
     return { name: worksheet.name, rowCount, columnCount, headers, sampleRows };
@@ -357,18 +374,109 @@ export class SpreadsheetDocumentAdapter implements DocumentAdapter, SpreadsheetI
       const values = [];
       for (let column = parsed.start.column; column <= parsed.end.column; column += 1) {
         const cell = worksheet.getCell(row, column);
-        values.push({ address: cellAddress(row, column), value: normalizeValue(cell.value) });
+        values.push({ address: cellAddress(row, column), value: normalizeCellValue(cell) });
       }
       rows.push(values);
     }
     return { sheetName: worksheet.name, range: `${cellAddress(parsed.start.row, parsed.start.column)}:${cellAddress(parsed.end.row, parsed.end.column)}`, rows, cellCount: parsed.count };
   }
 
+  registerPendingChange(change: SpreadsheetCellChange) {
+    const existing = this.changes.get(change.id);
+    if (existing) return existing;
+    if (!change.requiresReview || change.approved || change.rejected) throw fail('Only unresolved spreadsheet changes can be registered.', 409);
+    this.getWorksheet(change.sheetName);
+
+    let normalized = { ...change, values: change.values.map((row) => [...row]) };
+    if (change.operation === 'write_range') {
+      if (!change.values.length || change.values.length > 100 || change.values.some((row) => !row.length || row.length > 50)) throw fail('Range values must be a non-empty matrix of at most 100 × 50 cells.');
+      const cellCount = change.values.reduce((total, row) => total + row.length, 0);
+      if (cellCount > maxRangeCells) throw fail(`A range may contain at most ${maxRangeCells} cells.`, 413);
+      const start = parseCellAddress(change.range.split(':')[0]!);
+      const endRow = start.row + change.values.length - 1;
+      const endColumn = start.column + Math.max(...change.values.map((row) => row.length)) - 1;
+      if (endRow > maxWorkbookRows || endColumn > maxWorkbookColumns) throw fail('Range endpoints are outside Excel worksheet limits.', 413);
+      normalized = { ...normalized, range: `${cellAddress(start.row, start.column)}:${cellAddress(endRow, endColumn)}` };
+    }
+    if (change.operation === 'write_range') parseRangeBounds(normalized.range);
+    else if (parseRange(normalized.range).count !== 1) throw fail('A single-cell spreadsheet change must target one cell.');
+    this.changes.set(normalized.id, normalized);
+    this.annotations.set(normalized.id, this.annotationFromChange(normalized));
+    return normalized;
+  }
+
+  readChangeContext(changeId: string, source: SpreadsheetDocumentAdapter, requestedPage = 0) {
+    const change = this.changes.get(changeId);
+    if (!change) throw fail('Spreadsheet change was not found.', 404);
+    if (source.documentId !== this.documentId || source.fileName !== this.fileName) throw fail('Review context must use the original workbook from this document session.', 409);
+    if (!Number.isInteger(requestedPage) || requestedPage < 0) throw fail('Change context page is invalid.');
+
+    const target = parseRangeBounds(change.range);
+    const targetHeight = target.end.row - target.start.row + 1;
+    const targetWidth = target.end.column - target.start.column + 1;
+    const rowCount = 5;
+    const columnCount = 8;
+    const viewMode = targetHeight <= rowCount && targetWidth <= columnCount ? 'context' as const : 'range' as const;
+    let pageIndex = 0;
+    let pageCount = 1;
+    let firstRow: number;
+    let firstColumn: number;
+    let lastRow: number;
+    let lastColumn: number;
+
+    if (viewMode === 'context') {
+      if (requestedPage !== 0) throw fail('Change context page is out of range.');
+      const minimumFirstRow = target.end.row - rowCount + 1;
+      const minimumFirstColumn = target.end.column - columnCount + 1;
+      firstRow = Math.max(minimumFirstRow, Math.min(Math.max(1, target.start.row - 2), maxWorkbookRows - rowCount + 1));
+      firstColumn = Math.max(minimumFirstColumn, Math.min(Math.max(1, target.start.column - 2), maxWorkbookColumns - columnCount + 1));
+      lastRow = firstRow + rowCount - 1;
+      lastColumn = firstColumn + columnCount - 1;
+    } else {
+      const rowPages = Math.ceil(targetHeight / rowCount);
+      const columnPages = Math.ceil(targetWidth / columnCount);
+      pageCount = rowPages * columnPages;
+      if (requestedPage >= pageCount) throw fail('Change context page is out of range.');
+      pageIndex = requestedPage;
+      const rowPage = Math.floor(pageIndex / columnPages);
+      const columnPage = pageIndex % columnPages;
+      firstRow = target.start.row + rowPage * rowCount;
+      firstColumn = target.start.column + columnPage * columnCount;
+      lastRow = Math.min(target.end.row, firstRow + rowCount - 1);
+      lastColumn = Math.min(target.end.column, firstColumn + columnCount - 1);
+    }
+
+    const contextRange = `${cellAddress(firstRow, firstColumn)}:${cellAddress(lastRow, lastColumn)}`;
+    const context = source.readRange(change.sheetName, contextRange);
+    const rows = context.rows.map((row) => row.map((cell) => {
+      if (typeof cell.value === 'string' && cell.value.length > 300) return { ...cell, value: cell.value.slice(0, 300), truncated: true };
+      return cell;
+    }));
+    const targetCellCount = change.values.reduce((total, row) => total + row.length, 0);
+    return {
+      changeId,
+      sheetName: change.sheetName,
+      range: context.range,
+      targetRange: change.range,
+      viewMode,
+      pageIndex,
+      pageCount,
+      targetCellCount,
+      rows,
+      cellCount: context.cellCount,
+    };
+  }
+
   createColumn(sheetName: string, header: string, headerRow: number, reason = 'Created by the document agent.', options: { requiresReview?: boolean; id?: string } = {}) {
     const worksheet = this.getWorksheet(sheetName);
     if (!header.trim() || header.length > 120) throw fail('Column header must contain 1 to 120 characters.');
     if (!Number.isInteger(headerRow) || headerRow < 1 || headerRow > maxWorkbookRows) throw fail('Header row is outside the supported worksheet range.');
-    const address = this.nextEmptyColumnAddress(sheetName, headerRow);
+    const existing = options.id ? this.changes.get(options.id) : undefined;
+    const existingAddress = existing?.operation === 'create_column' && existing.sheetName === worksheet.name && existing.requiresReview && !existing.approved && !existing.rejected
+      && parseCellAddress(existing.range).row === headerRow
+      ? existing.range
+      : undefined;
+    const address = existingAddress ?? this.nextEmptyColumnAddress(sheetName, headerRow);
     const change = this.recordChange({ operation: 'create_column', sheetName: worksheet.name, range: address, values: [[header.trim()]], reason, requiresReview: Boolean(options.requiresReview), ...(options.requiresReview ? {} : { approved: true }) }, options.id);
     if (!options.requiresReview) this.applyChange(change);
     return change;
