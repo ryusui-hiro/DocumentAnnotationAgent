@@ -1,11 +1,9 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import OpenAI from 'openai';
-import { IntentBlockStream, intentAnnotationPrompt, parseIntentAnnotationOutput, runIntentAnnotationWithCodex, runIntentAnnotationWithOpenAI, type IntentAnnotationBlock } from './intentAnnotator';
+import { IntentBlockStream, intentAnnotationPrompt, parseIntentAnnotationOutput, runIntentAnnotationWithCodex, runIntentAnnotationWithOpenAI, type IntentAnnotationBlock, type IntentAppServerClient } from './intentAnnotator';
 
 const block = { type: 'region', label: 'Custom target', note: 'Only the requested area.', bbox: { x: 0.1, y: 0.2, width: 0.3, height: 0.1 }, extractedText: 'Evidence', latex: null, uncertain: false, uncertaintyReason: '' };
 const input = { instruction: 'Label only the requested area as Custom target.', imageDataUrl: 'data:image/png;base64,iVBORw0KGgo=', pageNumber: 2, sourcePageNumber: 5, model: 'gpt-6-astra', reasoningEffort: 'low', labelRules: [{ name: 'Custom target', description: 'Only the specific region named by the user.' }] };
@@ -157,62 +155,57 @@ test('real OpenAI SDK streaming emits a complete region before final response an
   }
 });
 
-test('Codex deltas emit validated blocks before completion, ignore commentary, and retain final authority', { timeout: 60000 }, async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'intent-codex-stream-'));
-  const binary = join(directory, 'fake.cjs');
-  const capturePath = join(directory, 'turn.json');
-  const gatePath = join(directory, 'release');
-  const previousBinary = process.env.CODEX_APP_SERVER_BIN;
+test('Codex deltas emit validated blocks before completion, ignore commentary, and retain final authority', async () => {
   const controller = new AbortController();
   const firstBlock = deferred();
+  const releaseCompletion = deferred();
+  const completed = deferred<{ turn: { id: string; status: string; items: Array<{ type: string; id: string; text: string }> } }>();
   const seen: IntentAnnotationBlock[] = [];
+  const handlers = new Set<(message: { method?: string; params?: Record<string, unknown> }) => void>();
+  let captured: Record<string, unknown> | undefined;
   let running: Promise<unknown> | undefined;
+  const finalText = JSON.stringify({ blocks: [block], warnings: [] });
+  const notify = (method: string, params: Record<string, unknown>) => handlers.forEach((handler) => handler({ method, params }));
+  const client: IntentAppServerClient = {
+    async initialize() {},
+    async request<T>(method: string, params: Record<string, unknown>): Promise<T> {
+      if (method === 'thread/start') return { thread: { id: 'thread' } } as T;
+      if (method !== 'turn/start') throw new Error('Unexpected fixture request: ' + method);
+      captured = params;
+      notify('item/started', { threadId: 'thread', turnId: 'turn', item: { id: 'commentary', type: 'agentMessage', phase: 'commentary' } });
+      notify('item/agentMessage/delta', { threadId: 'thread', turnId: 'turn', itemId: 'commentary', delta: JSON.stringify({ blocks: [{ ...block, label: 'Must not emit' }], warnings: [] }) });
+      notify('item/started', { threadId: 'thread', turnId: 'turn', item: { id: 'answer', type: 'agentMessage', phase: 'final_answer' } });
+      notify('item/agentMessage/delta', { threadId: 'thread', turnId: 'turn', itemId: 'answer', delta: '{"blocks":[' + JSON.stringify(block) });
+      await releaseCompletion.promise;
+      notify('item/agentMessage/delta', { threadId: 'thread', turnId: 'turn', itemId: 'answer', delta: '],"warnings":[]}' });
+      notify('thread/tokenUsage/updated', { threadId: 'thread', tokenUsage: { last: { inputTokens: 50, outputTokens: 20, totalTokens: 70 } } });
+      completed.resolve({ turn: { id: 'turn', status: 'completed', items: [{ type: 'agentMessage', id: 'answer', text: finalText }] } });
+      return {} as T;
+    },
+    onNotification(handler) { handlers.add(handler); return () => handlers.delete(handler); },
+    onceNotification<T>() { return completed.promise as Promise<T>; },
+    close() {},
+  };
   try {
-    const finalText = JSON.stringify({ blocks: [block], warnings: [] });
-    await writeFile(binary, `#!/usr/bin/env node
-const fs = require('node:fs');
-const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
-require('node:readline').createInterface({input:process.stdin}).on('line', line => {
- const request = JSON.parse(line);
- if(request.method==='initialize') send({id:request.id,result:{}});
- if(request.method==='thread/start') send({id:request.id,result:{thread:{id:'thread'}}});
- if(request.method==='turn/start') {
-  fs.writeFileSync(${JSON.stringify(capturePath)},JSON.stringify(request.params));
-  send({id:request.id,result:{turn:{id:'turn'}}});
-  send({method:'item/started',params:{threadId:'thread',turnId:'turn',item:{id:'commentary',type:'agentMessage',phase:'commentary'}}});
-  send({method:'item/agentMessage/delta',params:{threadId:'thread',turnId:'turn',itemId:'commentary',delta:${JSON.stringify(JSON.stringify({ blocks: [{ ...block, label: 'Must not emit' }], warnings: [] }))}}});
-  send({method:'item/started',params:{threadId:'thread',turnId:'turn',item:{id:'answer',type:'agentMessage',phase:'final_answer'}}});
-  send({method:'item/agentMessage/delta',params:{threadId:'thread',turnId:'turn',itemId:'answer',delta:${JSON.stringify(`{"blocks":[${JSON.stringify(block)}`)}}});
-  fs.watchFile(${JSON.stringify(gatePath)},{interval:10},()=>{
-   if(!fs.existsSync(${JSON.stringify(gatePath)})) return;
-   fs.unwatchFile(${JSON.stringify(gatePath)});
-   send({method:'item/agentMessage/delta',params:{threadId:'thread',turnId:'turn',itemId:'answer',delta:'],"warnings":[]}'}});
-   send({method:'thread/tokenUsage/updated',params:{threadId:'thread',tokenUsage:{last:{inputTokens:50,outputTokens:20,totalTokens:70}}}});
-   send({method:'turn/completed',params:{threadId:'thread',turn:{id:'turn',status:'completed',items:[{type:'agentMessage',id:'answer',text:${JSON.stringify(finalText)}}]}}});
-  });
- }
-});
-`, { mode: 0o755 });
-    process.env.CODEX_APP_SERVER_BIN = binary;
     let finished = false;
-    running = runIntentAnnotationWithCodex({ ...input, signal: controller.signal, onBlock: (value) => { seen.push(value); firstBlock.resolve(); } }).finally(() => { finished = true; });
+    running = runIntentAnnotationWithCodex(
+      { ...input, signal: controller.signal, onBlock: (value) => { seen.push(value); firstBlock.resolve(); } },
+      () => client,
+    ).finally(() => { finished = true; });
     void running.catch(() => undefined);
-    // A cold child Node process shares CPU with the full CI suite; the gate still
-    // proves that a block arrives before the explicitly held completion.
-    await bounded(firstBlock.promise, 30000);
+    await bounded(firstBlock.promise);
     assert.equal(finished, false);
     assert.equal(seen.length, 1);
     assert.equal(seen[0]?.label, 'Custom target');
-    await writeFile(gatePath, 'continue');
-    const result = await bounded(running, 30000) as Awaited<ReturnType<typeof runIntentAnnotationWithCodex>>;
+    releaseCompletion.resolve();
+    const result = await bounded(running) as Awaited<ReturnType<typeof runIntentAnnotationWithCodex>>;
     assert.deepEqual(result.blocks, seen);
     assert.equal(result.usage.totalTokens, 70);
-    const sent = JSON.parse(await readFile(capturePath, 'utf8'));
+    assert.ok(captured);
+    const sent = captured as { outputSchema: { properties: { blocks: { items: { properties: { label: { enum: string[] } } } } } }; input: Array<{ path: string }> };
     assert.deepEqual(sent.outputSchema.properties.blocks.items.properties.label.enum, ['Custom target']);
-    await assert.rejects(readFile(sent.input[1].path), /ENOENT/);
+    await assert.rejects(readFile(sent.input[1]!.path), /ENOENT/);
   } finally {
-    controller.abort(); await running?.catch(() => undefined);
-    if (previousBinary === undefined) delete process.env.CODEX_APP_SERVER_BIN; else process.env.CODEX_APP_SERVER_BIN = previousBinary;
-    await rm(directory, { recursive: true, force: true });
+    releaseCompletion.resolve(); controller.abort(); await running?.catch(() => undefined);
   }
 });

@@ -12,7 +12,7 @@
     "dev:web": "vite --host 127.0.0.1",
     "build": "tsc --noEmit && vite build",
     "lint": "tsc --noEmit",
-    "test": "tsx --test --test-concurrency=1 server/*.test.ts src/*.test.ts scripts/*.test.mjs",
+    "test": "tsx --test server/*.test.ts src/*.test.ts scripts/*.test.mjs",
     "test:office-native-export-libreoffice": "node --import tsx scripts/office-native-export-libreoffice-acceptance.mjs",
     "test:browser-e2e": "node scripts/test-browser-e2e.mjs",
     "test:agent-sse-browser-e2e": "node scripts/agent-sse-browser-e2e.mjs",
