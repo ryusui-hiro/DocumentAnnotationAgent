@@ -1,29 +1,49 @@
 version: 2
+# Explicit target branches keep these version-update rules separate from
+# Dependabot security updates, which continue on the repository default branch.
 updates:
   - package-ecosystem: npm
     directory: /
+    target-branch: main
     schedule:
       interval: weekly
     groups:
       npm-minor-and-patch:
+        applies-to: version-updates
+        patterns:
+          - "*"
         update-types:
           - minor
           - patch
-    open-pull-requests-limit: 10
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-major
+    open-pull-requests-limit: 3
 
   - package-ecosystem: cargo
     directory: /src-tauri
+    target-branch: main
     schedule:
       interval: weekly
     groups:
       cargo-minor-and-patch:
+        applies-to: version-updates
+        patterns:
+          - "*"
         update-types:
           - minor
           - patch
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 3
 
   - package-ecosystem: github-actions
     directory: /
+    target-branch: main
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        applies-to: version-updates
+        patterns:
+          - "*"
+    open-pull-requests-limit: 3

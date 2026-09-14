@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import ts from 'typescript';
+import { createScanner, SyntaxKind } from 'typescript/unstable/ast';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { interpolate, setLanguage, translateFor, tr } from './i18n';
@@ -35,15 +35,25 @@ test('App and Settings translate every explicitly marked literal without fallbac
   const dictionary = { ...messageTranslations, ...uiTranslations };
   for (const relativePath of ['./App.tsx', './components/SettingsDialog.tsx']) {
     const path = fileURLToPath(new URL(relativePath, import.meta.url));
-    const source = ts.createSourceFile(path, readFileSync(path, 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
-    const visit = (node: ts.Node) => {
-      if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 't') {
-        const first = node.arguments[0];
-        if (first && ts.isStringLiteral(first)) assert.ok(Object.hasOwn(dictionary, first.text), `Missing translation: ${first.text}`);
+    const scanner = createScanner(true, undefined, readFileSync(path, 'utf8'));
+    let previous = SyntaxKind.Unknown;
+    for (let token = scanner.scan(); token !== SyntaxKind.EndOfFile; token = scanner.scan()) {
+      if (token !== SyntaxKind.Identifier || scanner.getTokenValue() !== 't' || previous === SyntaxKind.DotToken) {
+        previous = token;
+        continue;
       }
-      ts.forEachChild(node, visit);
-    };
-    visit(source);
+      const openParen = scanner.scan();
+      if (openParen !== SyntaxKind.OpenParenToken) {
+        previous = openParen;
+        continue;
+      }
+      const firstArgument = scanner.scan();
+      if (firstArgument === SyntaxKind.StringLiteral) {
+        const literal = scanner.getTokenValue();
+        assert.ok(Object.hasOwn(dictionary, literal), `Missing translation: ${literal}`);
+      }
+      previous = firstArgument;
+    }
   }
 });
 

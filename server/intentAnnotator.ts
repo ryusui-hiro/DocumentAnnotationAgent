@@ -6,13 +6,25 @@ import { AppServerClient, readFinalAgentMessage } from './codexAppServer';
 import { IntentBlockStream, createIntentAnnotationOutputSchema, intentAnnotationPrompt, streamCallbacks, validateInput, zeroUsage, type IntentAnnotationInput, type IntentAnnotationResult } from '../src/intentAnnotation';
 export * from '../src/intentAnnotation';
 
-export async function runIntentAnnotationWithCodex(args: IntentAnnotationInput): Promise<IntentAnnotationResult> {
+type IntentAppServerMessage = { method?: string; params?: Record<string, unknown> };
+export type IntentAppServerClient = {
+  initialize(): Promise<void>;
+  request<T>(method: string, params: Record<string, unknown>, timeoutMs?: number): Promise<T>;
+  onNotification(handler: (message: IntentAppServerMessage) => void): () => void;
+  onceNotification<T>(method: string, predicate: (params: Record<string, unknown>) => boolean, timeoutMs?: number): Promise<T>;
+  close(): void;
+};
+
+export async function runIntentAnnotationWithCodex(
+  args: IntentAnnotationInput,
+  createClient: () => IntentAppServerClient = () => new AppServerClient(),
+): Promise<IntentAnnotationResult> {
   validateInput(args);
   if (process.env.CODEX_APP_SERVER_DISABLED === 'true') throw new Error('Codex App Server is disabled.');
   const model = args.model || 'gpt-6-astra';
   const directory = await mkdtemp(join(tmpdir(), 'annotation-intent-'));
   const imagePath = join(directory, 'page.png');
-  const client = new AppServerClient();
+  const client = createClient();
   const scanners = new Map<string, IntentBlockStream>();
   const ignoredItems = new Set<string>();
   const onBlock = streamCallbacks(args);
