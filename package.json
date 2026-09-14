@@ -44,7 +44,7 @@
     "@tauri-apps/plugin-fs": "^2.5.2",
     "@xmldom/xmldom": "^0.9.12",
     "document-svg": "^0.1.1",
-    "dotenv": "^16.6.1",
+    "dotenv": "^17.4.2",
     "exceljs": "^4.4.0",
     "express": "^5.1.0",
     "express-rate-limit": "^8.7.0",
