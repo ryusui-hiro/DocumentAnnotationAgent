@@ -1,6 +1,7 @@
 import type { PreviewReport } from 'document-svg';
 import sharp from 'sharp';
 import type { Annotation, DocumentAnnotationRecord } from '../src/types';
+import { appendPdfTextComment } from '../src/pdfAnnotation';
 import { documentAnnotationsToCsv } from './annotationCsv';
 import { extractPositionedTextBlocks, type PositionedTextBlock } from './textTarget';
 
@@ -505,12 +506,23 @@ export class PagedDocumentAdapter implements DocumentAdapter {
             page!.drawText(String(index + 1), { x: markerPoint.x, y: markerPoint.y, size: 8, font, color: rgb(1, 1, 1), rotate: degrees(-rotation) });
           }
         });
+        appendPdfTextComment(page!, {
+          id: annotation.id,
+          label: annotation.label,
+          note: annotation.note,
+          explanation: annotation.reason ?? annotation.explanation,
+          evidence: annotation.excerpt ?? annotation.evidence,
+          status: annotation.status,
+          reviewPriority: annotation.reviewPriority,
+          rect: toPdfRectangle(fragments[0] ?? box),
+          color,
+        });
         annotationsExported += 1;
       });
     }
     const bytes = await pdf.save();
     const buffer = Buffer.from(bytes);
-    return { format: 'native-annotated', fileName: `${fileBase}-annotated.pdf`, contentType: 'application/pdf', buffer, annotationsExported, skipped };
+    return { format: 'native-annotated', fileName: `${fileBase}-annotated.pdf`, contentType: 'application/pdf', buffer, annotationsExported, skipped, metadata: { commentsAdded: annotationsExported } };
   }
 }
 

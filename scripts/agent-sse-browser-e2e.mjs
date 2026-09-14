@@ -342,6 +342,10 @@ try {
     const fail = (message) => { throw new Error('Agent SDK browser E2E assertion failed: ' + message); };
     const check = (condition, message) => { if (!condition) fail(message); };
     const equal = (actual, expected, message) => { if (actual !== expected) fail(message + '; expected ' + JSON.stringify(expected) + ', got ' + JSON.stringify(actual)); };
+    const expandDisclosure = async (selector) => {
+      const disclosure = page.locator(selector);
+      if (await disclosure.getAttribute('open') === null) await disclosure.locator(':scope > summary').click();
+    };
     const appUrl = ${JSON.stringify(appUrl)};
     const providerUrl = ${JSON.stringify(providerUrl)};
     const providerControlUrl = ${JSON.stringify(providerControlUrl)};
@@ -372,6 +376,8 @@ try {
       await route.continue();
     });
     await page.addInitScript(() => {
+      localStorage.setItem('annotation-studio:language:v1', 'ja');
+      if (!localStorage.getItem('annotation-studio:settings:v1')) localStorage.setItem('annotation-studio:settings:v1', JSON.stringify({ provider: 'openai-api', model: 'gpt-6-astra', reasoningEffort: 'medium', endpoint: 'https://api.openai.com/v1', apiServerUrl: '' }));
       const originalClick = HTMLAnchorElement.prototype.click;
       HTMLAnchorElement.prototype.click = function (...args) {
         if (this.download?.endsWith('-annotations.json')) {
@@ -386,9 +392,9 @@ try {
       };
     });
     await page.setViewportSize({ width: 1440, height: 900 });
-    await page.goto(appUrl);
+    await page.goto(appUrl + '/?view=advanced');
     try {
-      await page.getByRole('heading', { name: 'Visual Document Work Agent', exact: true }).waitFor({ state: 'visible', timeout: 12_000 });
+      await page.getByRole('heading', { name: '見つけたいことを、ひとこと。', exact: true }).waitFor({ state: 'visible', timeout: 12_000 });
     } catch (error) {
       const bodyText = await page.locator('body').innerText().catch(() => '(body unavailable)');
       fail('the production preview did not render the app heading; url=' + page.url() + '; title=' + await page.title().catch(() => '(title unavailable)') + '; body=' + bodyText.slice(0, 1200) + '; console=' + JSON.stringify(consoleErrors) + '; pageErrors=' + JSON.stringify(pageErrors) + '; cause=' + String(error));
@@ -475,10 +481,11 @@ try {
 
     const reviewCard = page.locator('.candidate-section .candidate-card').filter({ hasText: 'HIGH RISK' }).first();
     await reviewCard.waitFor({ state: 'visible', timeout: 20_000 });
+    await expandDisclosure('.agent-log-details');
     check((await activity.innerText()).includes('request_review →'), 'the UI omitted the streamed request_review activity before showing its approval card');
     check((await reviewCard.innerText()).includes('Either party may terminate for convenience on thirty days written notice.'), 'the Human-in-the-loop card omitted the page-2 excerpt');
     check((await reviewCard.innerText()).includes('without a breach condition'), 'the Human-in-the-loop card omitted the review reason');
-    await page.locator('.continuation-note').filter({ hasText: 'ページ 2' }).waitFor({ state: 'visible' });
+    await page.locator('.continuation-note').filter({ hasText: /ページ *2/u }).waitFor({ state: 'visible' });
     const pausedPageImage = await page.locator('.document-page-image').getAttribute('alt');
     check(pausedPageImage?.includes('2 ページ'), 'the approval card should focus page 2, got ' + pausedPageImage);
     await reviewCard.scrollIntoViewIfNeeded();
@@ -541,6 +548,7 @@ try {
       fail('the API returned page 3 but its annotation box was not visible; annotationTexts=' + JSON.stringify(annotationTexts) + '; activity=' + currentActivity.slice(-1500) + '; resumedResult=' + JSON.stringify({ status: resumedResult.status, visitedPages: resumedResult.visitedPages, annotations: resumedResult.annotations }) + '; cause=' + String(error));
     }
     await page.locator('.agent-overview .agent-status-pill.is-complete').waitFor({ state: 'visible', timeout: 45_000 });
+    await expandDisclosure('.agent-log-details');
     const continuedActivityText = await activity.innerText();
     check(continuedActivityText.includes('navigate_page →') && continuedActivityText.includes('annotate_region →'), 'the UI omitted resumed page-3 tool activity');
     check(continuedActivityText.includes('P.3') || continuedActivityText.includes('ページ 3'), 'the resumed Activity history did not identify page 3');

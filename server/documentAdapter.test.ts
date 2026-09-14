@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
-import { PDFArray, PDFDocument, PDFRawStream, StandardFonts, decodePDFRawStream } from 'pdf-lib';
+import { PDFArray, PDFDict, PDFDocument, PDFHexString, PDFName, PDFNumber, PDFRawStream, StandardFonts, decodePDFRawStream, degrees } from 'pdf-lib';
 import type { PreviewReport } from 'document-svg';
 import { PagedDocumentAdapter, searchDocumentAdapters, type DocumentAdapter } from './documentAdapter';
 
@@ -142,6 +142,79 @@ test('PDF native export preserves searchable source content and adds vector anno
   assert.match(overlayStreams, /79\.2/, 'the annotation rectangle height was added as PDF vector content');
   assert.deepEqual(sourceBuffer, originalBytes, 'export does not mutate the supplied source bytes');
   assert.equal(createHash('sha256').update(sourceBuffer).digest('hex'), originalHash, 'the original source hash is unchanged');
+});
+
+test('PDF export attaches Unicode notes to their rotated source pages while preserving existing annotations', async () => {
+  const sourcePdf = await PDFDocument.create();
+  const rotations = [0, 90, 180, 270];
+  const pages = rotations.map((rotation) => {
+    const page = sourcePdf.addPage([612, 792]);
+    page.setCropBox(10, 20, 500, 700);
+    page.setRotation(degrees(rotation));
+    return page;
+  });
+  const existingNote = sourcePdf.context.obj({
+    Type: PDFName.of('Annot'), Subtype: PDFName.of('Text'), Rect: [30, 40, 48, 58],
+    NM: PDFHexString.fromText('original-reviewer-note'), Contents: PDFHexString.fromText('既存レビューコメント'), P: pages[1]!.ref,
+  });
+  pages[1]!.node.addAnnot(sourcePdf.context.register(existingNote));
+  const source = Buffer.from(await sourcePdf.save());
+  const original = Buffer.from(source);
+  const report = {
+    sourceFormat: 'PDF', pageCount: pages.length,
+    pages: rotations.map((rotation, index) => ({
+      number: index + 1,
+      widthPoints: rotation % 180 ? 700 : 500,
+      heightPoints: rotation % 180 ? 500 : 700,
+      warningCount: 0, warnings: [], svg: '<svg/>',
+    })),
+  } as unknown as PreviewReport;
+  const adapter = new PagedDocumentAdapter('日本語レビュー.pdf', report, 'notes-doc', source);
+  const records = rotations.map((_, index) => ({
+    id: `note-${index + 1}`, documentId: 'notes-doc',
+    target: { kind: 'page' as const, page: index + 1, boundingBox: { x: 0.1, y: 0.2, width: 0.3, height: 0.1 } },
+    label: `条項 ${index + 1}`, note: '通知期限を確認してください 📝',
+    evidence: '契約終了の30日前までに通知する。', explanation: '解約に必要な事前通知の期限です。',
+    reviewPriority: 'medium' as const, status: index === 0 ? 'auto' as const : 'corrected' as const,
+  }));
+  adapter.replaceAnnotations([...records, { ...records[0]!, id: 'unconfirmed', status: 'needs_review' }]);
+
+  const result = await adapter.export({ format: 'native-annotated' });
+  assert.equal(result.annotationsExported, 4);
+  assert.equal(result.metadata?.commentsAdded, 4);
+  assert.deepEqual(source, original, 'source bytes remain unchanged');
+  const exported = await PDFDocument.load(result.buffer);
+  const expectedRectangles = [
+    [60, 510, 210, 580],
+    [110, 90, 160, 300],
+    [310, 160, 460, 230],
+    [360, 440, 410, 650],
+  ];
+  for (let index = 0; index < rotations.length; index += 1) {
+    const page = exported.getPage(index);
+    assert.equal(page.getRotation().angle, rotations[index]);
+    assert.deepEqual(page.getCropBox(), { x: 10, y: 20, width: 500, height: 700 });
+    const notes = page.node.Annots()!.asArray().map((entry) => exported.context.lookup(entry, PDFDict));
+    assert.equal(notes.length, index === 1 ? 2 : 1, 'the original note remains alongside the added comment');
+    const newNote = notes.find((note) => note.lookup(PDFName.of('NM'), PDFHexString).decodeText() === `annotation-studio:note-${index + 1}`);
+    assert.ok(newNote, 'each comment retains its stable application annotation id');
+    assert.equal(newNote.lookup(PDFName.of('Subtype'), PDFName).asString(), '/Text');
+    assert.equal(newNote.get(PDFName.of('P'))?.toString(), page.ref.toString(), 'the note references the correct PDF page');
+    assert.equal(newNote.lookup(PDFName.of('Subj'), PDFHexString).decodeText(), `条項 ${index + 1}`);
+    const contents = newNote.lookup(PDFName.of('Contents'), PDFHexString).decodeText();
+    assert.match(contents, /通知期限を確認してください 📝/u);
+    assert.match(contents, /契約終了の30日前までに通知する。/u);
+    assert.match(contents, /解約に必要な事前通知の期限です。/u);
+    assert.ok(contents.includes(`Review status: ${index === 0 ? 'auto' : 'corrected'}`));
+    const rect = newNote.lookup(PDFName.of('Rect'), PDFArray);
+    expectedRectangles[index]!.forEach((expected, coordinate) => {
+      assert.ok(Math.abs(rect.lookup(coordinate, PDFNumber).asNumber() - expected) < 0.00001, 'comment geometry follows page crop and rotation');
+    });
+    if (index === 1) {
+      const preservedNote = notes.find((note) => note.lookup(PDFName.of('NM'), PDFHexString).decodeText() === 'original-reviewer-note');
+      assert.equal(preservedNote?.lookup(PDFName.of('Contents'), PDFHexString).decodeText(), '既存レビューコメント');
+    }
+  }
 });
 
 test('search combines matches from paged and spreadsheet adapters without changing target types', () => {

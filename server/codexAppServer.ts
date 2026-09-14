@@ -50,6 +50,8 @@ export function resolveCodexAppServerBinary(
     const bundledCandidates = [
       '/Applications/ChatGPT.app/Contents/Resources/codex',
       join(homedir(), 'Applications/ChatGPT.app/Contents/Resources/codex'),
+      '/Applications/Codex.app/Contents/Resources/codex',
+      join(homedir(), 'Applications/Codex.app/Contents/Resources/codex'),
     ];
     const bundled = bundledCandidates.find(isExecutable);
     if (bundled) return bundled;
@@ -111,10 +113,12 @@ export const codexWorkbookTurnSchema = z.object({
 }).strict();
 export const codexWorkbookTurnJsonSchema = codexWorkbookTurnSchema.toJSONSchema();
 
-class AppServerClient {
+export class AppServerClient {
   private readonly child: ChildProcessWithoutNullStreams;
   private readonly pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
   private readonly notificationHandlers = new Set<(message: ServerMessage) => void>();
+  private readonly pendingNotifications = new Set<(error: Error) => void>();
+  private connectionError: Error | undefined;
   private nextId = 0;
 
   constructor() {
@@ -125,6 +129,10 @@ class AppServerClient {
     });
     const lines = createInterface({ input: this.child.stdout });
     lines.on('line', (line) => this.handleLine(line));
+    // An unread stderr pipe can fill up and block both generation and RPC output.
+    // Diagnostics can include document text, so consume them without logging them.
+    this.child.stderr.resume();
+    this.child.stdin.on('error', (error) => this.failPending(new Error(`Codex App Serverへの接続が切断されました: ${error.message}`)));
     this.child.on('error', (error) => this.failPending(new Error(`Codex App Serverを起動できませんでした: ${error.message}`)));
     this.child.on('exit', (code) => this.failPending(new Error(`Codex App Serverが終了しました (${code ?? 'signal'}).`)));
   }
@@ -134,6 +142,12 @@ class AppServerClient {
     try {
       message = JSON.parse(line) as ServerMessage;
     } catch {
+      return;
+    }
+    if (message.method && message.id !== undefined) {
+      // Server requests have their own ID namespace. Never resolve a client RPC
+      // with one, and always answer unsupported requests instead of hanging.
+      this.child.stdin.write(`${JSON.stringify({ id: message.id, error: { code: -32601, message: 'This client does not support server-initiated requests.' } })}\n`);
       return;
     }
     if (typeof message.id === 'number') {
@@ -149,14 +163,18 @@ class AppServerClient {
   }
 
   private failPending(error: Error) {
+    this.connectionError ??= error;
     for (const [id, pending] of this.pending) {
       clearTimeout(pending.timer);
       pending.reject(error);
       this.pending.delete(id);
     }
+    for (const reject of this.pendingNotifications) reject(this.connectionError);
+    this.pendingNotifications.clear();
   }
 
   request<T>(method: string, params: Record<string, unknown>, timeoutMs = 30_000): Promise<T> {
+    if (this.connectionError) return Promise.reject(this.connectionError);
     const id = ++this.nextId;
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -176,6 +194,7 @@ class AppServerClient {
   }
 
   notify(method: string, params?: Record<string, unknown>) {
+    if (this.connectionError) return;
     this.child.stdin.write(`${JSON.stringify({ method, ...(params ? { params } : {}) })}\n`);
   }
 
@@ -185,19 +204,31 @@ class AppServerClient {
   }
 
   onceNotification<T>(method: string, predicate: (params: Record<string, unknown>) => boolean, timeoutMs = 180_000): Promise<T> {
-    return new Promise<T>((resolve, reject) => {
-      const timer = setTimeout(() => {
+    const promise = new Promise<T>((resolve, reject) => {
+      if (this.connectionError) { reject(this.connectionError); return; }
+      const fail = (error: Error) => {
+        clearTimeout(timer);
         this.notificationHandlers.delete(handler);
-        reject(new Error(`Codex App Serverから完了通知が届きませんでした (${method})。`));
+        this.pendingNotifications.delete(fail);
+        reject(error);
+      };
+      const timer = setTimeout(() => {
+        fail(new Error(`Codex App Serverから完了通知が届きませんでした (${method})。`));
       }, timeoutMs);
       const handler = (message: ServerMessage) => {
         if (message.method !== method || !message.params || !predicate(message.params)) return;
         clearTimeout(timer);
         this.notificationHandlers.delete(handler);
+        this.pendingNotifications.delete(fail);
         resolve(message.params as T);
       };
       this.notificationHandlers.add(handler);
+      this.pendingNotifications.add(fail);
     });
+    // Register before turn/start to avoid missing a fast completion. If that RPC
+    // fails, close() still rejects this waiter before its caller can await it.
+    void promise.catch(() => undefined);
+    return promise;
   }
 
   async initialize() {
@@ -210,12 +241,13 @@ class AppServerClient {
 
   close() {
     this.failPending(new Error('Codex App Serverの接続を終了しました。'));
+    this.notificationHandlers.clear();
     this.child.kill();
   }
 }
 
 export async function readFinalAgentMessage(client: ThreadReadClient, threadId: string, completedTurn: CompletedTurn) {
-  const findMessage = (turn?: TurnWithItems) => [...(turn?.items ?? [])]
+  const findMessage = (turn?: TurnWithItems) => turn?.status === 'failed' || turn?.status === 'interrupted' ? undefined : [...(turn?.items ?? [])]
     .reverse()
     .find((item) => item.type === 'agentMessage' && typeof item.text === 'string' && item.text.length > 0)?.text;
   const inlineMessage = findMessage(completedTurn.turn);
@@ -230,7 +262,7 @@ export async function readFinalAgentMessage(client: ThreadReadClient, threadId: 
     );
     const read = response as { thread?: { turns?: TurnWithItems[] } };
     const turns = read.thread?.turns ?? [];
-    turn = (turn.id ? turns.find((item) => item.id === turn.id) : undefined) ?? turns.at(-1) ?? turn;
+    turn = (turn.id ? turns.find((item) => item.id === turn.id) : turns.at(-1)) ?? turn;
   } catch {
     // Keep the completed notification as the diagnostic source if history cannot be read.
   }
@@ -253,6 +285,24 @@ function toUsage(breakdown?: Partial<TokenUsageBreakdown>): CodexUsage {
     cachedInputTokens: Number(breakdown?.cachedInputTokens ?? 0),
     totalTokens: Number(breakdown?.totalTokens ?? 0),
   };
+}
+
+export async function readCodexAppServerAuthStatus(): Promise<{ ready: boolean }> {
+  if (process.env.CODEX_APP_SERVER_DISABLED === 'true') {
+    throw new Error('Codex App Server接続はサーバー設定で無効になっています。');
+  }
+  const client = new AppServerClient();
+  try {
+    await client.initialize();
+    const status = await client.request<{ account?: { type?: string } | null; requiresOpenaiAuth?: boolean }>(
+      'account/read', { refreshToken: false },
+    );
+    // Keep account identifiers and credentials out of the browser response.
+    // A catalog can be available before sign-in; it is not authentication proof.
+    return { ready: Boolean(status.account?.type) || status.requiresOpenaiAuth === false };
+  } finally {
+    client.close();
+  }
 }
 
 export async function listCodexModels(): Promise<Model[]> {

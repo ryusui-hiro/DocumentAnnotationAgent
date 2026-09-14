@@ -1,8 +1,22 @@
+import { STATIC_BUILD } from './runtime';
 import type { AppSettings, ModelId, ProviderId, ReasoningEffort, UsageTotals } from './types';
 
 export const SETTINGS_STORAGE_KEY = 'annotation-studio:settings:v1';
 export const API_KEY_STORAGE_KEY = 'annotation-studio:api-key:v1';
 export const USAGE_STORAGE_KEY = 'annotation-studio:usage:v1';
+export const LANGUAGE_STORAGE_KEY = 'annotation-studio:language:v1';
+export type UiLanguage = 'ja' | 'en' | 'zh-CN';
+
+export function loadLanguage(storage?: Pick<Storage, 'getItem'>): UiLanguage {
+  try {
+    const value = (storage ?? globalThis.localStorage).getItem(LANGUAGE_STORAGE_KEY);
+    return value === 'ja' || value === 'en' || value === 'zh-CN' ? value : 'en';
+  } catch { return 'en'; }
+}
+
+export function persistLanguage(language: UiLanguage, storage?: Pick<Storage, 'setItem'>) {
+  try { (storage ?? globalThis.localStorage).setItem(LANGUAGE_STORAGE_KEY, language); } catch { /* Session language remains available when storage is disabled. */ }
+}
 
 export const modelCatalog: Array<{ id: ModelId; label: string }> = [
   { id: 'gpt-6-astra', label: 'GPT-6 Astra' },
@@ -13,7 +27,7 @@ export const modelCatalog: Array<{ id: ModelId; label: string }> = [
 
 export const defaultSettings: AppSettings = {
   apiServerUrl: import.meta.env?.VITE_API_BASE_URL?.trim() || '',
-  provider: 'openai-api',
+  provider: STATIC_BUILD ? 'openai-api' : 'codex-app-server',
   endpoint: 'https://api.openai.com/v1',
   azureDeployment: '',
   model: 'gpt-6-astra',

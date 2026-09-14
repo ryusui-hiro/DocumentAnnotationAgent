@@ -1,10 +1,11 @@
+import { readResponseJson } from './responseJson';
 import type { AgentActivityPhase, NormalizedTextBox } from './types';
 
 export type LiveToolActivity = { toolName: string; phase: AgentActivityPhase; detail: string; status: 'active' | 'complete' | 'waiting' | 'error'; pageNumber?: number; viewport?: NormalizedTextBox };
 
 export async function consumeAgentStream<T>(response: Response, onActivity: (event: LiveToolActivity) => void): Promise<{ payload: T; streamedActivityCount: number }> {
   if (!response.headers.get('content-type')?.includes('text/event-stream') || !response.body) {
-    return { payload: await response.json() as T, streamedActivityCount: 0 };
+    return { payload: await readResponseJson<T>(response), streamedActivityCount: 0 };
   }
 
   const reader = response.body.getReader();

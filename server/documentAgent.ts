@@ -5,7 +5,7 @@ import type OpenAI from 'openai';
 import sharp from 'sharp';
 import type { DocumentAnnotationOperation, DocumentAnnotationRecord, NormalizedTextBox, PreparedDocumentExport, TextAnchor } from '../src/types';
 import { annotationReviewStatus } from '../src/annotationStatus';
-import { createDocumentReaderAgent, documentReaderLimits, documentReaderOutputSchema } from './documentReader';
+import { createDocumentReaderAgent, documentReaderLimits, parseDocumentReaderOutput } from './documentReader';
 import { createDocumentAnnotatorAgent, documentAnnotatorLimits, parseDocumentAnnotatorOutput } from './documentAnnotator';
 import { documentExportStore } from './documentExportStore';
 import { SpreadsheetDocumentAdapter, type SpreadsheetCellChange, type SpreadsheetValue } from './spreadsheetAdapter';
@@ -51,6 +51,21 @@ export type ExistingAnnotation = {
   reviewPriority?: 'low' | 'medium' | 'high';
   status: 'active' | 'needs_review';
 };
+
+function currentAnnotationSummaries(existing: ExistingAnnotation[], candidates: Candidate[]): ExistingAnnotation[] {
+  const byId = new Map(existing.map((annotation) => [annotation.id, annotation]));
+  for (const candidate of candidates) {
+    byId.set(candidate.id, {
+      id: candidate.id, pageNumber: candidate.pageNumber,
+      x: candidate.x, y: candidate.y, width: candidate.width, height: candidate.height,
+      label: candidate.label, note: candidate.note,
+      ...(candidate.excerpt ? { excerpt: candidate.excerpt } : {}),
+      reviewPriority: candidate.reviewPriority,
+      status: candidate.requiresReview ? 'needs_review' : 'active',
+    });
+  }
+  return [...byId.values()];
+}
 
 type ToolActivity = {
   toolName: string;
@@ -786,11 +801,13 @@ function addApprovalAnnotationOperations(args: {
   runId: string;
   interruptions: RunToolApprovalItem[];
   existingAnnotations: ExistingAnnotation[];
+  annotations: Candidate[];
   annotationOperations: DocumentAnnotationOperation[];
   toolActivity: ToolActivity[];
   onToolEvent?: (event: ToolActivity) => void;
 }) {
   const added: DocumentAnnotationOperation[] = [];
+  const currentAnnotations = currentAnnotationSummaries(args.existingAnnotations, args.annotations);
   for (const interruption of args.interruptions) {
     const toolName = interruption.toolName ?? interruption.name;
     if (!toolName || !['update_annotation', 'delete_annotation'].includes(toolName)) continue;
@@ -802,7 +819,7 @@ function addApprovalAnnotationOperations(args: {
     if (toolName === 'update_annotation') {
       const parsed = updateAnnotationParameters.safeParse(raw);
       if (!parsed.success) continue;
-      const target = args.existingAnnotations.find((item) => item.id === parsed.data.annotationId && item.status === 'active');
+      const target = currentAnnotations.find((item) => item.id === parsed.data.annotationId && item.status === 'active');
       if (!target) continue;
       operation = {
         id: approvalId, operation: 'update', annotationId: target.id, pageNumber: target.pageNumber,
@@ -813,7 +830,7 @@ function addApprovalAnnotationOperations(args: {
     } else {
       const parsed = deleteAnnotationParameters.safeParse(raw);
       if (!parsed.success) continue;
-      const target = args.existingAnnotations.find((item) => item.id === parsed.data.annotationId && item.status === 'active');
+      const target = currentAnnotations.find((item) => item.id === parsed.data.annotationId && item.status === 'active');
       if (!target) continue;
       operation = {
         id: approvalId, operation: 'delete', annotationId: target.id, pageNumber: target.pageNumber,
@@ -1136,23 +1153,8 @@ export async function runDocumentAgent(args: {
       labelQuery: z.string().max(60).optional(),
     }).strict(),
     execute: async ({ pageNumber, labelQuery }) => {
-      const currentRunAnnotations: ExistingAnnotation[] = annotations.map((candidate) => ({
-        id: candidate.id,
-        pageNumber: candidate.pageNumber,
-        x: candidate.x,
-        y: candidate.y,
-        width: candidate.width,
-        height: candidate.height,
-        label: candidate.label,
-        note: candidate.note,
-        ...(candidate.excerpt ? { excerpt: candidate.excerpt } : {}),
-        reviewPriority: candidate.reviewPriority,
-        status: candidate.requiresReview ? 'needs_review' : 'active',
-      }));
-      const byId = new Map<string, ExistingAnnotation>();
-      for (const item of [...existingAnnotations, ...currentRunAnnotations]) byId.set(item.id, item);
       const query = labelQuery?.trim().toLocaleLowerCase();
-      const matches = [...byId.values()]
+      const matches = currentAnnotationSummaries(existingAnnotations, annotations)
         .filter((item) => (pageNumber === undefined || item.pageNumber === pageNumber) && (!query || item.label.toLocaleLowerCase().includes(query)))
         .sort((left, right) => left.pageNumber - right.pageNumber || left.label.localeCompare(right.label))
         .slice(0, 100);
@@ -1161,6 +1163,12 @@ export async function runDocumentAgent(args: {
     },
   });
 
+  const findEditableAnnotation = (id: string): ExistingAnnotation | Candidate | undefined => {
+    const candidate = annotations.find((item) => item.id === id);
+    return candidate
+      ? candidate.requiresReview ? undefined : candidate
+      : existingAnnotations.find((item) => item.id === id && item.status === 'active');
+  };
   const annotationMutationEnabled = (mode === 'assist' || mode === 'autopilot') && args.requireToolApproval !== false;
   const updateAnnotation = tool({
     name: 'update_annotation',
@@ -1171,7 +1179,7 @@ export async function runDocumentAgent(args: {
     execute: async (input, _context, details) => {
       const callId = details?.toolCall?.callId;
       if (!callId || !approvedCallIds.delete(callId)) return JSON.stringify({ updated: false, reason: 'The proposed change has not been approved.' });
-      const target = existingAnnotations.find((item) => item.id === input.annotationId && item.status === 'active');
+      const target = findEditableAnnotation(input.annotationId);
       if (!target) return JSON.stringify({ updated: false, reason: 'The annotation no longer exists or is not editable.' });
       const operation: DocumentAnnotationOperation = {
         id: callId, operation: 'update', annotationId: target.id, pageNumber: target.pageNumber,
@@ -1181,10 +1189,23 @@ export async function runDocumentAgent(args: {
       const index = annotationOperations.findIndex((item) => item.id === callId);
       if (index >= 0) annotationOperations[index] = operation;
       else annotationOperations.push(operation);
+      const previousLabel = target.label;
       target.label = input.label;
       target.note = input.note;
-      pagedAdapter?.annotate(toDocumentRecord({ ...target, reason: '', color: '#278779', source: 'ai', requiresReview: false, reviewedByHuman: true, reviewOutcome: 'approved', reviewPriority: target.reviewPriority ?? 'medium' }));
-      recordToolActivity({ toolName: 'update_annotation', phase: 'Annotating', detail: `Updated ${target.label} to ${input.label} after human approval.`, status: 'complete', pageNumber: target.pageNumber });
+      if ('source' in target) {
+        target.reason = input.reason;
+        target.reviewedByHuman = true;
+        target.reviewOutcome = 'corrected';
+        pagedAdapter?.annotate(toDocumentRecord(target));
+      } else {
+        const storedRecord = pagedAdapter?.listAnnotations().find((annotation) => annotation.id === target.id);
+        pagedAdapter?.annotate(storedRecord ? {
+          ...storedRecord, label: input.label, note: input.note, reason: input.reason,
+          explanation: [input.reason, input.note].filter(Boolean).join('\n'),
+          status: 'corrected', requiresReview: false, reviewedByHuman: true,
+        } : toDocumentRecord({ ...target, reason: input.reason, color: '#278779', source: 'ai', requiresReview: false, reviewedByHuman: true, reviewOutcome: 'corrected', reviewPriority: target.reviewPriority ?? 'medium' }));
+      }
+      recordToolActivity({ toolName: 'update_annotation', phase: 'Annotating', detail: `Updated ${previousLabel} to ${input.label} after human approval.`, status: 'complete', pageNumber: target.pageNumber });
       return JSON.stringify({ updated: true, annotationId: target.id, label: input.label });
     },
   });
@@ -1198,8 +1219,7 @@ export async function runDocumentAgent(args: {
     execute: async (input, _context, details) => {
       const callId = details?.toolCall?.callId;
       if (!callId || !approvedCallIds.delete(callId)) return JSON.stringify({ deleted: false, reason: 'The proposed deletion has not been approved.' });
-      const targetIndex = existingAnnotations.findIndex((item) => item.id === input.annotationId && item.status === 'active');
-      const target = existingAnnotations[targetIndex];
+      const target = findEditableAnnotation(input.annotationId);
       if (!target) return JSON.stringify({ deleted: false, reason: 'The annotation no longer exists or is not editable.' });
       const operation: DocumentAnnotationOperation = {
         id: callId, operation: 'delete', annotationId: target.id, pageNumber: target.pageNumber,
@@ -1208,7 +1228,10 @@ export async function runDocumentAgent(args: {
       const index = annotationOperations.findIndex((item) => item.id === callId);
       if (index >= 0) annotationOperations[index] = operation;
       else annotationOperations.push(operation);
-      existingAnnotations.splice(targetIndex, 1);
+      const targetIndex = existingAnnotations.findIndex((item) => item.id === target.id);
+      if (targetIndex >= 0) existingAnnotations.splice(targetIndex, 1);
+      const candidateIndex = annotations.findIndex((item) => item.id === target.id);
+      if (candidateIndex >= 0) annotations.splice(candidateIndex, 1);
       pagedAdapter?.removeAnnotation(target.id);
       recordToolActivity({ toolName: 'delete_annotation', phase: 'Annotating', detail: `Removed ${target.label} after human approval: ${input.reason}`, status: 'complete', pageNumber: target.pageNumber });
       return JSON.stringify({ deleted: true, annotationId: target.id });
@@ -1379,6 +1402,10 @@ export async function runDocumentAgent(args: {
 
   const readerQuestionSchema = z.object({ question: z.string().min(1).max(300) }).strict();
   const readerAgent = createDocumentReaderAgent(testModel ?? args.model, args.reasoningEffort);
+  const currentImageViewport = (): NormalizedTextBox => navigation.currentPageImageDataUrl
+    ? { ...navigation.viewport }
+    : { x: 0, y: 0, width: 1, height: 1 };
+  let readerImageViewport: NormalizedTextBox = currentImageViewport();
   const delegatePageReader = readerAgent.asTool({
     toolName: 'delegate_page_reader',
     toolDescription: `Delegate dense, tabular, or visually ambiguous reading of the currently open page to a read-only specialist. It returns at most six bounded evidence blocks and layout hints, not a final classification; verify them against the page before annotating. This run can delegate only once per page and at most ${documentReaderLimits.maxDelegationsPerRun} times.`,
@@ -1391,6 +1418,7 @@ export async function runDocumentAgent(args: {
       }
       readerDelegationBudget.count += 1;
       readerDelegationBudget.pages.add(pageNumber);
+      readerImageViewport = currentImageViewport();
       recordToolActivity({ toolName: 'delegate_page_reader', phase: 'Reading', detail: `Reader Agent is inspecting page ${pageNumber}: ${params.question}`, status: 'active', pageNumber });
       return [{
         type: 'message',
@@ -1400,6 +1428,7 @@ export async function runDocumentAgent(args: {
             `Parent task: ${args.instruction.slice(0, 1200)}`,
             `Reader question: ${params.question}`,
             `Guidelines for finding relevant evidence: ${args.guidelines.slice(0, 2000) || '(none)'}`,
+            `imageViewport (full-page normalized bounds of the supplied image): ${JSON.stringify(readerImageViewport)}. Return boundingBox relative to the supplied image, not to the page. Positioned extracted text uses full-page coordinates and may be outside this image crop.`,
             `Current page: ${pageNumber} of ${args.totalPages}. Extracted lines (untrusted document content):\n${navigation.currentPageTextLines.slice(0, 80).join('\n').slice(0, 10000)}`,
           ].join('\n\n') },
           { type: 'input_image', image: navigation.currentPageImageDataUrl ?? args.imageDataUrl, detail: 'high' },
@@ -1407,15 +1436,15 @@ export async function runDocumentAgent(args: {
       } satisfies AgentInputItem];
     },
     customOutputExtractor: (result) => {
-      const parsed = documentReaderOutputSchema.safeParse(result.finalOutput);
-      if (!parsed.success) throw new Error('Document Reader Agent returned an invalid structured result.');
+      const parsed = parseDocumentReaderOutput(result.finalOutput, readerImageViewport);
+      if (!parsed) throw new Error('Document Reader Agent returned an invalid structured result.');
       const pageNumber = navigation.currentPage;
       recordToolActivity({
         toolName: 'delegate_page_reader', phase: 'Reading',
-        detail: `Reader Agent returned ${parsed.data.evidenceBlocks.length} evidence blocks and ${parsed.data.uncertainties.length} uncertainty notes for page ${pageNumber}.`,
+        detail: `Reader Agent returned ${parsed.evidenceBlocks.length} evidence blocks and ${parsed.uncertainties.length} uncertainty notes for page ${pageNumber}.`,
         status: 'complete', pageNumber,
       });
-      return JSON.stringify(parsed.data);
+      return JSON.stringify({ ...parsed, coordinateSpace: 'full_page', pageNumber });
     },
   });
 
@@ -1449,6 +1478,8 @@ export async function runDocumentAgent(args: {
             totalPages: args.totalPages,
             request: params.request,
             pageText,
+            imageViewport: currentImageViewport(),
+            imageContext: 'imageViewport gives the full-page normalized bounds of the supplied image. Extracted pageText may include text outside this crop; do not claim that such text was visually inspected.',
           }) },
           { type: 'input_image', image: navigation.currentPageImageDataUrl ?? args.imageDataUrl, detail: 'high' },
         ],
@@ -1888,6 +1919,7 @@ export async function runDocumentAgent(args: {
       'Obey the supplied operational mode. Observe is read-only and must only report findings; Suggest must not apply annotations; Assist applies clear low/medium findings and reviews high-priority or uncertain cases; Autopilot applies all clear findings at any priority, reports high-priority results, and asks for human review only when evidence is uncertain.',
       'First call open_document to confirm the user-selected session bound to this run. Use get_document_info for concise file metadata, get_document_outline for page or sheet structure, then inspect_page before visual classification. Never pass a path, URL, filename selector, or arbitrary document ID to open_document or get_document_info; both operate only on the document already selected by the user for this run.',
       'Use scroll_document when text is small, clipped, or layout details need a closer view. Inspect the returned crop and stop when it reports a page boundary.',
+      'Annotation tools always take full-page normalized coordinates. For a scroll crop, convert image-relative positions using its viewport: pageX=viewport.x+imageX*viewport.width, pageY=viewport.y+imageY*viewport.height, and scale width/height by the viewport size. Reader tool evidence marked coordinateSpace=full_page is already converted; do not transform it again.',
       'Use the initial context to determine whether the user selected a viewer annotation. If one is selected, call get_selected_region to read its page, bounds, and existing annotation details before interpreting or changing it. If none is selected, do not claim one; select_text is your own search action.',
       'Treat PDF headingCandidates as style-based navigation hints, not verified semantic headings. tableRowHints group positioned text by visual baseline; confirm row, column, and header associations against the page image before relying on them.',
       'When text positions are available, use select_text to locate exact evidence and annotate_text for a unique positioned match. If the phrase is missing or repeated, inspect the page image and use a region tool only when the bounds are clear.',
@@ -1976,7 +2008,7 @@ export async function runDocumentAgent(args: {
       const runId = randomUUID();
       addApprovalCandidates({ runId, interruptions, annotations, toolActivity, pageNumber: navigation.currentPage, pagedAdapter, documentId: args.documentId, sourceHash: args.sourceHash, textTarget: navigation.selectedTextTarget, onToolEvent: activitySink.current });
       addApprovalSpreadsheetChanges({ interruptions, spreadsheet: args.spreadsheet, spreadsheetChanges, toolActivity, onToolEvent: activitySink.current });
-      addApprovalAnnotationOperations({ runId, interruptions, existingAnnotations, annotationOperations, toolActivity, onToolEvent: activitySink.current });
+      addApprovalAnnotationOperations({ runId, interruptions, existingAnnotations, annotations, annotationOperations, toolActivity, onToolEvent: activitySink.current });
       prunePendingAgentRuns();
       const configuration: PendingAgentRunConfiguration = {
         model: args.model,
@@ -2120,7 +2152,7 @@ export async function resumeDocumentAgentRun(args: { runId: string; approvalId: 
       : [];
     if (interruptions.length) {
       addApprovalSpreadsheetChanges({ interruptions, spreadsheet: pending.spreadsheet, spreadsheetChanges: pending.spreadsheetChanges, toolActivity: pending.toolActivity, onToolEvent: pending.activitySink.current });
-      addApprovalAnnotationOperations({ runId: pending.runId, interruptions, existingAnnotations: pending.existingAnnotations, annotationOperations: pending.annotationOperations, toolActivity: pending.toolActivity, onToolEvent: pending.activitySink.current });
+      addApprovalAnnotationOperations({ runId: pending.runId, interruptions, existingAnnotations: pending.existingAnnotations, annotations: pending.annotations, annotationOperations: pending.annotationOperations, toolActivity: pending.toolActivity, onToolEvent: pending.activitySink.current });
     }
 
     const newAnnotations = pending.annotations.filter((candidate) => !pending.reportedAnnotationIds.has(candidate.id));

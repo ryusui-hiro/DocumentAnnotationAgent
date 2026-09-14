@@ -1070,6 +1070,7 @@ test('the Reader Agent receives the latest high-detail crop after the Orchestrat
       { number: 2, widthPoints: 120, heightPoints: 160, warningCount: 0, warnings: [], svg: '<svg xmlns="http://www.w3.org/2000/svg" width="120" height="160"><text x="4" y="20">A small, dense table value</text></svg>' },
     ],
   } as unknown as PreviewReport);
+  let suppliedViewport: { x: number; y: number; width: number; height: number };
   const model = new ScriptedModel([
     modelResponse([functionCall('get_document_outline', {}, { callId: 'scroll-reader-outline' })]),
     modelResponse([functionCall('inspect_page', {}, { callId: 'scroll-reader-inspect-start' })]),
@@ -1082,9 +1083,30 @@ test('the Reader Agent receives the latest high-detail crop after the Orchestrat
       assert.match(input, /data:image\/png;base64,/u, 'the Reader should receive the high-detail crop from the latest scroll action');
       assert.match(input, /"detail":"high"/u, 'the delegated crop should retain high image detail');
       assert.doesNotMatch(input, /data:image\/jpeg;base64,/u, 'the Reader should not fall back to the lower-detail navigation overview after scrolling');
-      return [assistantMessage(JSON.stringify({ pageSummary: 'A dense value is visible in the focused table crop.', evidenceBlocks: [], uncertainties: [] }))];
+      const text = inputTextFromModelCall(call);
+      const viewportMatch = text.match(/imageViewport .*?: (\{[^\n]+?\})\./u);
+      assert.ok(viewportMatch, 'the Reader receives the image crop mapping independently of full-page text coordinates');
+      suppliedViewport = JSON.parse(viewportMatch[1]!);
+      assert.ok(suppliedViewport.y > 0);
+      assert.ok(suppliedViewport.width < 1);
+      return [assistantMessage(JSON.stringify({
+        pageSummary: 'A dense value is visible in the focused table crop.',
+        evidenceBlocks: [{ excerpt: '120', description: 'The visible table value.', boundingBox: { x: 0.1, y: 0.2, width: 0.4, height: 0.1 }, readingPriority: 'medium' }], uncertainties: [],
+      }))];
     }),
-    modelResponse([assistantMessage('The detail crop was delegated to the Reader.')]),
+    modelResponder((call) => {
+      const output = readToolResult(call, 'delegate_page_reader');
+      assert.equal(output.coordinateSpace, 'full_page');
+      assert.equal(output.pageNumber, 2);
+      const blocks = output.evidenceBlocks as Array<{ boundingBox: typeof suppliedViewport }>;
+      assert.deepEqual(blocks[0]?.boundingBox, {
+        x: suppliedViewport.x + 0.1 * suppliedViewport.width,
+        y: suppliedViewport.y + 0.2 * suppliedViewport.height,
+        width: 0.4 * suppliedViewport.width,
+        height: 0.1 * suppliedViewport.height,
+      }, 'the parent receives full-page coordinates, not coordinates relative to the cropped image');
+      return [assistantMessage('The detail crop was delegated to the Reader.')];
+    }),
   ]);
   const result = await runDocumentAgent({
     model: 'gpt-6-astra', reasoningEffort: 'low', instruction: 'Inspect the dense table on page 2.',
@@ -1207,6 +1229,19 @@ test('updating and deleting an annotation each pause for approval and resume the
     id: 'existing-risk', pageNumber: 1, x: 0.2, y: 0.25, width: 0.4, height: 0.12,
     label: 'MEDIUM RISK', note: 'Conditional termination right.', excerpt: 'for cause', status: 'active' as const,
   };
+  const adapter = new PagedDocumentAdapter('existing-risk.pdf', {
+    sourceFormat: 'PDF', pageCount: 1,
+    pages: [{ number: 1, widthPoints: 240, heightPoints: 320, warningCount: 0, warnings: [], svg: '<svg xmlns="http://www.w3.org/2000/svg" width="240" height="320"><text x="20" y="40">Either party may terminate for cause.</text></svg>' }],
+  } as unknown as PreviewReport, 'existing-risk-doc');
+  const sourceTarget = {
+    kind: 'page' as const, page: 1, boundingBox: { x: existing.x, y: existing.y, width: existing.width, height: existing.height },
+    textAnchor: { quote: { exact: 'for cause', prefix: 'terminate ', suffix: '.' }, position: { start: 27, end: 36, unit: 'normalized-page-text' as const } },
+  };
+  adapter.annotate({
+    id: existing.id, documentId: 'existing-risk-doc', sourceHash: 'preserved-source-hash', target: sourceTarget,
+    label: existing.label, note: existing.note, evidence: existing.excerpt, explanation: existing.note,
+    reviewPriority: 'medium', status: 'approved', source: 'manual',
+  });
   const model = new ScriptedModel([
     modelResponse([functionCall('get_document_outline', {}, { callId: 'mutation-outline' })]),
     modelResponse([functionCall('inspect_page', {}, { callId: 'mutation-inspect' })]),
@@ -1224,6 +1259,7 @@ test('updating and deleting an annotation each pause for approval and resume the
     model: 'gpt-6-astra', reasoningEffort: 'medium', instruction: 'Correct prior risk labels and remove stale annotations.',
     guidelines: '', correction: '', humanDecisions: '', pageText: 'Either party may terminate for cause.',
     imageDataUrl: 'data:image/png;base64,AA==', pageNumber: 1, totalPages: 1, mode: 'assist', existingAnnotations: [existing],
+    documentId: 'existing-risk-doc', documentAdapters: [adapter],
   }, model);
   assert.equal(first.status, 'interrupted');
   assert.equal(first.annotationOperations?.[0]?.operation, 'update');
@@ -1235,11 +1271,86 @@ test('updating and deleting an annotation each pause for approval and resume the
   assert.equal(second.status, 'interrupted');
   assert.equal(second.annotationOperations?.find((item) => item.operation === 'update')?.status, 'approved');
   assert.equal(second.annotationOperations?.find((item) => item.operation === 'delete')?.existingLabel, 'HIGH RISK');
+  const corrected = adapter.listAnnotations()[0]!;
+  assert.deepEqual(corrected.target, sourceTarget, 'correcting an imported annotation retains its exact text anchor');
+  assert.equal(corrected.source, 'manual');
+  assert.equal(corrected.sourceHash, 'preserved-source-hash');
+  assert.equal(corrected.status, 'corrected');
 
   const completed = await resumeDocumentAgentRun({ runId: second.approvalRunId!, approvalId: second.approvalId!, approved: true });
   model.assertComplete();
   assert.equal(completed.status, 'complete');
   assert.equal(completed.annotationOperations?.find((item) => item.operation === 'delete')?.status, 'approved');
+  assert.deepEqual(adapter.listAnnotations(), []);
+});
+
+test('annotations created in the current run can be corrected and removed with review without losing text anchors', async () => {
+  const adapter = new PagedDocumentAdapter('current-run.pdf', {
+    sourceFormat: 'PDF', pageCount: 1,
+    pages: [{ number: 1, widthPoints: 240, heightPoints: 320, warningCount: 0, warnings: [], svg: '<svg xmlns="http://www.w3.org/2000/svg" width="240" height="320"><text x="20" y="40">Revenue: 120</text></svg>' }],
+  } as unknown as PreviewReport, 'current-run');
+  let annotationId = '';
+  const model = new ScriptedModel([
+    modelResponse([functionCall('get_document_outline', {}, { callId: 'current-run-outline' })]),
+    modelResponse([functionCall('inspect_page', {}, { callId: 'current-run-inspect' })]),
+    modelResponse([functionCall('annotate_text', {
+      text: 'Revenue: 120', label: 'REVENUE', note: 'Revenue amount.', reason: 'The source states revenue of 120.',
+      confidence: null, reviewPriority: 'low', requiresReview: false,
+    }, { callId: 'current-run-create' })]),
+    modelResponder((call) => {
+      const created = readToolResult(call, 'annotate_text');
+      assert.equal(created.created, true);
+      annotationId = String(created.id);
+      return [functionCall('update_annotation', {
+        annotationId, label: 'REPORTED REVENUE', note: 'Reported revenue is 120.', reason: 'Clarify that the number is reported revenue.',
+      }, { callId: 'current-run-update' })];
+    }),
+    modelResponder((call) => {
+      assert.equal(readToolResult(call, 'update_annotation').updated, true);
+      return [functionCall('list_annotations', { pageNumber: 1 }, { callId: 'current-run-list' })];
+    }),
+    modelResponder((call) => {
+      const listed = readToolResult(call, 'list_annotations').annotations as Array<{ id: string; label: string }>;
+      assert.deepEqual(listed.map(({ id, label }) => ({ id, label })), [{ id: annotationId, label: 'REPORTED REVENUE' }]);
+      return [functionCall('delete_annotation', { annotationId, reason: 'The reviewer wants to remove this label after checking it.' }, { callId: 'current-run-delete' })];
+    }),
+    modelResponder((call) => {
+      assert.equal(readToolResult(call, 'delete_annotation').deleted, true);
+      return [functionCall('list_annotations', { pageNumber: 1 }, { callId: 'current-run-list-empty' })];
+    }),
+    modelResponder((call) => {
+      assert.deepEqual(readToolResult(call, 'list_annotations').annotations, []);
+      return [assistantMessage('The reviewed correction and removal are complete.')];
+    }),
+  ]);
+  const first = await runDocumentAgent({
+    model: 'gpt-6-astra', reasoningEffort: 'low', instruction: 'Label the revenue and review any corrections.',
+    guidelines: '', correction: '', humanDecisions: '', pageText: 'Revenue: 120',
+    imageDataUrl: 'data:image/png;base64,AA==', pageNumber: 1, totalPages: 1,
+    mode: 'assist', documentId: 'current-run', documentAdapters: [adapter],
+  }, model);
+  assert.equal(first.status, 'interrupted');
+  assert.equal(first.annotationOperations[0]?.status, 'needs_review');
+  assert.equal(first.annotationOperations[0]?.annotationId, annotationId);
+  const originalRecord = adapter.listAnnotations()[0]!;
+  assert.equal(originalRecord.label, 'REVENUE', 'the new label does not change before approval');
+  assert.equal(originalRecord.target.kind, 'page');
+  assert.ok('textAnchor' in originalRecord.target && originalRecord.target.textAnchor);
+
+  const second = await resumeDocumentAgentRun({ runId: first.approvalRunId!, approvalId: first.approvalId!, approved: true });
+  assert.equal(second.status, 'interrupted');
+  const correctedRecord = adapter.listAnnotations()[0]!;
+  assert.equal(correctedRecord.label, 'REPORTED REVENUE');
+  assert.equal(correctedRecord.status, 'corrected');
+  assert.deepEqual(correctedRecord.target, originalRecord.target, 'the source text anchors and fragments are retained');
+  assert.equal(second.annotationOperations.find((operation) => operation.operation === 'delete')?.existingLabel, 'REPORTED REVENUE');
+
+  const completed = await resumeDocumentAgentRun({ runId: second.approvalRunId!, approvalId: second.approvalId!, approved: true });
+  model.assertComplete();
+  assert.equal(completed.status, 'complete');
+  assert.deepEqual(adapter.listAnnotations(), []);
+  assert.deepEqual(completed.annotations, [], 'the removed current-run candidate is not returned or resurrected');
+  assert.equal(completed.annotationOperations.find((operation) => operation.operation === 'delete')?.status, 'approved');
 });
 
 test('rejecting an annotation update records the decision without applying it', async () => {

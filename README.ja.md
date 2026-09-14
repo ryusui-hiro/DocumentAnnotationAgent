@@ -1,10 +1,31 @@
 # Astra Annotator
 
+GitHub Pagesの[公開アプリ](https://ryusui-hiro.github.io/DocumentAnnotationAgent/)を追加しました。APIエンドポイントとキーでブラウザーから直接AIを実行できます。PDF・画像はブラウザーで描画し、Officeは本文の再配置プレビューです。キーはタブ内だけに保持します。Codexと元形式のOffice出力には文書APIサーバーが必要です。詳細は[英語README](README.md)をご覧ください。
+
 [日本語](README.ja.md) | [English](README.md) | [简体中文](README.zh.md) · `README.md` は英語版を既定にしています。
 
-PDF / Word / Excel / PowerPointをページ単位で読み、PNG / JPEG / WebP / TIFF画像も1ページの文書として扱う Document Annotation Agent の React + Node.js PoC です。指示とガイドラインに沿って注釈し、根拠が明確で確認要求のない結果は自動追加、曖昧な結果は人の確認キューに回します。
+PDF / Word / Excel / PowerPointをページ単位で読み、PNG / JPEG / WebP / TIFF画像も1ページの文書として扱う Document Annotation Agent の React + Node.js アプリです。指示とガイドラインに沿って注釈し、根拠が明確で確認要求のない結果は自動追加、曖昧な結果は人の確認キューに回します。
 
 PDF / DOCX / PPTX / XLSX の変換は Node.js サーバー上の [`document-svg`](https://github.com/ryusui-hiro/document-svg) で行います。画像はサーバーで1ページのSVGプレビューに正規化します。APIキーはAI要求ごとにNode APIへ渡し、サーバー側では保存・ログ出力しません。
+
+## シンプルな文書ワークスペース
+
+既定表示は英語です。ヘッダーで日本語・英語・簡体字中国語を切り替えられます。初期画面、PDF・Word・PowerPoint・Excel・画像の読み込みは同じシンプルな画面です。文書を開き、自然文の指示を入力してRunを押すと、最大3ページを同時に処理し、届いた注釈を逐次表示します。領域を手動で囲んでラベル・メモを編集することもできます。
+
+ラベルはAIが動的に生成します。「Labels · optional」で名前と定義を追加した場合は、その名前を厳密に使用します。人の注釈はAIの再実行で消しません。途中結果は未確定として扱い、失敗・中断したページは区別して表示します。空のJSON応答は、APIの状態が分かるエラー表示に置き換えています。
+
+本番用のローカル起動は `npm run build` の後に `npm start` を実行し、`http://127.0.0.1:3001` を開きます。高度な既存ツールは `?view=advanced` に保持しています。
+
+## 論文OCRの実動デモ
+
+PC向けの「論文OCRデモ」を追加しました。OpenAI DALL·E論文の原ページ1・2・5を、実際のGPT-6 Astraでタイトル・見出し・本文・図・表・数式・キャプションの60領域に分類しています。数式はLaTeX表示と編集、表は行列付きテキスト、各領域はPNGで取り出せます。日本語・英語・簡体字中国語へ表示を切り替えても、原文や指示はそのままです。
+
+- [論文デモと再現手順](docs/paper-ocr-demo.md)
+- [実アップロードからの録画・実行証跡](docs/live-paper-recording.md)
+- 本番用ローカル起動では `http://127.0.0.1:3001/?view=paper-ocr` を開きます。
+- 白紙の作業画面から始める場合は `?view=paper-ocr&blank=1` を使い、PDFを選択し、Codex App Serverの設定でRunを実行します。
+- 書き出しにはJSON、CSV、Markdown＋LaTeX、注釈付きPDF、確定領域のPNG＋ノートZIPがあります。
+- 通常ワークスペースにも、複数ページの確定範囲ZIPと抜粋Markdownを追加しました。PDFにはラベル・メモ・根拠のUnicodeコメントを保存します。
 
 ## 起動
 
@@ -17,7 +38,7 @@ npm run create:demo
 npm run dev
 ```
 
-`http://127.0.0.1:5173` を開くと、既定の冷却ファン資料で画面を確認できます。手動注釈、ラベル・メモ編集、ページ切り替え、PNG抽出はキーなしでも使えます。通常のサンプルでは、AI未接続時に固定候補を表示することがあります。実モデルの解析結果ではありません。「契約レビュー例」は固定スクリプトの架空契約書デモです。別の「実AIデモ」メニューから、ラベル未記入の架空契約PDF、`Churn Risk`列が空欄の18件の顧客解約リスクExcel、または出力列が空欄の16件の顧客フィードバックExcelを個別に開けます。各デモは専用の指示とガイドラインを読み込みます。ファイルを開いただけではモデルを呼ばず、ユーザーがAgentの実行ボタンを押したときだけ解析を始めます。実AIデモはライブのAIプロバイダー接続が必須です。未接続で実行すると固定ラベルに置き換えず、設定画面を開きます。サンプルは合成データで、実在顧客の情報は含みません。契約例は法的助言ではありません。サンプルは`npm run create:termination-demo`、`npm run create:product-hunt-demo`、`npm run create:product-hunt-churn-demo`で再生成できます。Product Hunt用の実演手順、掲載文、事前確認は[demo kit](docs/product-hunt-demo-kit.md)を参照してください。
+`http://127.0.0.1:5173` を開くと、英語のシンプルな初期画面が表示されます。`?view=advanced` では従来の冷却ファンサンプル付きワークスペースも使えます。手動注釈、ラベル・メモ編集、ページ切り替え、PNG抽出はキーなしでも使えます。通常のサンプルでは、AI未接続時に固定候補を表示することがあります。実モデルの解析結果ではありません。「契約レビュー例」は固定スクリプトの架空契約書デモです。別の「実AIデモ」メニューから、ラベル未記入の架空契約PDF、`Churn Risk`列が空欄の18件の顧客解約リスクExcel、または出力列が空欄の16件の顧客フィードバックExcelを個別に開けます。各デモは専用の指示とガイドラインを読み込みます。ファイルを開いただけではモデルを呼ばず、ユーザーがAgentの実行ボタンを押したときだけ解析を始めます。実AIデモはライブのAIプロバイダー接続が必須です。未接続で実行すると固定ラベルに置き換えず、設定画面を開きます。サンプルは合成データで、実在顧客の情報は含みません。契約例は法的助言ではありません。サンプルは`npm run create:termination-demo`、`npm run create:product-hunt-demo`、`npm run create:product-hunt-churn-demo`で再生成できます。Product Hunt用の実演手順、掲載文、事前確認は[demo kit](docs/product-hunt-demo-kit.md)を参照してください。
 
 設定画面でOpenAI API、Azure OpenAI、OpenAI互換APIを選び、endpoint、API key、モデル、推論レベルを入力します。GPT-6 AstraとGPT-5.6 Sol / Terra / Lunaに対応します。Azureではendpoint、key、deployment名を入力します。サーバー環境変数 OPENAI_API_KEY / AZURE_OPENAI_* は、画面にAPIキーを入力しない場合のローカル用fallbackです。
 

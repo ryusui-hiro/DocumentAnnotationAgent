@@ -1,5 +1,6 @@
 node_modules/
 dist/
+dist-pages/
 src-tauri/resources/desktop-runtime/*
 !src-tauri/resources/desktop-runtime/.keep
 .cache/desktop-runtime/

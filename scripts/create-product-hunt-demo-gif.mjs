@@ -108,7 +108,7 @@ try {
   const recording = page.video();
 
   await page.goto(appUrl, { waitUntil: 'networkidle' });
-  await page.getByRole('heading', { name: 'Visual Document Work Agent' }).waitFor({ state: 'visible' });
+  await page.getByRole('heading', { name: '見つけたいことを、ひとこと。' }).waitFor({ state: 'visible' });
   await page.locator('.document-page-image').waitFor({ state: 'visible' });
   await page.waitForFunction(() => {
     const image = document.querySelector('.document-page-image');

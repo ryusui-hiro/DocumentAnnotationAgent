@@ -1,0 +1,105 @@
+{
+  "product": "Astra Annotator",
+  "tagline": "Annotate documents live with AI, on your terms",
+  "url": "https://ryusui-hiro.github.io/DocumentAnnotationAgent/",
+  "regenerate": "node scripts/create-launch-assets.mjs",
+  "thumbnail": {
+    "file": "launch-thumbnail-1024.png",
+    "width": 1024,
+    "height": 1024,
+    "source": "launch-thumbnail.svg"
+  },
+  "galleries": [
+    {
+      "id": "01-live",
+      "title": "Watch annotations appear as AI works.",
+      "subtitle": "Process pages concurrently. Keep your own notes alongside AI annotations.",
+      "source": "launch-source-live.png",
+      "originalCapture": "output/recordings/parallel-en/video-check-live.png",
+      "state": "Real live run: three pages processing; incoming regions and a manual reviewer note visible.",
+      "file": "launch-gallery-01-live-1600x1200.png",
+      "width": 1600,
+      "height": 1200,
+      "sourceWidth": 1600,
+      "sourceHeight": 1000,
+      "sourceSha256": "0fe612181b10713aa52348a506d55c15eee8715387662fe8711d769c8e84d4ff",
+      "screenshotPlacement": {
+        "left": 48,
+        "top": 208,
+        "width": 1504,
+        "height": 940,
+        "cropped": false
+      }
+    },
+    {
+      "id": "02-equations",
+      "title": "Turn equations into editable LaTeX.",
+      "subtitle": "Keep the source region, rendered formula, and editable expression together.",
+      "source": "launch-source-equations.png",
+      "originalCapture": "output/recordings/parallel-en/latex-visible.png",
+      "state": "Completed real run: an equation region selected with its LaTeX editor visible.",
+      "file": "launch-gallery-02-equations-1600x1200.png",
+      "width": 1600,
+      "height": 1200,
+      "sourceWidth": 1600,
+      "sourceHeight": 1000,
+      "sourceSha256": "64c152d0aa222eb4762bc0a94b54ca0d8c1f56c2ddf9aecace4f898f36660aa4",
+      "screenshotPlacement": {
+        "left": 48,
+        "top": 208,
+        "width": 1504,
+        "height": 940,
+        "cropped": false
+      }
+    },
+    {
+      "id": "03-tables",
+      "title": "Bring table values into your annotations.",
+      "subtitle": "Review extracted text and notes beside the table they came from.",
+      "source": "launch-source-tables.png",
+      "originalCapture": "output/recordings/parallel-en/table-values-visible.png",
+      "state": "Completed real run: a table region selected with its extracted source text visible.",
+      "file": "launch-gallery-03-tables-1600x1200.png",
+      "width": 1600,
+      "height": 1200,
+      "sourceWidth": 1600,
+      "sourceHeight": 1000,
+      "sourceSha256": "452bbf3fd9a7124af015a2ceb7604130a453d28067df6edfc60d44847b2d844d",
+      "screenshotPlacement": {
+        "left": 48,
+        "top": 208,
+        "width": 1504,
+        "height": 940,
+        "cropped": false
+      }
+    },
+    {
+      "id": "04-workspace",
+      "title": "Your documents. Your direction.",
+      "subtitle": "Open a document, describe what matters, and annotate with AI or by hand.",
+      "source": "launch-source-workspace.png",
+      "originalCapture": "output/playwright/unified-welcome-en-1600x1000.png",
+      "state": "Real welcome screen: supported document formats, instruction field, and Open document action.",
+      "file": "launch-gallery-04-workspace-1600x1200.png",
+      "width": 1600,
+      "height": 1200,
+      "sourceWidth": 1600,
+      "sourceHeight": 1000,
+      "sourceSha256": "1a7605af9f0cf31c43c8fb0f6ed8c3f618ac1099c24254f8a90951fe5e67479c",
+      "screenshotPlacement": {
+        "left": 48,
+        "top": 208,
+        "width": 1504,
+        "height": 940,
+        "cropped": false
+      }
+    }
+  ],
+  "provenance": "Screenshots are genuine full app viewports. Only uniform scaling and an external presentation frame are applied. No UI or data is fabricated.",
+  "paper": {
+    "title": "Zero-Shot Text-to-Image Generation",
+    "url": "https://arxiv.org/abs/2102.12092",
+    "license": "CC BY 4.0",
+    "attribution": "Aditya Ramesh, Mikhail Pavlov, Gabriel Goh, Scott Gray, Chelsea Voss, Alec Radford, Mark Chen, Ilya Sutskever (2021)."
+  }
+}

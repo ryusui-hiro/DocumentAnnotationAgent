@@ -1,4 +1,5 @@
 import { defaultSettings } from './settings';
+import { usesBrowserRuntime } from './runtime';
 import { invoke } from '@tauri-apps/api/core';
 
 function isTauriRuntime() {
@@ -21,6 +22,7 @@ export function shouldResolveManagedApiUrl(apiServerUrl: string, desktop: boolea
 
 export function apiFetch(path: string, init?: RequestInit, apiServerUrl?: string) {
   const configuredBase = (apiServerUrl ?? defaultSettings.apiServerUrl).trim();
+  if (usesBrowserRuntime(configuredBase)) return import('./staticApi').then(({ staticApiFetch }) => staticApiFetch(path, init));
   if (!shouldResolveManagedApiUrl(configuredBase, isTauriRuntime())) return fetch(apiUrl(path, configuredBase), init);
   return invoke<string>('local_api_base_url').then((base) => fetch(apiUrl(path, base), init));
 }

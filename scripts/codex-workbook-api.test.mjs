@@ -77,6 +77,58 @@ function readSseResult(text) {
   return JSON.parse(data);
 }
 
+test('Codex connection test checks sign-in before its catalog and hides account details', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'annotation-studio-codex-auth-api-'));
+  const binary = join(directory, 'fake-codex.cjs');
+  const statePath = join(directory, 'auth.json');
+  const callsPath = `${statePath}.requests`;
+  let api;
+  try {
+    await writeFile(binary, `#!/usr/bin/env node
+const { readFileSync, appendFileSync } = require('node:fs');
+const lines = require('node:readline').createInterface({ input: process.stdin });
+const send = (message) => process.stdout.write(JSON.stringify(message) + '\\n');
+lines.on('line', (line) => {
+  const request = JSON.parse(line);
+  appendFileSync(process.env.CODEX_APP_SERVER_CAPTURE + '.requests', request.method + '\\n');
+  if (request.method === 'initialize') send({ id: request.id, result: {} });
+  if (request.method === 'account/read') send({ id: request.id, result: JSON.parse(readFileSync(process.env.CODEX_APP_SERVER_CAPTURE, 'utf8')) });
+  if (request.method === 'model/list') send({ id: request.id, result: { data: [{ id: 'gpt-6-astra', model: 'gpt-6-astra' }], nextCursor: null } });
+});
+`, { mode: 0o755 });
+    await writeFile(statePath, JSON.stringify({ account: null, requiresOpenaiAuth: true }));
+    const port = await availablePort();
+    const baseUrl = `http://127.0.0.1:${port}`;
+    api = startApiServer(port, join(directory, 'api-state'), binary, statePath);
+    await waitForApi(baseUrl, api);
+    const check = (model = 'gpt-6-astra') => fetch(`${baseUrl}/api/ai/test`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, settings: { provider: 'codex-app-server', reasoningEffort: 'low' } }),
+    });
+
+    const missing = await check();
+    assert.equal(missing.status, 401);
+    assert.match((await missing.json()).error, /codex login/);
+    assert.doesNotMatch(await readFile(callsPath, 'utf8'), /model\/list/, 'An unsigned account must not be reported ready from its catalog.');
+
+    await writeFile(statePath, JSON.stringify({ account: { type: 'chatgpt', email: 'synthetic-private@example.test', planType: 'pro' }, requiresOpenaiAuth: true }));
+    const signedIn = await check();
+    assert.equal(signedIn.status, 200);
+    assert.deepEqual(await signedIn.json(), { ok: true, provider: 'codex-app-server', model: 'gpt-6-astra', reasoningEffort: 'low' });
+
+    const unknownModel = await check('gpt-5.6-sol');
+    assert.equal(unknownModel.status, 409, 'Authenticated accounts still require an available selected model.');
+
+    await writeFile(statePath, JSON.stringify({ account: null, requiresOpenaiAuth: false }));
+    const externalProvider = await check();
+    assert.equal(externalProvider.status, 200, 'A provider explicitly requiring no OpenAI authentication remains usable.');
+    assert.doesNotMatch(await readFile(callsPath, 'utf8'), /thread\/start|turn\/start/, 'Readiness checks must not start billable model generation.');
+  } finally {
+    await stopApi(api);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('Codex App Server reads bounded XLSX ranges, stages pending edits, and applies only source-bound approvals', async () => {
   const temporaryDirectory = await mkdtemp(join(tmpdir(), 'annotation-studio-codex-workbook-api-'));
   const dataDirectory = join(temporaryDirectory, 'api-state');

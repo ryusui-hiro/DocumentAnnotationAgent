@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { parseTaskPlan, taskPlanJsonSchema } from '../src/taskPlan';
-import { annotationOutputSchema, codexWorkbookTurnJsonSchema, draftCorrectionRuleWithCodexAppServer, planTaskWithCodexAppServer, readFinalAgentMessage, resolveCodexAppServerBinary } from './codexAppServer';
+import { AppServerClient, annotationOutputSchema, codexWorkbookTurnJsonSchema, draftCorrectionRuleWithCodexAppServer, planTaskWithCodexAppServer, readCodexAppServerAuthStatus, readFinalAgentMessage, resolveCodexAppServerBinary } from './codexAppServer';
 import { correctionRuleJsonSchema, parseCorrectionRuleDraft } from './correctionRulePlanner';
 
 test('Codex App Server binary override takes precedence over automatic discovery', () => {
@@ -17,6 +17,10 @@ test('macOS prefers the bundled ChatGPT CLI, while other platforms use PATH', ()
     '/Applications/ChatGPT.app/Contents/Resources/codex',
   );
   assert.equal(resolveCodexAppServerBinary(undefined, 'linux', () => true), 'codex');
+  assert.equal(
+    resolveCodexAppServerBinary(undefined, 'darwin', (path) => path === '/Applications/Codex.app/Contents/Resources/codex'),
+    '/Applications/Codex.app/Contents/Resources/codex',
+  );
 });
 
 function assertStrictObjectSchemas(schema: Record<string, unknown>, path = '$') {
@@ -82,6 +86,105 @@ test('reports turn metadata when neither completion nor history contains a final
     }),
     /status=failed, error=none, itemsView=summary, itemTypes=reasoning/,
   );
+});
+
+test('does not return an earlier turn when the completed turn is missing from history', async () => {
+  await assert.rejects(readFinalAgentMessage({
+    async request() { return { thread: { turns: [{ id: 'older-turn', status: 'completed', items: [{ type: 'agentMessage', text: '{"annotations":[]}' }] }] } }; },
+  }, 'thread-1', { turn: { id: 'current-turn', status: 'completed', items: [] } }), /最終メッセージ/);
+});
+
+test('does not apply partial output from a failed or interrupted turn', async () => {
+  for (const status of ['failed', 'interrupted']) {
+    await assert.rejects(readFinalAgentMessage({ async request() { return {}; } }, 'thread-1', {
+      turn: { id: 'turn-1', status, items: [{ type: 'agentMessage', text: '{"annotations":[]}' }] },
+    }), new RegExp(`status=${status}`));
+  }
+});
+
+async function withFakeAppServer(body: string, run: () => Promise<void>) {
+  const directory = await mkdtemp(join(tmpdir(), 'annotation-codex-transport-test-'));
+  const binaryPath = join(directory, 'fake-codex.cjs');
+  const previousBinary = process.env.CODEX_APP_SERVER_BIN;
+  await writeFile(binaryPath, `#!/usr/bin/env node
+const readline = require('node:readline');
+const send = (message) => process.stdout.write(JSON.stringify(message) + '\\n');
+const lines = readline.createInterface({ input: process.stdin });
+${body}
+`, { mode: 0o755 });
+  process.env.CODEX_APP_SERVER_BIN = binaryPath;
+  try { await run(); }
+  finally {
+    if (previousBinary === undefined) delete process.env.CODEX_APP_SERVER_BIN;
+    else process.env.CODEX_APP_SERVER_BIN = previousBinary;
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+test('drains verbose App Server stderr so RPC cannot stall behind a full pipe', { timeout: 5000 }, async () => {
+  await withFakeAppServer(`lines.on('line', (line) => {
+    const request = JSON.parse(line);
+    process.stderr.write('diagnostic '.repeat(100000), () => send({ id: request.id, result: { ok: true } }));
+  });`, async () => {
+    const client = new AppServerClient();
+    try { assert.deepEqual(await client.request('probe', {}, 2000), { ok: true }); }
+    finally { client.close(); }
+  });
+});
+
+test('distinguishes server request IDs from pending client RPC IDs', { timeout: 5000 }, async () => {
+  await withFakeAppServer(`lines.on('line', (line) => {
+    const request = JSON.parse(line);
+    if (request.method === 'probe') send({ id: request.id, method: 'unsupported/approval', params: {} });
+    else if (request.error?.code === -32601) send({ id: request.id, result: { ok: true } });
+  });`, async () => {
+    const client = new AppServerClient();
+    try { assert.deepEqual(await client.request('probe', {}, 2000), { ok: true }); }
+    finally { client.close(); }
+  });
+});
+
+test('disconnect immediately rejects turn waiters and all later RPCs', { timeout: 5000 }, async () => {
+  await withFakeAppServer(`lines.on('line', () => process.exit(7));`, async () => {
+    const client = new AppServerClient();
+    try {
+      const completed = client.onceNotification('turn/completed', () => true);
+      await assert.rejects(client.request('probe', {}, 2000), /終了|切断/);
+      await assert.rejects(completed, /終了|切断/);
+      await assert.rejects(client.request('after-exit', {}, 2000), /終了|切断/);
+    } finally { client.close(); }
+  });
+});
+
+test('failed turn startup closes its pre-registered completion waiter', { timeout: 5000 }, async () => {
+  await withFakeAppServer(`lines.on('line', (line) => {
+    const request = JSON.parse(line);
+    if (request.method === 'initialize') send({ id: request.id, result: {} });
+    if (request.method === 'thread/start') send({ id: request.id, result: { thread: { id: 'thread-1' } } });
+    if (request.method === 'turn/start') send({ id: request.id, error: { code: -32000, message: 'synthetic startup failure' } });
+  });`, async () => {
+    await assert.rejects(planTaskWithCodexAppServer({
+      instruction: 'Find totals.', guidelines: '', correction: '', mode: 'assist', model: 'synthetic', reasoningEffort: 'low',
+    }), /synthetic startup failure/);
+  });
+});
+
+test('auth readiness requires sign-in when needed and returns no account details', { timeout: 5000 }, async () => {
+  const fixtures = [
+    { account: null, requiresOpenaiAuth: true },
+    { account: { type: 'chatgpt', email: 'synthetic-private@example.test', planType: 'pro' }, requiresOpenaiAuth: true },
+    { account: null, requiresOpenaiAuth: false },
+    {},
+  ];
+  for (const [index, fixture] of fixtures.entries()) {
+    await withFakeAppServer(`lines.on('line', (line) => {
+      const request = JSON.parse(line);
+      if (request.method === 'initialize') send({ id: request.id, result: {} });
+      if (request.method === 'account/read') send({ id: request.id, result: ${JSON.stringify(fixture)} });
+    });`, async () => {
+      assert.deepEqual(await readCodexAppServerAuthStatus(), { ready: index === 1 || index === 2 });
+    });
+  }
 });
 
 const validPlan = {

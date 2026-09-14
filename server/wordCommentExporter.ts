@@ -520,14 +520,15 @@ export async function exportWordComments(source: Buffer, annotations: WordCommen
     const paragraphSafeGroups = groups.filter((group) => safeGroups.includes(group)).sort((left, right) => right.startIndex - left.startIndex);
     for (const group of paragraphSafeGroups) {
       // Earlier anchors may have split the original Word runs. Rebuild the text index
-      // against the live paragraph before inserting the next exact range.
+      // against the live paragraph before inserting the next exact range. Splitting
+      // runs preserves normalized text offsets, including context-resolved matches
+      // when the same excerpt occurs more than once in this paragraph.
       const index = paragraphTextIndex(paragraph);
-      const foundAt = index.text.indexOf(group.query);
-      const nextMatch = foundAt < 0 ? -1 : index.text.indexOf(group.query, foundAt + 1);
-      const start = foundAt >= 0 ? index.positions[foundAt] : undefined;
-      const end = foundAt >= 0 ? index.positions[foundAt + group.query.length - 1] : undefined;
+      const foundAt = group.startIndex;
+      const start = index.positions[foundAt];
+      const end = index.positions[group.endIndex - 1];
       const match = start && end ? { start, end } : null;
-      if (foundAt < 0 || nextMatch >= 0 || !match) {
+      if (index.text.slice(foundAt, group.endIndex) !== group.query || !match) {
         for (const annotation of group.annotations) skipped.push({ annotationId: annotation.id, label: annotation.label, reason: 'ambiguous' });
         continue;
       }

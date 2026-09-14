@@ -1,0 +1,13 @@
+import { spawnSync } from 'node:child_process';
+import { stat, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
+const input=resolve(process.argv[2] || 'output/recordings/parallel-en/astra-parallel-live-en.webm');
+const output=resolve('docs/product-hunt/assets/astra-live-annotation.gif');
+await stat(input);
+const args=['-y','-hide_banner','-loglevel','error','-ss','115','-t','111','-i',input,'-filter_complex','[0:v]setpts=PTS/4,fps=7,scale=960:600:flags=lanczos,split[a][b];[a]palettegen=max_colors=96:stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=4:diff_mode=rectangle','-loop','0',output];
+const result=spawnSync('ffmpeg',args,{stdio:'inherit'});if(result.status!==0)throw new Error('ffmpeg could not create the live-annotation excerpt.');
+const size=(await stat(output)).size;
+await writeFile(resolve('docs/product-hunt/assets/astra-live-annotation.json'),JSON.stringify({source:'Actual English Codex App Server / GPT-6 Astra recording; see docs/live-paper-recording.md',sourceSha256:createHash('sha256').update(await readFile(input)).digest('hex'),sourceStartSeconds:115,sourceDurationSeconds:111,playbackSpeed:4,width:960,height:600,fps:7,bytes:size,fullAppViewport:true,scope:'Only the actual live annotation phase; setup and upload omitted.'},null,2)+'\n');
+console.log(`Wrote ${output} (${(size/1048576).toFixed(2)} MiB).`);

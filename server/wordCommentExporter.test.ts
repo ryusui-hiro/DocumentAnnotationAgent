@@ -235,6 +235,50 @@ test('reports an excerpt repeated twice in one paragraph as ambiguous', async ()
   assert.deepEqual(exported.skipped, [{ annotationId: 'same-paragraph-duplicate', label: 'Termination', reason: 'ambiguous' }]);
 });
 
+test('retains context-resolved positions for repeated excerpts while splitting the same Word paragraph', async () => {
+  const paragraphText = 'First party: may terminate after notice. Second party: may terminate immediately.';
+  const source = await makeDocx({ documentXml: `<w:document xmlns:w="${W}"><w:body><w:p><w:r><w:rPr><w:b/></w:rPr><w:t>${paragraphText}</w:t></w:r></w:p><w:sectPr/></w:body></w:document>` });
+  const annotations = [
+    { id: 'first-party', label: 'Notice required', prefix: 'First party: ', suffix: ' after notice.' },
+    { id: 'second-party', label: 'Immediate termination', prefix: 'Second party: ', suffix: ' immediately.' },
+  ].map(({ id, label, prefix, suffix }) => ({
+    id, label, note: '', excerpt: 'may terminate',
+    textAnchor: {
+      quote: { exact: 'may terminate', prefix, suffix },
+      position: { start: 0, end: 13, unit: 'normalized-page-text' as const },
+    },
+  }));
+
+  const exported = await exportWordComments(source, annotations);
+  assert.equal(exported.annotationsAnchored, 2, 'both contextual occurrences survive the live index rebuild');
+  assert.equal(exported.commentsAdded, 2);
+  assert.deepEqual(exported.skipped, []);
+  const zip = await JSZip.loadAsync(exported.buffer);
+  const document = new DOMParser().parseFromString(await zip.file('word/document.xml')!.async('string'), 'application/xml');
+  const paragraph = document.getElementsByTagNameNS(W, 'p').item(0)! as unknown as TestXmlElement;
+  const allText = Array.from(paragraph.getElementsByTagNameNS(W, 't')).map((node) => node.textContent ?? '').join('');
+  assert.equal(allText, paragraphText, 'splitting formatted runs leaves the original text unchanged');
+  const selections = selectedCommentTextById(paragraph);
+  assert.deepEqual([...selections.values()], ['may terminate', 'may terminate']);
+  const precedingTextById = new Map<string, string>();
+  let precedingText = '';
+  for (const child of Array.from(paragraph.childNodes)) {
+    if (child.nodeType !== child.ELEMENT_NODE) continue;
+    const element = child as TestXmlElement;
+    if (element.namespaceURI === W && element.localName === 'commentRangeStart') {
+      precedingTextById.set(element.getAttributeNS(W, 'id') ?? '', precedingText);
+    }
+    precedingText += Array.from(element.getElementsByTagNameNS(W, 't')).map((node) => node.textContent ?? '').join('');
+  }
+  const comments = new DOMParser().parseFromString(await zip.file('word/comments.xml')!.async('string'), 'application/xml');
+  for (const comment of Array.from(comments.getElementsByTagNameNS(W, 'comment'))) {
+    const label = comment.getElementsByTagNameNS(W, 't').item(0)?.textContent;
+    const prefix = precedingTextById.get(comment.getAttributeNS(W, 'id') ?? '') ?? '';
+    assert.ok(prefix.endsWith(label === 'Label: Notice required' ? 'First party: ' : 'Second party: '), 'each comment is attached to its context-selected occurrence');
+  }
+  assert.equal(paragraph.getElementsByTagNameNS(W, 'b').length, 5, 'all split pieces retain bold formatting');
+});
+
 test('does not let missing document-edge context select the wrong repeated Word excerpt', async () => {
   const documentXml = `<w:document xmlns:w="${W}"><w:body><w:p><w:r><w:t>Repeated claim without evidence. matching suffix.</w:t></w:r></w:p><w:p><w:r><w:t>Context B: Repeated claim without evidence. incorrect suffix.</w:t></w:r></w:p><w:sectPr/></w:body></w:document>`;
   const source = await makeDocx({ documentXml });

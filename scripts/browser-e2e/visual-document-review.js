@@ -4,6 +4,10 @@ async (page) => {
   const equal = (actual, expected, message) => {
     if (actual !== expected) fail(`${message}; expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
   };
+  const expandDisclosure = async (selector) => {
+    const disclosure = page.locator(selector);
+    if (await disclosure.getAttribute('open') === null) await disclosure.locator(':scope > summary').click();
+  };
   const workbookFixturePath = __WORKBOOK_FIXTURE_PATH__;
   const changedSourcePdfPath = __CHANGED_SOURCE_PDF_PATH__;
   const officeDocxFixturePath = __OFFICE_DOCX_FIXTURE_PATH__;
@@ -364,6 +368,8 @@ async (page) => {
   await page.addInitScript((fixture) => {
     if (sessionStorage.getItem('__visualDocumentE2eSeeded') !== 'true') {
       localStorage.clear();
+      localStorage.setItem('annotation-studio:language:v1', 'ja');
+      localStorage.setItem('annotation-studio:settings:v1', JSON.stringify({ provider: 'openai-api', model: 'gpt-6-astra', reasoningEffort: 'medium', endpoint: 'https://api.openai.com/v1', apiServerUrl: '' }));
       const baseKey = `annotation-studio:annotations:${fixture.fileName}`;
       const versionKey = `${baseKey}:source:${fixture.sourceHash}`;
       const state = {
@@ -420,7 +426,7 @@ async (page) => {
   }, demo);
 
   await page.setViewportSize({ width: 1440, height: 1000 });
-  await page.goto(origin);
+  await page.goto(`${origin}/?view=advanced`);
 
   const scenarios = [
     { action: 'approve', candidate: '制限値', expectedLabel: '制限値', expectedSource: 'ai', expectedStatus: 'approved' },
@@ -430,7 +436,7 @@ async (page) => {
   const outcomes = [];
 
   const waitForReadyDocument = async () => {
-    await page.getByRole('heading', { name: 'Visual Document Work Agent', exact: true }).waitFor({ state: 'visible' });
+    await page.getByRole('heading', { name: '見つけたいことを、ひとこと。', exact: true }).waitFor({ state: 'visible' });
     await page.locator('#ai-prompt').waitFor({ state: 'visible' });
     await page.locator('.document-page-image').waitFor({ state: 'visible' });
     await page.waitForFunction(() => {
@@ -460,7 +466,7 @@ async (page) => {
     fail(`the ${fileName} workspace document did not finish opening: ${JSON.stringify(lastState)}`);
   };
   const waitForRestoredDocument = async () => {
-    await page.getByRole('heading', { name: 'Visual Document Work Agent', exact: true }).waitFor({ state: 'visible' });
+    await page.getByRole('heading', { name: '見つけたいことを、ひとこと。', exact: true }).waitFor({ state: 'visible' });
     await page.locator('#ai-prompt').waitFor({ state: 'visible' });
     await page.locator('.document-page-image').waitFor({ state: 'visible' });
     await page.waitForFunction(() => {
@@ -544,6 +550,13 @@ async (page) => {
 
   await ambiguousCandidate.getByRole('button', { name: 'P.2' }).click();
   check((await page.locator('.page-controls').innerText()).includes('2 / 2'), 'the ambiguous candidate did not navigate the PDF viewer to page 2');
+  await page.locator('.export-menu-toggle').click();
+  const archiveDownload = page.waitForEvent('download');
+  await page.getByRole('menuitem', { name: '確定範囲をまとめて抽出（ZIP）' }).click();
+  const archive = await archiveDownload;
+  await archive.saveAs(`${visualEvidenceDirectory}/contract-extractions.zip`);
+  check(archive.suggestedFilename().endsWith('-extractions.zip'), 'the extraction archive is missing its ZIP filename');
+  await page.getByRole('status').filter({ hasText: 'PNG画像・抜粋ノート・ラベルとページ座標をZIPにまとめました' }).waitFor({ state: 'visible' });
   await ambiguousCandidate.getByRole('button', { name: '確認して追加' }).click();
   await page.getByRole('tab', { name: /注釈/ }).waitFor({ state: 'visible' });
   await page.waitForFunction(() => document.querySelector('[role="tab"][aria-selected="true"]')?.textContent?.includes('注釈'));
@@ -659,7 +672,7 @@ async (page) => {
   await page.getByRole('button', { name: '設定を閉じる' }).click();
   console.log('Customer churn-risk demo passed: dedicated task and route, 18 balanced blank synthetic records, live-model-only run guard, and no external requests.');
 
-  await page.goto(origin);
+  await page.goto(`${origin}/?view=advanced`);
   await waitForReadyDocument();
   const modePicker = page.getByTestId('agent-mode-picker');
   const modeGroup = page.getByRole('group', { name: 'Agent mode' });
@@ -671,6 +684,8 @@ async (page) => {
   }
   for (const [width, height, name] of [[1440, 900, 'agent-modes-1440x900'], [1280, 720, 'agent-modes-1280x720'], [390, 844, 'agent-modes-390x844']]) {
     await page.setViewportSize({ width, height });
+    // Mobile gives document and instructions priority; all mode controls remain reachable by panel scrolling.
+    if (width <= 850) await modeGroup.scrollIntoViewIfNeeded();
     const metrics = await page.evaluate(() => {
       const root = document.querySelector('#root')?.getBoundingClientRect();
       const shell = document.querySelector('.app-shell')?.getBoundingClientRect();
@@ -722,6 +737,7 @@ async (page) => {
     await page.locator('#ai-prompt').fill(historyTask);
     await page.locator('.guideline-details summary').click();
     await page.locator('#annotation-guidelines').fill('Use a concise label, quote the visible passage, and explain why it needs review.');
+    await expandDisclosure('.task-planning-details');
     await page.getByRole('button', { name: /作業仕様を確認/ }).click();
     const planCard = page.getByRole('region', { name: 'Annotation Task Plan' });
     await planCard.waitFor({ state: 'visible' });
@@ -736,6 +752,7 @@ async (page) => {
     }, undefined, { timeout: 45_000 });
     check(await page.getByText('デモ候補です。実モデルの解析結果ではありません。').isVisible(), 'the deterministic demo candidates were not disclosed as demo output');
 
+    await expandDisclosure('.agent-log-details');
     const activityText = await page.locator('section[aria-label="Agent Activity"]').innerText();
     for (const phase of ['計画', 'ページ移動', '読み取り', '検索', '人の確認']) {
       check(activityText.includes(phase), `visible Agent Activity is missing the ${phase} phase`);
@@ -771,7 +788,7 @@ async (page) => {
       check(seededContinuation, 'could not prepare a saved multi-page continuation for the correction rule flow');
       await page.reload();
       await waitForRestoredDocument();
-      await page.locator('.continuation-note').filter({ hasText: 'ページ 1' }).waitFor({ state: 'visible' });
+      await page.locator('.continuation-note').filter({ hasText: /ページ\s*1/u }).waitFor({ state: 'visible' });
       await page.locator('.rail-settings').click();
       const ruleSettingsDialog = page.getByRole('dialog', { name: '接続と使用量' });
       await ruleSettingsDialog.locator('#api-key').fill('e2e-mock-rule-key-not-a-secret');
@@ -883,6 +900,7 @@ async (page) => {
   });
   await page.reload();
   await waitForReadyDocument();
+  await expandDisclosure('.agent-log-details');
   const runHistoryPanel = page.locator('.run-history-details');
   await runHistoryPanel.waitFor({ state: 'visible', timeout: 10_000 });
   check((await page.locator('.run-history-details > summary').innerText()).includes('過去の作業履歴（1件）'), 'the completed Agent run was not restored from this browser profile');
@@ -1229,10 +1247,10 @@ async (page) => {
     const nativeOfficeExport = page.getByRole('menuitem', { name: office.menuLabel, exact: true });
     await nativeOfficeExport.waitFor({ state: 'visible' });
     await waitUntil(() => nativeOfficeExport.isEnabled(), `${office.mode.toUpperCase()} native export stayed disabled after a clear finding was applied`);
-    await page.evaluate(() => { delete window.__visualDocumentE2eOfficeExportFilename; delete window.__visualDocumentE2eOfficeExportByteLength; });
+    await page.evaluate(() => { delete window.__visualDocumentE2eOfficeExportFilename; delete window.__visualDocumentE2eOfficeExportByteLength; delete window.__visualDocumentE2eOfficeExportPromise; });
     await nativeOfficeExport.click();
-    await page.waitForFunction(() => typeof window.__visualDocumentE2eOfficeExportFilename === 'string', undefined, { timeout: 20_000 });
-    const officeExport = await page.evaluate(() => ({ fileName: window.__visualDocumentE2eOfficeExportFilename, byteLength: window.__visualDocumentE2eOfficeExportByteLength }));
+    await page.waitForFunction(() => Boolean(window.__visualDocumentE2eOfficeExportPromise), undefined, { timeout: 20_000 });
+    const officeExport = await page.evaluate(async () => ({ fileName: window.__visualDocumentE2eOfficeExportFilename, byteLength: await window.__visualDocumentE2eOfficeExportPromise }));
     equal(officeExport.fileName, office.expectedDownload, `${office.mode.toUpperCase()} native export used the wrong filename`);
     check(officeExport.byteLength > 0, `${office.mode.toUpperCase()} native export returned an empty Office package`);
   }
@@ -1313,6 +1331,7 @@ async (page) => {
     return { page: document.querySelector('.document-page-image')?.getAttribute('alt') ?? '', viewport: viewer?.className ?? '', scrollTop: viewer?.scrollTop ?? 0, zoom: frame?.style.getPropertyValue('--zoom') ?? '' };
   });
   check(navigationViewer.zoom.length > 0 && navigationViewer.scrollTop > 0, `scroll_document did not focus the viewer on a bounded crop: ${JSON.stringify(navigationViewer)}`);
+  await expandDisclosure('.agent-log-details');
   const navigationActivityText = await page.locator('section[aria-label="Agent Activity"]').innerText();
   check(navigationActivityText.includes('navigate_page → Returned to page 2 to finish with the evidence highlight.'), 'the streamed page navigation activity was not rendered');
   check(navigationActivityText.includes('scroll_document → Focused the viewer on the highlighted passage.'), 'the final detailed viewport action was not rendered after the second navigation segment');
@@ -1322,6 +1341,7 @@ async (page) => {
   await page.locator('#ai-prompt').fill('Classify every page and report important findings; ask only when evidence is unclear.');
   await page.getByRole('button', { name: 'Autopilotを開始' }).click();
   await page.getByRole('status').filter({ hasText: '高優先度の重要項目1件を報告しました' }).waitFor({ state: 'visible', timeout: 25_000 });
+  await expandDisclosure('.agent-log-details');
   equal(await page.locator('section[aria-label="Agent Activity"] .agent-status-pill').innerText(), '完了', 'Autopilot should complete after the checked full-document pass');
   equal(autopilotRequests.length, 1, 'Autopilot did not send a single full-document run request');
   equal(autopilotRequests[0].agentMode, 'autopilot', 'Autopilot mode did not reach the document Agent request');
@@ -1338,6 +1358,7 @@ async (page) => {
   coverageWarningMode = false;
   equal(coverageWarningRequests.length, 1, 'the converter-warning coverage scenario did not run exactly once');
   equal(coverageWarningRequests[0].documentScope, 'current', 'the warning acknowledgement fixture should be page-scoped');
+  await expandDisclosure('.agent-log-details');
   await page.locator('.run-history-details > summary').click();
   const warningRun = page.locator('.run-history-item').first();
   await warningRun.locator('summary').click();

@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.13"
   },
   "scripts": {
     "dev": "concurrently -k -n api,web -c cyan,green \"npm:dev:api\" \"npm:dev:web\"",
@@ -16,6 +16,7 @@
     "test:office-native-export-libreoffice": "node --import tsx scripts/office-native-export-libreoffice-acceptance.mjs",
     "test:browser-e2e": "node scripts/test-browser-e2e.mjs",
     "test:agent-sse-browser-e2e": "node scripts/agent-sse-browser-e2e.mjs",
+    "test:live-codex-smoke": "node --import tsx scripts/live-codex-smoke.mjs",
     "test:live-provider-smoke": "node --import tsx scripts/live-provider-smoke.mjs",
     "test:installed-desktop-e2e": "node scripts/test-installed-desktop-e2e.mjs",
     "test:desktop-runtime": "node scripts/test-desktop-runtime.mjs",
@@ -30,7 +31,11 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
-    "prepare:desktop-runtime": "node scripts/prepare-tauri-runtime.mjs"
+    "prepare:desktop-runtime": "node scripts/prepare-tauri-runtime.mjs",
+    "build:pages": "tsc --noEmit && vite build --mode pages",
+    "test:static-pages": "node scripts/test-static-pages.mjs",
+    "create:launch-assets": "node scripts/create-launch-assets.mjs",
+    "create:readme-gif": "node scripts/create-readme-gif.mjs"
   },
   "dependencies": {
     "@openai/agents": "^0.18.0",
@@ -44,10 +49,12 @@
     "express": "^5.1.0",
     "express-rate-limit": "^8.7.0",
     "jszip": "^3.10.2",
+    "katex": "^0.18.7",
     "lucide-react": "^0.577.0",
     "multer": "^2.0.2",
     "openai": "^7.15.0",
     "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "^6.3.289",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "sharp": "^0.35.4",

@@ -1,17 +1,11 @@
 import type { DocumentAnnotationRecord } from '../src/types';
+import { escapeCsvCell } from '../src/csv';
 
 const headers = [
   'id', 'documentId', 'sourceHash', 'targetType', 'page', 'slide', 'sheet', 'cellRange', 'x', 'y', 'width', 'height',
   'fragments', 'textPositionStart', 'textPositionEnd', 'textPositionUnit', 'textQuote', 'textPrefix', 'textSuffix',
   'label', 'evidence', 'explanation', 'reviewPriority', 'status', 'confidence', 'operation', 'values',
 ];
-
-function cell(value: unknown) {
-  const text = value === null || value === undefined
-    ? ''
-    : typeof value === 'string' ? value : JSON.stringify(value);
-  return `"${text.replaceAll('"', '""')}"`;
-}
 
 /** Serialize canonical records as RFC-4180-style UTF-8 CSV with a spreadsheet-friendly BOM. */
 export function documentAnnotationsToCsv(records: DocumentAnnotationRecord[]) {
@@ -34,5 +28,5 @@ export function documentAnnotationsToCsv(records: DocumentAnnotationRecord[]) {
       record.confidence, record.operation, record.values,
     ];
   });
-  return Buffer.from(`\uFEFF${[headers, ...rows].map((row) => row.map(cell).join(',')).join('\r\n')}`);
+  return Buffer.from(`\uFEFF${[headers, ...rows].map((row) => row.map(escapeCsvCell).join(',')).join('\r\n')}`);
 }

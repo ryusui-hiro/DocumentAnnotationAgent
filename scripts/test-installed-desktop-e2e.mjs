@@ -252,6 +252,8 @@ function createWorkspaceFixture(document) {
 const installEmptyWorkspaceScript = `
   const fixture = arguments[0];
   localStorage.clear();
+  localStorage.setItem('annotation-studio:language:v1', 'ja');
+  localStorage.setItem('annotation-studio:settings:v1', JSON.stringify({ provider: 'openai-api', model: 'gpt-6-astra', reasoningEffort: 'medium', endpoint: 'https://api.openai.com/v1', apiServerUrl: '' }));
   const baseKey = 'annotation-studio:annotations:' + fixture.fileName;
   const versionKey = baseKey + ':source:' + fixture.sourceHash;
   const state = {
@@ -358,6 +360,9 @@ async function runScenario(scenario, fixture, index, total, apiBaseUrl) {
     guidelineDetails.open = true;
     setValue('#ai-prompt', 'Find torque limits and safety requirements on page 1. Ask me when the evidence is uncertain.');
     setValue('#annotation-guidelines', 'Use a concise label, quote the visible passage, and explain why it needs review.');
+    const taskPlanning = document.querySelector('.task-planning-details');
+    if (!taskPlanning) throw new Error('The task planning disclosure is missing.');
+    taskPlanning.open = true;
     document.querySelector('.task-plan-button')?.click();
     return true;
   `);
@@ -382,6 +387,12 @@ async function runScenario(scenario, fixture, index, total, apiBaseUrl) {
     return status === '確認待ち' && document.querySelectorAll('.candidate-section .candidate-list .candidate-card').length === 2;
   `);
 
+  await executeScript(`
+    const activityLog = document.querySelector('.agent-log-details');
+    if (!activityLog) throw new Error('The Agent activity disclosure is missing.');
+    activityLog.open = true;
+    return true;
+  `);
   const resourceUrls = await executeScript(`return performance.getEntriesByType('resource').map((entry) => entry.name);`);
   const scenarioRemoteUrls = resourceUrls.filter((url) => /^https?:\/\//i.test(url) && !url.startsWith(`${apiBaseUrl}/`));
   assert.deepEqual(scenarioRemoteUrls, [], `The ${scenario.action} run requested non-local HTTP resources.`);
@@ -510,10 +521,15 @@ async function runPackageAcceptance() {
   appProcess = await waitFor('the test-owned installed Tauri process', findInstalledAppProcess, 15_000);
   await sessionCommand('POST', '/timeouts', { script: 30_000, pageLoad: 60_000, implicit: 0 });
 
-  await waitForScript('the installed app UI', `
-    return document.querySelector('h2')?.textContent.trim() === 'Visual Document Work Agent'
-      && document.querySelector('#ai-prompt');
+  await waitForScript('the installed app English welcome screen', `
+    const welcome = document.querySelector('.ocr-welcome');
+    const illustration = welcome?.querySelector('img');
+    return document.documentElement.lang === 'en'
+      && welcome?.querySelector('h1')?.textContent.trim() === 'Your documents. Your direction.'
+      && illustration?.complete && illustration.naturalWidth > 0
+      && document.querySelector('[data-testid="paper-ocr-workspace"]');
   `, [], 60_000);
+  assert.equal(await executeScript(`return document.querySelectorAll('.ocr-page, .ocr-results article').length;`), 0, 'A fresh installation must start without a loaded document or annotations.');
 
   sidecarProcess = await waitFor('the bundled API sidecar process', findSidecarProcess, 15_000);
   apiPort = sidecarProcess.port;
@@ -525,6 +541,33 @@ async function runPackageAcceptance() {
   assert.equal(health.conversion, 'document-svg+raster-images', 'The sidecar did not serve the packaged API.');
   assert.equal(health.aiConfigured, false, 'The app must run without provider credentials.');
   assert.equal(health.codexAppServerConfigured, false, 'Codex App Server must be disabled for this test.');
+
+  await waitForScript('the welcome screen sidecar health request to finish', `
+    return performance.getEntriesByType('resource').some((entry) => entry.name === arguments[0] + '/api/health');
+  `, [apiBaseUrl]);
+  const welcomeResources = await executeScript(`return performance.getEntriesByType('resource').map((entry) => entry.name);`);
+  assert.deepEqual(welcomeResources.filter((url) => /\/api\/(?:demo|paper-ocr\/demo)/i.test(url)), [], 'A fresh installation must not automatically load sample documents.');
+  // First launch discovers model metadata for the default Codex provider. The
+  // test environment disables that provider; no inference call is permitted.
+  assert.deepEqual(welcomeResources.filter((url) => /\/api\/(?:ai|codex)\//i.test(url) && url !== `${apiBaseUrl}/api/codex/models`), [], 'The welcome screen attempted a model inference endpoint.');
+  assert.deepEqual(welcomeResources.filter((url) => /^https?:\/\//i.test(url) && !url.startsWith(`${apiBaseUrl}/`)), [], 'The welcome screen requested non-local HTTP resources.');
+
+  // The full review workflow remains available in the advanced view. Use an
+  // explicit locale for its Japanese fixture assertions, independently of the
+  // English first-launch contract verified above.
+  const advancedUrl = await executeScript(`
+    localStorage.setItem('annotation-studio:language:v1', 'ja');
+    localStorage.setItem('annotation-studio:settings:v1', JSON.stringify({ provider: 'openai-api', model: 'gpt-6-astra', reasoningEffort: 'medium', endpoint: 'https://api.openai.com/v1', apiServerUrl: '' }));
+    const url = new URL(window.location.href);
+    url.searchParams.set('view', 'advanced');
+    return url.href;
+  `);
+  await sessionCommand('POST', '/url', { url: advancedUrl }, 60_000);
+  await waitForScript('the installed advanced workspace and sample to finish loading', `
+    const image = document.querySelector('.document-page-image');
+    return document.querySelector('#ai-prompt') && image?.complete && image.naturalWidth > 0
+      && performance.getEntriesByType('resource').some((entry) => entry.name === arguments[0] + '/api/demo');
+  `, [apiBaseUrl], 60_000);
 
   const { response: demoResponse, payload: demo } = await httpJson(`${apiBaseUrl}/api/demo`, 30_000);
   assert.equal(demoResponse.status, 200, 'The packaged API must serve its built-in fictional PDF.');

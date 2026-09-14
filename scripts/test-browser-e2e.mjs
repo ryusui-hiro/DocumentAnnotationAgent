@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import ExcelJS from 'exceljs';
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 import sharp from 'sharp';
+import JSZip from 'jszip';
 import { createDocxFixture, createPptxFixture } from './office-fixtures.mjs';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -230,6 +231,24 @@ try {
   assert.match(result, /streamed Agent navigation and viewport-to-highlight interaction/i, 'The browser flow did not verify streamed tool events against the visible document viewer.');
   assert.match(result, /DOCX\/PPTX upload, annotation, and native export/i, 'The browser flow did not verify Word and PowerPoint through the app UI.');
   assert.match(result, /XLSX column jump\/context paging/i, 'The browser flow did not verify the workbook review UI.');
+  const extractionZip = await JSZip.loadAsync(await readFile(join(visualEvidenceDirectory, 'contract-extractions.zip')));
+  const extractionManifest = JSON.parse(await extractionZip.file('manifest.json').async('string'));
+  assert.equal(extractionManifest.document.pageCount, 2);
+  assert.equal(extractionManifest.annotations.length, 5, 'Only the five confirmed annotations should be extracted; the pending sixth must stay out.');
+  assert.deepEqual([...new Set(extractionManifest.annotations.map((item) => item.pageNumber))], [1, 2]);
+  const extractionNotes = await extractionZip.file('notes.md').async('string');
+  assert.match(extractionNotes, /thirty/);
+  assert.ok(!extractionNotes.includes('reasonable business circumstances'), 'Pending evidence leaked into confirmed notes.');
+  for (const annotation of extractionManifest.annotations) {
+    const png = await extractionZip.file(annotation.image).async('nodebuffer');
+    const metadata = await sharp(png).metadata();
+    assert.equal(metadata.format, 'png');
+    assert.ok(metadata.width > 100 && metadata.height > 10, 'The extracted PNG has no useful area.');
+    const stats = await sharp(png).stats();
+    assert.ok(stats.channels.some((channel) => channel.stdev > 4), 'The extracted PNG is blank.');
+  }
+  console.log('Multi-page extraction ZIP verified: five PNG crops, Unicode labels, source-page coordinates, Markdown evidence, pending exclusion.');
+
 
   console.log('Provider-free browser E2E passed on the production preview: optional fictional contract review demo, live-model-only customer feedback LLM demo, PDF planning/activity/review/export, streamed Agent navigation and viewport-to-highlight interaction, run-history reload/export/source isolation, mixed-format folder subset batch with per-document review/export, DOCX/PPTX upload and native export, human-approved correction-rule continuation, read-only Validator recheck with stale-response protection, and XLSX column navigation/context paging; no external provider calls or browser console errors.');
 } finally {

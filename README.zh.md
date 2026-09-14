@@ -1,5 +1,7 @@
 # Annotation Studio
 
+已提供[GitHub Pages在线应用](https://ryusui-hiro.github.io/DocumentAnnotationAgent/)。输入API端点与密钥即可直接从浏览器运行AI。PDF和图像在浏览器中渲染，Office文档使用重新排版的文本预览。密钥仅保留在当前标签页内。Codex和原生Office导出需要文档API服务器。详见[英文README](README.md)。
+
 [English](README.md) | [日本語](README.ja.md) | [简体中文](README.zh.md)
 
 默认语言为英语，主文档为 `README.md`。

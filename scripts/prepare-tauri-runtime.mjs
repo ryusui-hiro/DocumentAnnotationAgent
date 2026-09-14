@@ -8,9 +8,9 @@ import { pipeline } from 'node:stream/promises';
 import JSZip from 'jszip';
 
 export const NODE_VERSION = 'v24.21.0';
-export const bundledDemoPdfNames = ['demo-specification.pdf', 'fictional-termination-contract.pdf', 'demos/product-hunt-termination-contract.pdf'];
-export const bundledDemoAssetNames = [...bundledDemoPdfNames, 'demos/customer-feedback-demo.xlsx', 'demos/customer-churn-risk-demo.xlsx'];
-export const bundledApiSharedSourceNames = ['annotationStatus.ts', 'taskPlan.ts', 'types.ts', 'validatorSnapshotSignature.ts'];
+export const bundledDemoPdfNames = ['demo-specification.pdf', 'fictional-termination-contract.pdf', 'demos/product-hunt-termination-contract.pdf', 'demos/openai-paper-selected.pdf'];
+export const bundledDemoAssetNames = [...bundledDemoPdfNames, 'demos/customer-feedback-demo.xlsx', 'demos/customer-churn-risk-demo.xlsx', 'demos/openai-paper-preview.json', 'demos/openai-paper-ocr.json'];
+export const bundledApiSharedSourceNames = ['annotationStatus.ts', 'taskPlan.ts', 'types.ts', 'validatorSnapshotSignature.ts', 'csv.ts', 'pdfAnnotation.ts', 'intentAnnotation.ts'];
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const OUTPUT = join(ROOT, 'src-tauri', 'resources', 'desktop-runtime');
 const CACHE = join(ROOT, '.cache', 'desktop-runtime');

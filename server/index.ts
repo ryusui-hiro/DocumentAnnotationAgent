@@ -10,9 +10,12 @@ import OpenAI from 'openai';
 import { z } from 'zod';
 import { preview, type PreviewReport } from 'document-svg';
 import { previewRasterImage, rasterImageExtensions } from './imagePreview';
+import { loadPaperOcrDemoPreview } from './paperOcrDemo';
+import { PageAnnotationConcurrency } from './pageAnnotationConcurrency';
+import { runPaperOcrWithCodex, runPaperOcrWithOpenAI } from './paperOcr';
 import { createAnnotationTaskPlan } from './taskPlanner';
 import { parseTaskPlan } from '../src/taskPlan';
-import { annotateWithCodexAppServer, draftCorrectionRuleWithCodexAppServer, listCodexModels, planTaskWithCodexAppServer, proposeWorkbookChangesWithCodexAppServer, validateAnnotationsWithCodexAppServer } from './codexAppServer';
+import { annotateWithCodexAppServer, draftCorrectionRuleWithCodexAppServer, listCodexModels, planTaskWithCodexAppServer, proposeWorkbookChangesWithCodexAppServer, readCodexAppServerAuthStatus, validateAnnotationsWithCodexAppServer } from './codexAppServer';
 import { getPendingAgentDocumentIds, getPendingAgentRunInfo, hasLivePendingAgentRun, pendingAgentRunMatchesProviderIdentity, prunePersistedPendingAgentRuns, restorePendingAgentRun, resumeDocumentAgentRun, runDocumentAgent, type ExistingAnnotation } from './documentAgent';
 import { runAnnotationValidator, sanitizeValidatorFindings, type ValidatorAnnotation } from './annotationValidator';
 import { createCorrectionRuleDraft, parseCorrectionRuleDraft, type CorrectionRuleInput } from './correctionRulePlanner';
@@ -522,6 +525,125 @@ app.get('/api/demo', demoFileRateLimit, async (_request, response, next) => {
   }
 });
 
+let paperOcrDemoSessionId: string | undefined;
+app.get('/api/demo/paper-ocr', demoFileRateLimit, async (_request, response, next) => {
+  try {
+    const demo = JSON.parse(await readFile(resolve('public/demos/openai-paper-ocr.json'), 'utf8'));
+    let session = paperOcrDemoSessionId ? documentSessions.get(paperOcrDemoSessionId) : undefined;
+    if (!session) {
+      const source = await readFile(resolve('public/demos/openai-paper-selected.pdf'));
+      const report = await loadPaperOcrDemoPreview();
+      const payload = storeDocument('openai-paper-selected.pdf', report, true, source);
+      paperOcrDemoSessionId = payload.documentId;
+      session = documentSessions.get(payload.documentId);
+    }
+    if (!session) throw new Error('The paper OCR demonstration is unavailable.');
+    response.set('Cache-Control', 'no-store').json({ ...demo, document: pagePayload(session.id, session.fileName, session.sourceHash, session.report, true) });
+  } catch (error) { next(error); }
+});
+
+const pageAnnotationRuns = new PageAnnotationConcurrency(3);
+app.post('/api/ai/paper-ocr', async (request, response, next) => {
+  if (!request.body || typeof request.body !== 'object' || Array.isArray(request.body)) { response.status(400).json({ error: 'An OCR request body is required.' }); return; }
+  let releasePageRun: (() => void) | undefined;
+  try {
+    const body = request.body as Record<string, unknown>;
+    const { settings, model, effort } = readAIRequest(body);
+    if (typeof body.documentId !== 'string' || !Number.isInteger(body.pageNumber) || Number(body.pageNumber) < 1
+      || typeof body.instruction !== 'string' || body.instruction.trim().length < 2 || body.instruction.length > 2000) {
+      response.status(400).json({ error: 'A document, page number and bounded OCR instruction are required.' }); return;
+    }
+    pruneDocumentSessions();
+    const session = documentSessions.get(body.documentId);
+    if (!session) { response.status(410).json({ error: 'Document session expired. Reopen the paper or upload the document again.' }); return; }
+    const pageNumber = Number(body.pageNumber);
+    if (pageNumber > session.report.pageCount) { response.status(400).json({ error: 'The requested page is outside this document.' }); return; }
+    const config = settings.provider === 'codex-app-server' ? null : configuredModel(model, settings);
+    if (settings.provider !== 'codex-app-server' && !config) { response.status(503).json({ error: 'Connect an API in settings, or choose Codex App Server with an authenticated local CLI.' }); return; }
+    releasePageRun = pageAnnotationRuns.acquire(session.id, pageNumber);
+    const view = session.pageAdapter.inspect({ kind: 'page', pageNumber });
+    if (view.kind !== 'page') throw new Error('This document has no visual page.');
+    const { default: sharp } = await import('sharp');
+    const png = await sharp(Buffer.from(view.svg), { density: 180 }).resize({ width: 1800, height: 2400, fit: 'inside' }).png().toBuffer();
+    let sourcePageNumber = pageNumber;
+    try {
+      const demo = JSON.parse(await readFile(resolve('public/demos/openai-paper-ocr.json'), 'utf8'));
+      if (session.sourceHash === demo.paper.selectedSha256) sourcePageNumber = demo.paper.sourcePages[pageNumber - 1] ?? pageNumber;
+    } catch { /* Custom document page numbering remains unchanged. */ }
+    const input = { imageDataUrl: `data:image/png;base64,${png.toString('base64')}`, model, reasoningEffort: effort, instruction: body.instruction, pageNumber, sourcePageNumber };
+    const result = settings.provider === 'codex-app-server'
+      ? await runPaperOcrWithCodex(input)
+      : await runPaperOcrWithOpenAI({ ...input, client: config!.client, deployment: config!.deployment, provider: config!.provider as 'openai-api' | 'azure-openai' | 'openai-compatible' });
+    response.set('Cache-Control', 'no-store').json(result);
+  } catch (error) {
+    const settings = (request.body as Record<string, unknown> | undefined)?.settings;
+    const status = error && typeof error === 'object' && 'status' in error ? Number(error.status) : 0;
+    if (status >= 400 && status < 500) response.status(status).json({ error: error instanceof Error ? error.message : 'Invalid OCR request.' });
+    else if (settings && typeof settings === 'object' && (settings as Record<string, unknown>).provider === 'codex-app-server') response.status(502).json({ error: safeCodexAppServerError(error) });
+    else next(error);
+  } finally { releasePageRun?.(); }
+});
+
+app.post('/api/ai/intent-stream', async (request, response, next) => {
+  if (!request.body || typeof request.body !== 'object' || Array.isArray(request.body)) { response.status(400).json({ error: 'An annotation request body is required.' }); return; }
+  let releasePageRun: (() => void) | undefined;
+  let streaming = false;
+  const abort = new AbortController();
+  const onClose = () => { if (!response.writableEnded) abort.abort(); };
+  const emit = (event: string, data: unknown) => {
+    if (!response.writableEnded && !response.destroyed) response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  };
+  response.on('close', onClose);
+  try {
+    const body = request.body as Record<string, unknown>;
+    const { settings, model, effort } = readAIRequest(body);
+    const { runIntentAnnotationWithCodex, runIntentAnnotationWithOpenAI, validateIntentLabelRules } = await import('./intentAnnotator');
+    const labelRules = validateIntentLabelRules(body.labelRules);
+    if (typeof body.documentId !== 'string' || !Number.isInteger(body.pageNumber) || Number(body.pageNumber) < 1
+      || typeof body.instruction !== 'string' || body.instruction.trim().length < 2 || body.instruction.length > 4000) {
+      response.status(400).json({ error: 'A document, page number and annotation instruction are required.' }); return;
+    }
+    pruneDocumentSessions();
+    const session = documentSessions.get(body.documentId);
+    if (!session) { response.status(410).json({ error: 'Document session expired. Reopen the document.' }); return; }
+    const pageNumber = Number(body.pageNumber);
+    if (pageNumber > session.report.pageCount) { response.status(400).json({ error: 'The requested page is outside this document.' }); return; }
+    const config = settings.provider === 'codex-app-server' ? null : configuredModel(model, settings);
+    if (settings.provider !== 'codex-app-server' && !config) { response.status(503).json({ error: 'Connect an API in settings, or choose Codex App Server with an authenticated local CLI.' }); return; }
+    releasePageRun = pageAnnotationRuns.acquire(session.id, pageNumber);
+    let sourcePageNumber = pageNumber;
+    try {
+      const demo = JSON.parse(await readFile(resolve('public/demos/openai-paper-ocr.json'), 'utf8'));
+      if (session.sourceHash === demo.paper.selectedSha256) sourcePageNumber = demo.paper.sourcePages[pageNumber - 1] ?? pageNumber;
+    } catch { /* Custom documents retain their original page numbering. */ }
+    response.status(200).set({ 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
+    response.flushHeaders(); streaming = true;
+    emit('start', { pageNumber, sourcePageNumber, model, provider: settings.provider ?? config?.provider });
+    emit('activity', { phase: 'analyzing', message: 'Preparing the document page.', pageNumber });
+    const view = session.pageAdapter.inspect({ kind: 'page', pageNumber });
+    if (view.kind !== 'page') throw new Error('This document has no visual page.');
+    const { default: sharp } = await import('sharp');
+    const png = await sharp(Buffer.from(view.svg), { density: 180 }).resize({ width: 1800, height: 2400, fit: 'inside' }).png().toBuffer();
+    const input = {
+      imageDataUrl: `data:image/png;base64,${png.toString('base64')}`, model, reasoningEffort: effort, instruction: body.instruction, labelRules, pageNumber, sourcePageNumber, signal: abort.signal,
+      onBlock: (block: unknown) => emit('block', { block, pageNumber }),
+      onActivity: (activity: { phase: string; message: string }) => emit('activity', { ...activity, pageNumber }),
+    };
+    const result = settings.provider === 'codex-app-server'
+      ? await runIntentAnnotationWithCodex(input)
+      : await runIntentAnnotationWithOpenAI({ ...input, client: config!.client, deployment: config!.deployment, provider: config!.provider as 'openai-api' | 'azure-openai' | 'openai-compatible' });
+    if (!abort.signal.aborted) emit('complete', result);
+    response.end();
+  } catch (error) {
+    const codex = request.body?.settings?.provider === 'codex-app-server';
+    const status = error && typeof error === 'object' && 'status' in error ? Number(error.status) : 0;
+    const message = status >= 400 && status < 500 ? (error instanceof Error ? error.message : 'Invalid request.') : codex ? safeCodexAppServerError(error) : error instanceof Error ? error.message : 'Annotation failed.';
+    if (streaming) { emit('error', { error: message, pageNumber: request.body?.pageNumber }); response.end(); }
+    else if (status >= 400 && status < 500) response.status(status).json({ error: message });
+    else next(error);
+  } finally { releasePageRun?.(); response.off('close', onClose); }
+});
+
 app.get('/api/demo/termination-contract', demoFileRateLimit, async (_request, response, next) => {
   try {
     let currentDemo = terminationDemoSessionId ? documentSessions.get(terminationDemoSessionId) : undefined;
@@ -656,9 +778,17 @@ app.post('/api/convert', upload.single('file'), async (request, response, next) 
       response.status(400).json({ error: '変換するファイルを選択してください。' });
       return;
     }
-    const report = await convertBuffer(request.file.originalname, request.file.buffer);
+    // Reuse the verified rendering only for the exact source PDF bytes. No OCR results are reused on upload.
+    let paperSource: Record<string, unknown> | undefined;
+    if (extname(request.file.originalname).toLowerCase() === '.pdf') {
+      try {
+        const prepared = JSON.parse(await readFile(resolve('public/demos/openai-paper-ocr.json'), 'utf8'));
+        if (sourceHash(request.file.buffer) === prepared.paper.selectedSha256) paperSource = prepared.paper;
+      } catch { /* Ordinary uploads do not depend on the optional research demo. */ }
+    }
+    const report = paperSource ? await loadPaperOcrDemoPreview() : await convertBuffer(request.file.originalname, request.file.buffer);
     const fileName = workspaceDisplayName(request.body?.relativePath, request.file.originalname);
-    response.json(storeDocument(fileName, report, false, request.file.buffer));
+    response.json({ ...storeDocument(fileName, report, false, request.file.buffer), ...(paperSource ? { paperSource } : {}) });
   } catch (error) {
     next(error);
   }
@@ -942,6 +1072,11 @@ app.post('/api/ai/test', async (request, response, next) => {
   try {
     const { settings, model, effort } = readAIRequest(request.body as Record<string, unknown>);
     if (settings.provider === 'codex-app-server') {
+      const authentication = await readCodexAppServerAuthStatus();
+      if (!authentication.ready) {
+        response.status(401).json({ error: 'Codex CLIにサインインしてから接続を確認してください（codex login）。' });
+        return;
+      }
       const models = await listCodexModels();
       const available = models.some((item) => item.id === model || item.model === model);
       if (!available) {
