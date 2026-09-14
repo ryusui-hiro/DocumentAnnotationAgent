@@ -10,6 +10,7 @@ import JSZip from 'jszip';
 export const NODE_VERSION = 'v24.21.0';
 export const bundledDemoPdfNames = ['demo-specification.pdf', 'fictional-termination-contract.pdf', 'demos/product-hunt-termination-contract.pdf'];
 export const bundledDemoAssetNames = [...bundledDemoPdfNames, 'demos/customer-feedback-demo.xlsx', 'demos/customer-churn-risk-demo.xlsx'];
+export const bundledApiSharedSourceNames = ['annotationStatus.ts', 'taskPlan.ts', 'types.ts', 'validatorSnapshotSignature.ts'];
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const OUTPUT = join(ROOT, 'src-tauri', 'resources', 'desktop-runtime');
 const CACHE = join(ROOT, '.cache', 'desktop-runtime');
@@ -88,7 +89,7 @@ function npmInstall(runtimeDirectory, spec) {
   if (result.status !== 0) throw new Error(`npm ci failed for ${spec.targetTriple} (exit ${result.status ?? 'unknown'}).`);
 }
 
-async function copyApiSources(runtimeDirectory) {
+export async function copyApiSources(runtimeDirectory) {
   const sourceServer = join(ROOT, 'server');
   const destinationServer = join(runtimeDirectory, 'server');
   await cp(sourceServer, destinationServer, {
@@ -97,7 +98,7 @@ async function copyApiSources(runtimeDirectory) {
   });
   const sourceDirectory = join(runtimeDirectory, 'src');
   await mkdir(sourceDirectory, { recursive: true });
-  for (const name of ['annotationStatus.ts', 'taskPlan.ts', 'types.ts']) await cp(join(ROOT, 'src', name), join(sourceDirectory, name));
+  for (const name of bundledApiSharedSourceNames) await cp(join(ROOT, 'src', name), join(sourceDirectory, name));
   await cp(join(ROOT, 'scripts', 'desktop-api-launcher.mjs'), join(runtimeDirectory, 'desktop-api-launcher.mjs'));
   await copyBundledDemoAssets(runtimeDirectory);
   await cp(join(ROOT, 'package.json'), join(runtimeDirectory, 'package.json'));

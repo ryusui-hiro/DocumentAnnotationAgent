@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { bundledDemoAssetNames, copyBundledDemoAssets } from './prepare-tauri-runtime.mjs';
+import { bundledApiSharedSourceNames, bundledDemoAssetNames, copyApiSources, copyBundledDemoAssets } from './prepare-tauri-runtime.mjs';
 
 const projectRoot = fileURLToPath(new URL('..', import.meta.url));
 
@@ -18,6 +18,19 @@ test('Tauri API runtime includes every built-in demo file', async () => {
       const bundled = await readFile(join(runtimeDirectory, 'public', fileName));
       assert.deepEqual(bundled, source, `${fileName} must be copied into the desktop API runtime unchanged`);
     }
+  } finally {
+    await rm(runtimeDirectory, { recursive: true, force: true });
+  }
+});
+
+test('Tauri API runtime includes the shared validator snapshot implementation', async () => {
+  assert.ok(bundledApiSharedSourceNames.includes('validatorSnapshotSignature.ts'));
+  const runtimeDirectory = await mkdtemp(join(tmpdir(), 'annotation-studio-runtime-shared-api-'));
+  try {
+    await copyApiSources(runtimeDirectory);
+    const source = await readFile(join(projectRoot, 'src', 'validatorSnapshotSignature.ts'));
+    const bundled = await readFile(join(runtimeDirectory, 'src', 'validatorSnapshotSignature.ts'));
+    assert.deepEqual(bundled, source, 'documentAgent imports this runtime module during bundled startup');
   } finally {
     await rm(runtimeDirectory, { recursive: true, force: true });
   }

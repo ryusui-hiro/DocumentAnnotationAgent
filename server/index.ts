@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, extname, join, resolve } from 'node:path';
@@ -32,6 +32,7 @@ const documentExtensions = new Set(['.pdf', '.docx', '.pptx', '.xlsx']);
 const allowedExtensions = new Set([...documentExtensions, ...rasterImageExtensions]);
 const maxDocumentSessions = 20;
 const documentSessionTtlMs = 30 * 60 * 1000;
+const providerFingerprintSecret = randomBytes(32);
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: maxUploadMb * 1024 * 1024, files: 1 },
@@ -241,9 +242,10 @@ function providerCredentialFingerprint(settings: AISettings, config: { deploymen
     || (mode === 'azure-openai' ? process.env.AZURE_OPENAI_ENDPOINT : process.env.OPENAI_BASE_URL)
     || (mode === 'openai-api' ? 'https://api.openai.com/v1' : '');
   const normalized = normalizeEndpoint(endpoint, mode);
-  // Keep this hash in memory only. It lets a live run detect when no durable
-  // snapshot exists to safely rebind to newly supplied credentials.
-  return createHash('sha256').update([mode, model, config.deployment, normalized, apiKey].join('\0')).digest('hex');
+  // The HMAC key is random and process-local, so this fingerprint is not
+  // useful for offline API-key guessing and is never persisted. It lets a live
+  // run detect whether its credentials changed before a safe rebind.
+  return createHmac('sha256', providerFingerprintSecret).update([mode, model, config.deployment, normalized, apiKey].join('\0')).digest('hex');
 }
 
 function sourceHash(buffer: Buffer) {
