@@ -157,7 +157,7 @@ test('real OpenAI SDK streaming emits a complete region before final response an
   }
 });
 
-test('Codex deltas emit validated blocks before completion, ignore commentary, and retain final authority', { timeout: 30000 }, async () => {
+test('Codex deltas emit validated blocks before completion, ignore commentary, and retain final authority', { timeout: 60000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'intent-codex-stream-'));
   const binary = join(directory, 'fake.cjs');
   const capturePath = join(directory, 'turn.json');
@@ -199,12 +199,12 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
     void running.catch(() => undefined);
     // A cold child Node process shares CPU with the full CI suite; the gate still
     // proves that a block arrives before the explicitly held completion.
-    await bounded(firstBlock.promise, 15000);
+    await bounded(firstBlock.promise, 30000);
     assert.equal(finished, false);
     assert.equal(seen.length, 1);
     assert.equal(seen[0]?.label, 'Custom target');
     await writeFile(gatePath, 'continue');
-    const result = await bounded(running, 15000) as Awaited<ReturnType<typeof runIntentAnnotationWithCodex>>;
+    const result = await bounded(running, 30000) as Awaited<ReturnType<typeof runIntentAnnotationWithCodex>>;
     assert.deepEqual(result.blocks, seen);
     assert.equal(result.usage.totalTokens, 70);
     const sent = JSON.parse(await readFile(capturePath, 'utf8'));
