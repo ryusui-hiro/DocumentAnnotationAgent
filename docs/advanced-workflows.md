@@ -1,0 +1,147 @@
+# Advanced local workflows and architecture
+
+This reference describes the optional local/Tauri workspace at `?view=advanced`. See the [main README](../README.md) for the current static browser workspace.
+
+# Astra Annotator
+
+[English](README.md) | [日本語](README.ja.md) | [简体中文](README.zh.md)
+
+Default language: English.
+
+Astra Annotator is a React and Node.js proof of concept for a document annotation agent. It reads PDF, Word, Excel, and PowerPoint files page by page, and can also inspect PNG, JPEG, WebP, and TIFF images as single-page documents. It follows natural-language instructions and annotation guidelines, and marks relevant regions. Clear, evidence-backed results that do not request review are added automatically; ambiguous results go to a human review queue.
+
+PDF / DOCX / PPTX / XLSX conversion is handled by [`document-svg`](https://github.com/ryusui-hiro/document-svg) on the Node.js server. Raster images are normalized into one-page SVG previews on the server. API keys are passed to the local API for each AI request and are not stored or logged by the server.
+
+## Paper OCR and desktop workspace
+
+English is the default; Japanese and Simplified Chinese remain available. The simple initial and uploaded-document workspace supports manual annotation, three concurrent page workers, live incremental AI regions, and optional exact human label rules. Empty or malformed API responses show actionable errors. Run `npm run build && npm start` and open `http://127.0.0.1:3001`.
+
+The desktop workspace demonstrates real GPT-6 Astra OCR on OpenAI's DALL·E paper. It separates titles, text, figures, tables, equations and captions, renders recognized LaTeX, and exports PNG regions, JSON, CSV, Markdown, annotated PDFs and ZIP packages. [Live browser recording and evidence](./live-paper-recording.md) document an actual PDF upload and three Codex App Server requests, not replayed annotation fixtures. [Paper source and reproduction](./paper-ocr-demo.md).
+
+## Get started
+
+Use Node.js 22 or later.
+
+```bash
+npm install
+cp .env.example .env
+npm run create:demo
+npm run dev
+```
+
+Open `http://127.0.0.1:5173` to try the cooling-fan sample document, which remains the default. Manual annotations, label and note editing, page navigation, and PNG extraction work without an API key. When AI is not configured, ordinary sample workflows may show clearly marked scripted candidates; these are not model-generated results. The `契約レビュー例` (contract review example) button opens an optional fictional termination-contract demo with scripted review candidates. The separate `実AIデモ` menu opens a synthetic termination-contract PDF, an 18-row customer-churn workbook with a blank `Churn Risk` column, or the retained 16-row customer-feedback workbook with blank output columns. Each live demo loads its own task and rubric; opening a file makes no provider call, and analysis starts only when the user runs the Agent. Without a configured live provider, a run opens Settings instead of generating fixed substitute labels. The samples contain no real customer data, and the contract sample is not legal advice. Regenerate the samples with `npm run create:termination-demo`, `npm run create:product-hunt-demo`, and `npm run create:product-hunt-churn-demo`. See [the Product Hunt demo kit](./product-hunt-demo-kit.md) for the live walkthrough, launch copy, and checklist.
+
+In Settings, choose OpenAI API, Azure OpenAI, or an OpenAI-compatible API and enter the endpoint, API key, model, and reasoning level. GPT-6 Astra and GPT-5.6 Sol / Terra / Luna are supported. Azure also requires a deployment name. Local environment variables such as `OPENAI_API_KEY` and `AZURE_OPENAI_*` are fallback values when no key is entered in the app.
+
+The API key is held in memory for the current browser tab only and is never written to browser or Tauri WebView storage. Reloading the page or closing the tab clears it. AI analysis sends page images, extracted text with normalized locations, instructions, guidelines, optional correction rules, and human-confirmed decisions to the configured provider. A full-document scan runs an agent turn for each page; function-tool calls may require multiple model requests, and the app records actual token usage and request counts. OpenAI Responses API requests use `store: false`, and SDK tracing is disabled. Use HTTPS when connecting to a remote API server.
+
+Build and run the production app:
+
+```bash
+npm run build
+npm test
+npx playwright-cli install-browser chromium --only-shell
+npm run test:browser-e2e
+npm run test:agent-sse-browser-e2e
+npm start
+```
+
+`npm test` exercises scripted Agents SDK tool loops, approval/resume, and the correction-rule API against loopback OpenAI Responses fixtures; it does not call an external provider. A process-level API test also runs the real Task Planner endpoint and Agents SDK route against a loopback fake Responses endpoint, navigates through a 15-page synthetic document in one RunState, pauses for a high-priority review on page 14, approves and resumes on page 15, and exports the human-approved and automatic annotations. Full-scope API results expose `incomplete` plus exact `remainingPages` until every page is inspected, and the export gate refuses incomplete checkpoints. It holds the final model response to verify navigation, inspection, scrolling, annotation, and SSE activity arrive before the result frame. A scripted 40-page test verifies that low-detail image overviews and bounded per-page summaries support more than twelve page inspections in one run; a 121-page outline test checks the hard outline bound. A source-level PDF test verifies that the live Product Hunt agreement has eleven pages and fourteen unlabeled termination clauses. The correction-rule API test verifies its strict output schema, bounded untrusted evidence, and memory-only input handling. `npm run test:browser-e2e` builds and serves a production preview, then verifies the built-in demo PDF review/export flow, streamed page-navigation and viewport events moving the real viewer onto a visible highlight, an opened-but-uninspected page being scheduled again at the start of the next full-document segment, explicit human acknowledgement resolving a persistent converter warning, a human-edited and explicitly approved correction rule reaching later-page requests, discarding a rule response after its source correction changes, saved-annotation Validator rechecks, a generated wide XLSX workbook's column navigation and original-value review context, mixed-format folder batching with per-document review/export, recovery from an expired workspace export session, and browser DOCX/PPTX upload/native export. AI responses and browser navigation fixtures are local; uploads, workbook export-state registration, and read-only context use the isolated local API, with no provider call.
+
+Full-document coverage is now server-authoritative: page count comes from the opened document session, and verified inspection checkpoints are stored with the source hash and task scope in the encrypted session record. Client-supplied `alreadyInspectedPages` cannot unlock Validator or export. A process-level regression tries both a false page count and a forged all-pages list, restarts the API, then confirms uninspected pages still block validation and export.
+
+The unit suite also scripts an 80-page document: the Agent searches for a clause on page 80, navigates there, pauses for Human Review, and resumes the same Run. A separate process-level XLSX acceptance test drives the real Agents SDK workbook tools through column creation, two approvals, readback, native export, and an independent ExcelJS reload; it verifies the source bytes remain unchanged. The production browser E2E keeps all four modes visible at desktop and mobile widths and runs Autopilot through a full-document pass, confirming a clear high-priority finding is applied and reported while no review item is queued.
+
+`npm run test:agent-sse-browser-e2e` builds and serves the production React UI and drives it in Chromium against the real Task Planner and Agents SDK Express SSE routes. A fake Responses API listens only on loopback, so the run makes no external provider calls. After streamed navigation, scrolling, and Human Review activity, the browser corrects the page-2 HIGH RISK suggestion to LOW RISK and explicitly accepts the generated rule for remaining pages. It verifies the decision request sends `approved:false` for the original suggestion, resumes the same Agent Run, annotates page 3 as LOW RISK, and exports both the human-corrected page-2 finding and automatic page-3 annotation as JSON.
+
+`npm run test:office-native-export-libreoffice` is an optional acceptance check for environments with LibreOffice installed. It exports synthetic DOCX and PPTX annotations, round-trips them through LibreOffice, and checks that Word comment anchors and PowerPoint annotation shapes survive. LibreOffice drops the custom PowerPoint tag part on save; this test does not establish Microsoft Office compatibility or visual fidelity.
+
+For an intentional live acceptance run, set `ANNOTATION_STUDIO_LIVE_SMOKE=1` and configure an OpenAI, Azure OpenAI, or OpenAI-compatible credential, then run `npm run test:live-provider-smoke`. The script uses only a generated fictional PDF and checks planning, tool navigation, a human-review pause/resume, and JSON export; it can incur provider charges and is not run by the default test suite.
+
+CI also installs the production Ubuntu `.deb` and drives the packaged Tauri app through `tauri-driver`/WebKitWebDriver, verifying review exports and that the bundled API exits when the app closes. This installed-package test requires Linux; it skips on other platforms.
+
+## Features
+
+- Choose or drag one PDF, DOCX, PPTX, XLSX, PNG, JPEG, WebP, or TIFF file into the workspace to open it; PDFs and Office documents convert to page SVGs with `document-svg`, while images appear as single-page previews.
+- Add and edit rectangular annotations, color labels, and notes; select, delete, or extract a region as PNG.
+- Use task presets and editable annotation guidelines to analyze one page or the whole document sequentially.
+- Convert a natural-language request into a visible Annotation Task plan with labels, actions, uncertainty policy, and workflow. With OpenAI, Azure, OpenAI-compatible, or Codex App Server configured, the planner uses strict structured output; the agent receives that plan on each page. Without a provider, a clearly marked local draft is used.
+- Import a text-based PDF or Office document as a guideline source; its extracted text is added to the editable guideline field.
+- Choose Observe, Suggest, Assist, or Autopilot. A live activity stream reports task planning, page navigation, SVG text/layout inspection, search, annotation, review, and export actions. While a run is active or waiting, a sticky latest-activity strip stays visible as the Agent panel scrolls and links to the complete event log.
+- The server-side OpenAI Agents SDK orchestrator uses document tools; `open_document` opens only the user-selected session already bound to the run (no paths or URLs are accepted); `get_document_info` returns bounded metadata for that session, while `get_document_outline` returns its page or sheet structure. Other tools provide page inspection, selected-region inspection, listing existing annotations, extracted-text search, region annotation, and human-review requests. A current-page run preserves the human-visible viewport and explicitly tells the Agent whether an annotation is selected; full-document runs follow their normal page plan. `scroll_document` returns a closer page crop and synchronizes the viewer viewport; `select_text` resolves positioned text to normalized page bounds, `get_selected_region` exposes the viewer selection to the Agent, and `annotate_text` uses a unique match to create a text-backed region. Missing or repeated matches are not silently applied. In Assist / Autopilot, proposed updates and deletions of existing annotations pause for approval and resume the same run. Existing and review-queue annotations are sent as bounded summaries so the Agent can avoid duplicates. Codex App Server keeps its structured-output adapter.
+- When the user explicitly requests a file in the task, the Agents SDK run can call `export_annotations` after its requested scope is inspected. For full-document visual exports, the Orchestrator first runs the read-only Validator on the exact canonical annotation snapshot; native, JSON, and CSV export remain blocked if validation fails or annotations change. Validator findings flow to Final Review and never alter or approve annotations. The deterministic document adapter then prepares the download artifact, which expires after 30 minutes; native export also waits for unresolved annotation reviews. Codex App Server tasks use the provider-independent UI export actions.
+- PDF / Office page previews and XLSX workbooks implement a shared server-side `DocumentAdapter` contract for opening the bound session, outlines, inspection, and search. `search_document` returns page or sheet-cell locations across the current document adapters.
+- PDF inspection adds bounded style-based heading candidates and baseline-aligned text-row hints. These are navigation and layout cues that the Agent checks against the rendered page image, not claims of semantic PDF structure.
+- The same adapter owns typed annotation records from Agent tool calls and routes JSON, CSV, PDF, DOCX, PPTX, and XLSX output through `POST /api/documents/:documentId/export`. The session keeps the uploaded source bytes separate; native exports are new files.
+- The Orchestrator can delegate dense or visually ambiguous pages to a nested, read-only `Document Reader Agent` for evidence and layout hints, or to a bounded `Document Annotator Specialist` for complex label proposals. The Annotator has no tools, preserves image-grounded proposals when text extraction is incomplete, and follows explicit human-decision scope; the Orchestrator verifies each proposal and keeps all annotation and approval authority. Each page can be delegated once, with a 24-call run limit. For explicit full-document visual exports, the Validator runs inside the same Orchestrator run before deterministic export. Completed runs without an in-run export retain the host-side final Validator check.
+- If the user's instruction explicitly asks for a file, `export_annotations` becomes available only after the requested page or workbook scope has been read. For full-scope visual documents, it also requires a successful Validator result for the unchanged annotation snapshot. It prepares a deterministic adapter export, encrypts the download artifact at rest for up to 30 minutes, and surfaces a download action; native output waits for unresolved annotation reviews, while JSON / CSV preserve their review status. XLSX export keeps its existing workbook-evidence and approval gates.
+- In full-document OpenAI Agents SDK runs, `navigate_page` can open and inspect pages across the whole document in the same Agent RunState. Compact low-detail overview images and bounded text keep long runs within context; `scroll_document` returns a high-detail crop when the Agent needs to read small text or check a region. Annotations carry the page the Agent actually inspected. A page opened by `navigate_page` without an inspection stays uninspected: the API reports `incomplete` with the exact remaining pages, and the host starts another full-document segment at the first uninspected page. Full-scope export stays disabled until every page is in the inspected checkpoint. Providers without page-navigation tools retain page-scoped coverage processing and pass their previous-page checkpoint to the export gate.
+- For XLSX workbooks, the OpenAI Agents SDK Agent can inspect sheet outlines and bounded cell ranges, propose output columns, and write cell or range values. Assist applies clear low- and medium-priority changes and pauses on high-priority or uncertain proposals. Autopilot applies all clear changes, reports high-priority results, and pauses only when evidence needs human judgment. Workspace batch mode leaves uncertain changes pending per document while continuing to the next file. Codex App Server also reads bounded workbook ranges and returns structured changes through the server-owned adapter. Suggest queues every change; Assist holds high-priority changes for review, while Autopilot may apply clear high-priority changes and reports them. Pending decisions remain bound to the source hash.
+- The workbench identifies PDF, Word, PowerPoint, and Excel targets and keeps the Agent's current action, next step, progress, and review count visible. The export control opens a format-aware menu with the native document output first.
+- Excel's central preview follows the selected worksheet and shows up to 20 data rows in a 16-column window; users can page across the first 80 preview columns, and each cell-change card can jump to an in-grid target. The change card also loads a bounded 5-by-8 original-source window for pending, approved, or rejected changes, including targets outside the grid; larger ranges page through 5-by-8 slices until every proposed cell has been inspected. Context reads are keyed to the change and are not sent to an AI provider; long cell values are clipped at 300 characters. Download approved workbook changes as a new `-annotated.xlsx` copy; the uploaded source remains unchanged. Export a processed workspace document's native annotated copy, structured JSON, or CSV from the project list. If its server session has expired, the connected folder source is reopened on demand and checked against its saved source hash before export.
+- In Assist / Autopilot, an ambiguous `request_review` tool call interrupts the Agents SDK run. After approval or rejection, the same `RunState` resumes before the viewer processes remaining pages. Pending runs and their source document sessions are AES-GCM encrypted in the API server's local data directory and can resume after an API restart for up to 30 minutes. API keys are never persisted; approvals rebind the saved RunState to the valid current credentials for the same provider/model. If the encrypted checkpoint could not be saved, a live worker can continue only with the unchanged in-memory provider configuration. Workspace batch mode queues uncertainty per document and proceeds to the next file.
+- Generate candidates with qualitative review priority, rationale, and a short source excerpt. Ambiguity and explicit review requests determine whether a person must decide; an optional numeric confidence estimate is metadata only and never an application threshold.
+- Whole-document runs end with an independent Agents SDK Validator that checks label consistency, evidence support, and missing evidence using the selected provider. Deterministic checks also flag exact or substantially similar excerpts with different labels. Findings link to affected pages, are saved with the document workspace, and are rechecked after the final human decision; the Validator never changes annotations. Users can also rerun it from Final Review on saved annotations without repeating page analysis. A result is discarded if its document or annotation inputs change while the request is in flight. If the independent check is unavailable, deterministic findings remain available.
+- Edit a candidate's label and note before confirming it. Corrections default to that candidate only. When a full-document run has pages remaining, ask the selected provider to draft a narrowly scoped rule from the task, evidence, and correction; edit and explicitly approve the text before applying it. If the correction does not support a safe general rule, the planner says so. Multiple decisions on a blocked page are kept in order, and only explicitly accepted remaining-page rules are reused as guidance. Run history records each human action, its source candidate, scope, and versioned rule's first applicable page, alongside checked, image-only, opened, failed, and unprocessed page coverage. After visually reviewing a page with no extracted text or a converter warning, a reviewer can acknowledge that limitation in the saved run; the run remains waiting until all uncovered conditions are resolved.
+- Automatically save the latest 20 agent runs per document in browser storage, including status, task, timestamps, and activity events. View past runs and export history as JSON. History is unencrypted in this browser profile.
+- Keep live annotation state in one normalized record store for page regions, review items, and spreadsheet changes; the viewer derives its display queues by status. New document workspaces save that same record list. Existing version 2 workspaces remain readable and convert to the new format on the next save.
+- Save annotations, pending reviews, rejection history, and task instructions per document in browser storage. For XLSX workbooks, reopening a saved workbook restores its annotations and proposals, including review decisions, into the new API session only when the saved workspace and source SHA-256 match; a changed workbook does not inherit the old records.
+- Open a project folder as a workspace. Tauri desktop uses its native folder picker and read-only filesystem access; compatible web browsers use a folder upload. The project lists up to 200 supported documents and lets you select a subset.
+- Run one Agent instruction across every selected document and all of its pages. Batch mode continues to the next document while ambiguous regions remain in that document's review queue; each document's annotations and run history are stored separately.
+- Project file metadata is saved locally. After restarting the app or reloading the web page, reconnect the folder to grant access again; web browser file handles remain in the current session only.
+- Export structured JSON / CSV, an annotated PDF, and selected regions as PNG.
+- Structured JSON includes normalized records for page regions and sheet-cell changes with document ID, target, evidence, explanation, review priority, and status. Status distinguishes automatic findings, items needing review, approval as proposed, human corrections, and rejection.
+- Use GPT-6 Astra / GPT-5.6 Sol / Terra / Luna with OpenAI Responses API, Azure OpenAI, an OpenAI-compatible endpoint, or Codex App Server. Select the reasoning level in Settings.
+- Use the local Codex CLI model catalog, reasoning settings, and per-thread token usage through Codex App Server.
+- Review input, output, reasoning, cached-input, and total token usage by model in Settings.
+- Build a Tauri 2 desktop shell for macOS, Windows, and Linux.
+
+For original PDF sources, native export preserves the page content and adds vector annotation outlines and number markers, keeping the document text searchable. Office and image sources exported as PDF use a visual copy of the rendered pages. Approved Excel cell changes are exported as a new workbook, and approved DOCX annotations can be exported as Word comments in a new file; neither overwrites the source. Word comments anchor to exact excerpts when the paragraph uses supported text runs. Canonical text-quote context can disambiguate repeated phrases; missing, ambiguous, and unsupported nested-run excerpts are skipped and reported rather than widened to paragraph-level comments. Approved PowerPoint annotations are exported as editable outline and label shapes and slide-level user-defined tags. Text selections with multiple line fragments get separate linked outline shapes, each carrying the stable Annotation Studio finding ID. Native PPTX export reads and writes both Transitional and Strict OOXML namespace variants. The tags store categories and findings with slide coordinates, text fragments and selectors, evidence, explanation, review priority, and status as machine-readable name/value properties; unrelated existing tags are preserved. They are available through the PowerPoint Tags API or Open XML, rather than displayed on the slide canvas. Labels, rationales, review priority, coordinates, and any optional model estimate are included in CSV / JSON. LibreOffice 26.2 rendered the editable shapes but dropped the custom slide tags on a save-and-reopen round trip; Microsoft Office was unavailable for verification.
+
+Conversion warnings are shown in the app. SVG is displayed as an image rather than inserted directly into HTML. Codex App Server uses the Codex CLI login and model catalog on the host running the server. On macOS, the ChatGPT-bundled Codex executable is preferred when it is available; set `CODEX_APP_SERVER_BIN` to override it. For remote web deployments, operate the API server and Codex CLI on a local or company host. Tauri packages include the Node API, target-native dependencies, the cooling-fan PDF, the scripted contract PDF, the unlabeled eleven-page Product Hunt contract PDF, and both customer workbooks; a staging test checks that every built-in sample is copied unchanged. The desktop app starts the API on loopback and stops it on exit. Leave the server URL blank to use this bundled API, or enter a URL to use a local or company API instead. Desktop session data defaults to the platform app-data directory; web-server installs default to `~/.annotation-studio/session-state`. Set `ANNOTATION_STUDIO_DATA_DIR` to override either location.
+
+## Screen concepts
+
+The English screen concept and workflow guide show the intended annotation experience.
+
+![Annotation Studio desktop workspace concept](../public/examples/annotation-workspace-concept-en.png)
+
+![Agent-first annotation workbench reference](./visual-design/annotation-workbench-agent-first.png)
+
+![Four-step document annotation workflow](../public/examples/annotation-workflow-guide-en.png)
+
+![PDF, Excel, Word, and PowerPoint review targets](../public/examples/agent-format-workflow.png)
+
+## Reference material
+
+Earlier proof-of-concept files were used only to understand the annotation workflow. Their old deployment targets, commands, and API URLs are not carried forward as current requirements or credentials. See [`docs/reference-notes.md`](./reference-notes.md).
+
+## API and desktop settings
+
+- Settings can switch between OpenAI API, Azure OpenAI, OpenAI-compatible API, and Codex App Server.
+- API mode supports endpoints and API keys, GPT-6 Astra / GPT-5.6 Sol / Terra / Luna, and reasoning levels. Azure also uses a deployment name.
+- API keys are never written to device storage; they stay in memory for the current browser tab.
+- Codex App Server uses the Codex CLI on the same host, including its signed-in account, available models, and reasoning settings.
+- Tauri 2 desktop builds bundle the document-processing API and start it automatically on loopback. Leave the server URL blank to use it, or set a local or company Annotation Studio API URL to override it.
+
+Start web development:
+
+```bash
+npm run dev
+```
+
+Start Tauri desktop development:
+
+```bash
+npm run tauri:dev
+```
+
+Build the Tauri package:
+
+```bash
+npm run tauri:build
+```
+
+The Tauri build hook downloads the pinned Node.js 24.21.0 LTS runtime, verifies its SHA-256 against the official Node.js release manifest, and stages the API with production npm dependencies for the selected target. On native builds it also starts the staged API, checks readiness, and verifies that closing the parent pipe stops the process; the same pipe closes if Tauri is force-terminated. The app binds the API to `127.0.0.1`, waits for its health endpoint before loading the workspace, chooses another port if needed, and stops the child process on app exit. Native package builds support macOS x64 / arm64, Windows x64 / arm64, and Linux GNU x64 / arm64. Run `npm run tauri:build` on the platform being packaged with its normal Tauri prerequisites; the Tauri CLI passes its target triple to the staging hook automatically. Set `ANNOTATION_STUDIO_TARGET_TRIPLE` only when running `prepare:desktop-runtime` outside the Tauri CLI. `tauri:dev` continues to use the API started by `npm run dev`. For a public web deployment, set `HOST` explicitly, use an authenticated reverse proxy with HTTPS, and restrict `CORS_ALLOWED_ORIGINS` to the exact deployment origins; implicit same-origin access is limited to loopback hosts.
+
+The Codex App Server TypeScript wire schema was generated from the Codex CLI available in this development environment. After updating the CLI, regenerate it with `codex app-server generate-ts --out server/codex-protocol` and verify model discovery, reasoning levels, and token-usage notifications.

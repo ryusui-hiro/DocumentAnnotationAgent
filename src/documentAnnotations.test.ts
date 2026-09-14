@@ -1,0 +1,260 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { normalizeDocumentAnnotationRecords, readStoredDocumentAnnotationRecords, resolveCandidateReview, restoreDocumentAnnotationRecords, spreadsheetChangeStatusLabel } from './documentAnnotations';
+
+test('normalizes visual and spreadsheet annotations into a shared target and review schema', () => {
+  const records = normalizeDocumentAnnotationRecords({
+    documentId: 'doc-1',
+    fileType: 'XLSX',
+    annotations: [{
+      id: 'page-annotation', pageNumber: 2, x: 0.1, y: 0.2, width: 0.3, height: 0.1,
+      label: 'HIGH RISK', note: 'Unilateral termination.', reason: 'Only one party can terminate.',
+      excerpt: 'Either party may terminate', confidence: 0.91, color: '#178b87', source: 'ai',
+    }],
+    candidates: [{
+      id: 'review-candidate', pageNumber: 3, x: 0.2, y: 0.4, width: 0.2, height: 0.1,
+      label: 'MEDIUM RISK', note: 'Review this exception.', reason: 'The trigger is unclear.',
+      excerpt: 'reasonable circumstances', confidence: 0.62, reviewPriority: 'high', requiresReview: true, color: '#e8a532', source: 'ai',
+    }],
+    rejectedCandidates: [],
+    spreadsheetChanges: [{
+      id: 'sheet-cell', operation: 'write_cell', sheetName: 'Customers', range: 'F2',
+      values: [['HIGH']], reason: 'High ticket volume and no recent login.', confidence: 0.94,
+      requiresReview: false, approved: true,
+    }],
+  });
+
+  assert.deepEqual(records.map((record) => record.status), ['auto', 'needs_review', 'auto']);
+  assert.deepEqual(records[0]?.target, { kind: 'page', page: 2, boundingBox: { x: 0.1, y: 0.2, width: 0.3, height: 0.1 } });
+  assert.equal(records[1]?.reviewPriority, 'high');
+  assert.equal(records[0]?.reviewPriority, 'medium');
+  assert.equal(records[2]?.reviewPriority, 'medium');
+  assert.deepEqual(records[2]?.target, { kind: 'sheet', sheet: 'Customers', cellRange: 'F2' });
+  assert.equal(spreadsheetChangeStatusLabel({ id: 'sheet-cell', operation: 'write_cell', sheetName: 'Customers', range: 'F2', values: [['HIGH']], reason: '', requiresReview: false, approved: true }), '適用済み');
+  assert.equal(records.every((record) => record.documentId === 'doc-1'), true);
+});
+
+test('review priority does not change with the optional numeric model estimate', () => {
+  const records = normalizeDocumentAnnotationRecords({
+    documentId: 'priority-test', fileType: 'PDF',
+    annotations: [0.01, 0.99].map((confidence, index) => ({
+      id: `annotation-${index}`, pageNumber: index + 1, x: 0.1, y: 0.1, width: 0.4, height: 0.1,
+      label: 'Finding', note: 'Evidence-backed result.', reason: 'Visible evidence supports this.',
+      confidence, reviewPriority: 'low' as const, color: '#178b87', source: 'ai' as const,
+    })),
+    candidates: [], rejectedCandidates: [], spreadsheetChanges: [],
+  });
+  assert.deepEqual(records.map((record) => record.reviewPriority), ['low', 'low']);
+});
+
+test('a high-priority clear finding remains automatically applied when review is not required', () => {
+  const records = normalizeDocumentAnnotationRecords({
+    documentId: 'autopilot-clear-high', fileType: 'PDF',
+    annotations: [{
+      id: 'important-result', pageNumber: 1, x: 0.1, y: 0.1, width: 0.4, height: 0.1,
+      label: 'HIGH RISK', note: 'The evidence is clear.', reason: 'The contract permits termination without cause.',
+      reviewPriority: 'high', requiresReview: false, color: '#c64e57', source: 'ai',
+    }],
+    candidates: [], rejectedCandidates: [], spreadsheetChanges: [],
+  });
+  assert.equal(records[0]?.status, 'auto');
+  assert.equal(restoreDocumentAnnotationRecords(records).annotations[0]?.requiresReview, false);
+});
+
+test('canonical annotation IDs are unique and the latest review state wins', () => {
+  const records = normalizeDocumentAnnotationRecords({
+    documentId: 'dedupe-test', fileType: 'PDF',
+    annotations: [{ id: 'same-id', pageNumber: 1, x: 0.1, y: 0.1, width: 0.3, height: 0.1, label: 'Old', note: 'Existing', color: '#178b87', source: 'ai' }],
+    candidates: [{ id: 'same-id', pageNumber: 1, x: 0.1, y: 0.1, width: 0.3, height: 0.1, label: 'Updated', note: 'Needs review', requiresReview: true, color: '#e8a532', source: 'ai' }],
+    rejectedCandidates: [], spreadsheetChanges: [],
+  });
+  assert.equal(records.length, 1);
+  assert.equal(records[0]?.label, 'Updated');
+  assert.equal(records[0]?.status, 'needs_review');
+});
+
+test('canonical records restore visual review states and spreadsheet changes without legacy arrays', () => {
+  const records = normalizeDocumentAnnotationRecords({
+    documentId: 'doc-old', fileType: 'PPTX',
+    annotations: [{
+      id: 'slide-approved', pageNumber: 3, x: 0.1, y: 0.2, width: 0.3, height: 0.15,
+      label: 'Traction', note: 'Quarterly growth chart.', reason: 'The slide shows measured growth.',
+      excerpt: 'Revenue increased by 18%.', reviewPriority: 'low', color: '#178b87', source: 'ai',
+    }],
+    candidates: [{
+      id: 'page-review', pageNumber: 4, x: 0.2, y: 0.3, width: 0.4, height: 0.1,
+      label: 'Unsupported claim', note: 'Needs source.', reason: 'No citation is visible.', excerpt: 'Market leadership',
+      reviewPriority: 'high', requiresReview: true, color: '#e8a532', source: 'ai',
+    }],
+    rejectedCandidates: [{
+      id: 'page-rejected', pageNumber: 5, x: 0.2, y: 0.3, width: 0.4, height: 0.1,
+      label: 'Duplicate', note: 'Already covered.', reason: 'A prior annotation covers this point.', excerpt: 'Growth',
+      reviewPriority: 'medium', requiresReview: true, color: '#e8a532', source: 'ai',
+    }],
+    spreadsheetChanges: [{
+      id: 'cell-change', operation: 'write_cell', sheetName: 'Customers', range: 'F2', values: [['HIGH']],
+      reason: 'The account has repeated support escalations.', reviewPriority: 'high', requiresReview: false, approved: true, reviewOutcome: 'approved',
+    }],
+  });
+  const restored = restoreDocumentAnnotationRecords(records);
+  assert.equal(restored.annotations[0]?.pageNumber, 3);
+  assert.equal(restored.annotations[0]?.reviewPriority, 'low');
+  assert.equal(restored.annotations[0]?.reason, 'The slide shows measured growth.');
+  assert.equal(restored.candidates[0]?.id, 'page-review');
+  assert.equal(restored.rejectedCandidates[0]?.id, 'page-rejected');
+  assert.deepEqual(restored.spreadsheetChanges[0], {
+    id: 'cell-change', operation: 'write_cell', sheetName: 'Customers', range: 'F2',
+    values: [['HIGH']], reason: 'The account has repeated support escalations.',
+    reviewPriority: 'high', requiresReview: false, approved: true, reviewOutcome: 'approved',
+  });
+});
+
+test('round-trips all five spreadsheet review states without treating applied writes as human-approved', () => {
+  const spreadsheetChanges = [
+    { id: 'auto', operation: 'write_cell' as const, sheetName: 'Customers', range: 'A1', values: [['AUTO']], reason: '', requiresReview: false, approved: true },
+    { id: 'needs-review', operation: 'write_cell' as const, sheetName: 'Customers', range: 'A2', values: [['REVIEW']], reason: '', requiresReview: true },
+    { id: 'approved', operation: 'write_cell' as const, sheetName: 'Customers', range: 'A3', values: [['APPROVED']], reason: '', requiresReview: false, approved: true, reviewOutcome: 'approved' as const },
+    { id: 'corrected', operation: 'write_cell' as const, sheetName: 'Customers', range: 'A4', values: [['CORRECTED']], reason: '', requiresReview: false, approved: true, reviewOutcome: 'corrected' as const },
+    { id: 'rejected', operation: 'write_cell' as const, sheetName: 'Customers', range: 'A5', values: [['REJECTED']], reason: '', requiresReview: false, rejected: true },
+  ];
+  const records = normalizeDocumentAnnotationRecords({
+    documentId: 'spreadsheet-review-states', fileType: 'XLSX', annotations: [], candidates: [], rejectedCandidates: [], spreadsheetChanges,
+  });
+  assert.deepEqual(records.map((record) => record.status), ['auto', 'needs_review', 'approved', 'corrected', 'rejected']);
+
+  const restored = restoreDocumentAnnotationRecords(records);
+  assert.equal(restored.spreadsheetChanges[0]?.approved, true, 'automatic writes stay applied for native workbook export');
+  assert.equal(restored.spreadsheetChanges[0]?.reviewOutcome, undefined, 'automatic application is not a human approval');
+  const roundTripped = normalizeDocumentAnnotationRecords({ documentId: 'spreadsheet-review-states', fileType: 'XLSX', ...restored });
+  assert.deepEqual(roundTripped.map((record) => record.status), ['auto', 'needs_review', 'approved', 'corrected', 'rejected']);
+
+  const contradictoryPending = restoreDocumentAnnotationRecords([{ ...records[1]!, requiresReview: false, approved: true, rejected: true }]);
+  assert.deepEqual(contradictoryPending.spreadsheetChanges[0], {
+    id: 'needs-review', operation: 'write_cell', sheetName: 'Customers', range: 'A2', values: [['REVIEW']],
+    reason: '', reviewPriority: 'high', requiresReview: true,
+  }, 'the canonical state wins over stale operational flags');
+  const reconciledPending = normalizeDocumentAnnotationRecords({ documentId: 'spreadsheet-review-states', fileType: 'XLSX', ...contradictoryPending });
+  assert.equal(reconciledPending[0]?.status, 'needs_review');
+});
+
+test('maps presentation page regions to slide targets and rejected items to rejected status', () => {
+  const [record] = normalizeDocumentAnnotationRecords({
+    documentId: 'slides-1', fileType: 'PPTX',
+    annotations: [], candidates: [],
+    rejectedCandidates: [{
+      id: 'slide-rejected', pageNumber: 7, x: 0.1, y: 0.1, width: 0.5, height: 0.2,
+      label: 'Unsupported claim', note: 'Rejected claim.', reason: 'No source.',
+      excerpt: '90% of companies need this', confidence: 0.4, requiresReview: true, color: '#d36c74', source: 'ai',
+    }],
+    spreadsheetChanges: [],
+  });
+  assert.equal(record?.target.kind, 'slide');
+  assert.equal(record?.status, 'rejected');
+});
+
+test('keeps text quote selectors and per-line fragments in the canonical record', () => {
+  const fragments = [
+    { x: 0.2, y: 0.3, width: 0.25, height: 0.03 },
+    { x: 0.1, y: 0.34, width: 0.3, height: 0.03 },
+  ];
+  const textAnchor = {
+    quote: { exact: 'power supply before servicing', prefix: 'disconnect the ', suffix: ' the fan.' },
+    position: { start: 15, end: 44, unit: 'normalized-page-text' as const },
+  };
+  const records = normalizeDocumentAnnotationRecords({
+    documentId: 'selector-doc', sourceHash: 'c'.repeat(64), fileType: 'PDF',
+    annotations: [{
+      id: 'selector-annotation', pageNumber: 1, x: 0.1, y: 0.3, width: 0.35, height: 0.07,
+      label: 'SAFETY', note: 'Disconnect power.', excerpt: textAnchor.quote.exact, fragments, textAnchor,
+      color: '#178b87', source: 'ai', reviewPriority: 'low',
+    }],
+    candidates: [], rejectedCandidates: [], spreadsheetChanges: [],
+  });
+  assert.equal(records[0]?.sourceHash, 'c'.repeat(64));
+  assert.deepEqual(records[0]?.target.kind === 'page' ? records[0].target.fragments : undefined, fragments);
+  assert.deepEqual(records[0]?.target.kind === 'page' ? records[0].target.textAnchor : undefined, textAnchor);
+  const restored = restoreDocumentAnnotationRecords(records);
+  assert.deepEqual(restored.annotations[0]?.fragments, fragments);
+  assert.deepEqual(restored.annotations[0]?.textAnchor, textAnchor);
+});
+
+test('moves a reviewed candidate to a confirmed record atomically without losing its shared id', () => {
+  const candidate = {
+    id: 'same-id', pageNumber: 1, x: 0.1, y: 0.2, width: 0.3, height: 0.1,
+    label: 'MEDIUM RISK', note: 'Review this clause.', reason: 'Needs a human decision.', excerpt: 'This clause',
+    reviewPriority: 'high' as const, requiresReview: true, color: '#9275d3', source: 'ai' as const,
+  };
+  const initial = { annotations: [], candidates: [candidate], rejectedCandidates: [], spreadsheetChanges: [] };
+  const corrected = resolveCandidateReview(initial, candidate.id, {
+    type: 'correct',
+    annotation: { ...candidate, label: 'HIGH RISK', note: 'No termination date is stated.', reason: 'Human correction.', source: 'manual', requiresReview: false, reviewedByHuman: true },
+  });
+  const records = normalizeDocumentAnnotationRecords({ documentId: 'review-doc', fileType: 'PDF', ...corrected });
+  const restored = restoreDocumentAnnotationRecords(records);
+  assert.equal(restored.candidates.length, 0);
+  assert.equal(restored.annotations[0]?.id, 'same-id');
+  assert.equal(restored.annotations[0]?.label, 'HIGH RISK');
+  assert.equal(records[0]?.status, 'corrected');
+
+  const rejected = resolveCandidateReview(initial, candidate.id, { type: 'reject', candidate });
+  const rejectedRecords = normalizeDocumentAnnotationRecords({ documentId: 'review-doc', fileType: 'PDF', ...rejected });
+  assert.equal(restoreDocumentAnnotationRecords(rejectedRecords).rejectedCandidates[0]?.id, 'same-id');
+});
+
+test('keeps unchanged approval, correction, and human-created annotation statuses distinct', () => {
+  const records = normalizeDocumentAnnotationRecords({
+    documentId: 'review-outcomes', fileType: 'PDF',
+    annotations: [
+      { id: 'approved-ai', pageNumber: 1, x: 0.1, y: 0.2, width: 0.3, height: 0.1, label: 'LIMIT', note: 'Approved as proposed.', color: '#178b87', source: 'ai', reviewedByHuman: true, reviewOutcome: 'approved' },
+      { id: 'corrected-ai', pageNumber: 1, x: 0.1, y: 0.4, width: 0.3, height: 0.1, label: 'HIGH RISK', note: 'Human changed this label.', color: '#178b87', source: 'manual', reviewedByHuman: true, reviewOutcome: 'corrected' },
+      { id: 'human-created', pageNumber: 1, x: 0.1, y: 0.6, width: 0.3, height: 0.1, label: 'NOTE', note: 'Added directly by a human.', color: '#178b87', source: 'manual', reviewedByHuman: true, reviewOutcome: 'approved' },
+      { id: 'legacy-ai-approval', pageNumber: 1, x: 0.1, y: 0.8, width: 0.3, height: 0.1, label: 'SAFETY', note: 'Legacy approved result.', color: '#178b87', source: 'ai', reviewedByHuman: true },
+    ],
+    candidates: [], rejectedCandidates: [], spreadsheetChanges: [],
+  });
+
+  assert.deepEqual(records.map((record) => record.status), ['approved', 'corrected', 'approved', 'approved']);
+  const restored = restoreDocumentAnnotationRecords(records);
+  assert.deepEqual(restored.annotations.map((annotation) => annotation.reviewOutcome), ['approved', 'corrected', 'approved', 'approved']);
+});
+
+test('uses the same review fallback for legacy visual records and renders workbook application separately from human approval', () => {
+  const records = normalizeDocumentAnnotationRecords({
+    documentId: 'legacy-review-states', fileType: 'PDF',
+    annotations: [
+      { id: 'legacy-correction', pageNumber: 1, x: 0.1, y: 0.1, width: 0.3, height: 0.1, label: 'HIGH', note: 'Changed by a person.', color: '#178b87', source: 'manual', reviewedByHuman: true },
+      { id: 'high-priority', pageNumber: 1, x: 0.1, y: 0.3, width: 0.3, height: 0.1, label: 'REVIEW', note: 'Escalated priority.', color: '#178b87', source: 'ai', reviewPriority: 'high' },
+    ],
+    candidates: [], rejectedCandidates: [], spreadsheetChanges: [],
+  });
+  assert.deepEqual(records.map((record) => record.status), ['corrected', 'needs_review']);
+
+  const change = { id: 'sheet-change', operation: 'write_cell' as const, sheetName: 'Customers', range: 'F2', values: [['HIGH']], reason: '', requiresReview: false };
+  assert.equal(spreadsheetChangeStatusLabel({ ...change, approved: true }), '適用済み');
+  assert.equal(spreadsheetChangeStatusLabel({ ...change, approved: true, reviewOutcome: 'approved' }), '承認済み');
+  assert.equal(spreadsheetChangeStatusLabel({ ...change, requiresReview: true }), '承認待ち');
+  assert.equal(spreadsheetChangeStatusLabel({ ...change, rejected: true }), '却下');
+  assert.equal(spreadsheetChangeStatusLabel({ ...change, approved: true, reviewOutcome: 'corrected' }), '修正済み');
+});
+
+test('rebinds saved workspace annotations to a live session and tolerates malformed local state', () => {
+  const saved = normalizeDocumentAnnotationRecords({
+    documentId: 'expired-session', fileType: 'XLSX', annotations: [], candidates: [], rejectedCandidates: [],
+    spreadsheetChanges: [{ id: 'saved-cell', operation: 'write_cell', sheetName: 'Customers', range: 'F2', values: [['HIGH']], reason: 'Evidence in the row supports the classification.', requiresReview: false, approved: true, reviewOutcome: 'approved' }],
+  });
+  const rebound = readStoredDocumentAnnotationRecords(JSON.stringify({ version: 3, documentAnnotations: saved }), 'new-session', 'XLSX');
+  assert.equal(rebound[0]?.documentId, 'new-session');
+  assert.equal(rebound[0]?.target.kind, 'sheet');
+  assert.equal(rebound[0]?.status, 'approved');
+  assert.deepEqual(readStoredDocumentAnnotationRecords('{broken-json', 'new-session', 'PDF'), []);
+});
+
+test('does not rebind annotations from a different source-file version', () => {
+  const oldVersion = normalizeDocumentAnnotationRecords({
+    documentId: 'expired-session', sourceHash: 'a'.repeat(64), fileType: 'PDF',
+    annotations: [{ id: 'old-version', pageNumber: 1, x: 0.1, y: 0.2, width: 0.3, height: 0.1, label: 'Old', note: 'Old file result.', color: '#178b87', source: 'ai' }],
+    candidates: [], rejectedCandidates: [], spreadsheetChanges: [],
+  });
+  const raw = JSON.stringify({ version: 4, sourceHash: 'a'.repeat(64), documentAnnotations: oldVersion });
+  assert.deepEqual(readStoredDocumentAnnotationRecords(raw, 'new-session', 'PDF', 'b'.repeat(64)), []);
+});

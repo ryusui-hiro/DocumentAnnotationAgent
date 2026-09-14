@@ -1,0 +1,31 @@
+{
+  "productUrl": "https://ryusui-hiro.github.io/DocumentAnnotationAgent/",
+  "repositoryUrl": "https://github.com/ryusui-hiro/DocumentAnnotationAgent",
+  "name": "Astra Annotator",
+  "tagline": "Annotate documents live with AI, on your terms",
+  "description": "Turn PDFs, Office files and images into labeled information. Tell AI what to find, watch annotations arrive across up to three pages, and refine them by hand. Let AI create labels or enforce your own. Extract text, tables, equations and image regions; export annotated PDFs, PNG, JSON, CSV and Markdown. Use it in your browser with your API key, or run locally with Codex App Server. English, Japanese and Chinese UI.",
+  "categories": [
+    "Productivity",
+    "Artificial Intelligence",
+    "Developer Tools"
+  ],
+  "tags": [
+    "Document annotation",
+    "OCR",
+    "PDF",
+    "Research tools",
+    "Developer tools",
+    "OpenAI"
+  ],
+  "thumbnail": "assets/launch-thumbnail-1024.png",
+  "gallery": [
+    "assets/launch-gallery-01-live-1600x1200.png",
+    "assets/launch-gallery-02-equations-1600x1200.png",
+    "assets/launch-gallery-03-tables-1600x1200.png",
+    "assets/launch-gallery-04-workspace-1600x1200.png"
+  ],
+  "characterCounts": {
+    "tagline": 46,
+    "description": 417
+  }
+}

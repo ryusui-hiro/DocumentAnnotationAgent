@@ -1,0 +1,958 @@
+{
+  "paper": {
+    "title": "Zero-Shot Text-to-Image Generation",
+    "authors": [
+      "Aditya Ramesh",
+      "Mikhail Pavlov",
+      "Gabriel Goh",
+      "Scott Gray",
+      "Chelsea Voss",
+      "Alec Radford",
+      "Mark Chen",
+      "Ilya Sutskever"
+    ],
+    "sourceUrl": "https://openai.com/index/dall-e/",
+    "pdfUrl": "https://proceedings.mlr.press/v139/ramesh21a/ramesh21a.pdf",
+    "publicationUrl": "https://proceedings.mlr.press/v139/ramesh21a.html",
+    "citation": "Ramesh et al. (2021). Zero-Shot Text-to-Image Generation. Proceedings of the 38th International Conference on Machine Learning, PMLR 139:8821–8831.",
+    "license": "CC BY 4.0",
+    "licenseUrl": "https://creativecommons.org/licenses/by/4.0/",
+    "licenseSourceUrl": "https://proceedings.mlr.press/pmlr-license-agreement.html",
+    "description": "Original OpenAI DALL·E research paper. Selected original pages 1, 2, and 5 show the title, prose, figures, an actual numbered ELB equation, and Table 1.",
+    "sourcePages": [
+      1,
+      2,
+      5
+    ],
+    "originalPageCount": 11,
+    "sourceSha256": "c2801c43b6f2e9a967ec872f6d4b741384ecb88f8cd33f82470ece70daf6c2bb",
+    "selectedSha256": "f9f408cd4f40bc8f7bfdf10f757b617914c6f9b6f6cd21685fd4026f85f331f2",
+    "selectedPdfUrl": "/demos/openai-paper-selected.pdf",
+    "modifications": "Only original pages 1, 2, and 5 are included; their visible content is unchanged. OCR labels and transcriptions are separate model-generated annotations."
+  },
+  "pages": [
+    {
+      "pageNumber": 1,
+      "sourcePageNumber": 1,
+      "blocks": [
+        {
+          "type": "title",
+          "bbox": {
+            "x": 0.303,
+            "y": 0.112,
+            "width": 0.37,
+            "height": 0.022
+          },
+          "extractedText": "Zero-Shot Text-to-Image Generation",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p1-b1"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.265,
+            "y": 0.177,
+            "width": 0.443,
+            "height": 0.032
+          },
+          "extractedText": "Aditya Ramesh ¹  Mikhail Pavlov ¹  Gabriel Goh ¹  Scott Gray ¹\nChelsea Voss ¹  Alec Radford ¹  Mark Chen ¹  Ilya Sutskever ¹",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p1-b2"
+        },
+        {
+          "type": "heading",
+          "bbox": {
+            "x": 0.245,
+            "y": 0.235,
+            "width": 0.075,
+            "height": 0.018
+          },
+          "extractedText": "Abstract",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p1-b3"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.123,
+            "y": 0.261,
+            "width": 0.322,
+            "height": 0.181
+          },
+          "extractedText": "Text-to-image generation has traditionally fo-\ncused on finding better modeling assumptions for\ntraining on a fixed dataset. These assumptions\nmight involve complex architectures, auxiliary\nlosses, or side information such as object part la-\nbels or segmentation masks supplied during train-\ning. We describe a simple approach for this task\nbased on a transformer that autoregressively mod-\nels the text and image tokens as a single stream of\ndata. With sufficient data and scale, our approach\nis competitive with previous domain-specific mod-\nels when evaluated in a zero-shot fashion.",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p1-b4"
+        },
+        {
+          "type": "heading",
+          "bbox": {
+            "x": 0.09,
+            "y": 0.473,
+            "width": 0.129,
+            "height": 0.018
+          },
+          "extractedText": "1. Introduction",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p1-b5"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.09,
+            "y": 0.499,
+            "width": 0.386,
+            "height": 0.166
+          },
+          "extractedText": "Modern machine learning approaches to text to image syn-\nthesis started with the work of Mansimov et al. (2015),\nwho showed that the DRAW Gregor et al. (2015) generative\nmodel, when extended to condition on image captions, could\nalso generate novel visual scenes. Reed et al. (2016b) later\ndemonstrated that using a generative adversarial network\n(Goodfellow et al., 2014), rather than a recurrent variational\nauto-encoder, improved image fidelity. Reed et al. (2016b)\nshowed that this system could not only generate objects with\nrecognizable properties, but also could zero-shot generalize\nto held-out categories.",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p1-b6"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.09,
+            "y": 0.673,
+            "width": 0.386,
+            "height": 0.105
+          },
+          "extractedText": "Over the next few years, progress continued using a combi-\nnation of methods. These include improving the generative\nmodel architecture with modifications like multi-scale gen-\nerators (Zhang et al., 2017; 2018), integrating attention and\nauxiliary losses (Xu et al., 2018), and leveraging additional\nsources of conditioning information beyond just text (Reed\net al., 2016a; Li et al., 2019; Koh et al., 2021).",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p1-b7"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.09,
+            "y": 0.786,
+            "width": 0.386,
+            "height": 0.045
+          },
+          "extractedText": "Separately, Nguyen et al. (2017) propose an energy-based\nframework for conditional image generation that obtained\na large improvement in sample quality relative to contem-",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p1-b8"
+        },
+        {
+          "type": "figure",
+          "bbox": {
+            "x": 0.502,
+            "y": 0.236,
+            "width": 0.381,
+            "height": 0.196
+          },
+          "extractedText": "LA GRANDE PATISSERIE\nMAISON FONDEE EN 1880\n[illegible]\nLA GRANDE PATISSERIE\n[illegible]",
+          "latex": null,
+          "uncertain": true,
+          "uncertaintyReason": "Small storefront lettering is blurred, particularly in the lower reconstruction. The upper establishment-date lettering is also ambiguous at this resolution; other small signs are unreadable.",
+          "id": "paper-p1-b9"
+        },
+        {
+          "type": "caption",
+          "bbox": {
+            "x": 0.501,
+            "y": 0.448,
+            "width": 0.385,
+            "height": 0.096
+          },
+          "extractedText": "Figure 1. Comparison of original images (top) and reconstructions\nfrom the discrete VAE (bottom). The encoder downsamples the\nspatial resolution by a factor of 8. While details (e.g., the texture of\nthe cat’s fur, the writing on the storefront, and the thin lines in the\nillustration) are sometimes lost or distorted, the main features of the\nimage are still typically recognizable. We use a large vocabulary\nsize of 8192 to mitigate the loss of information.",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p1-b10"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.502,
+            "y": 0.574,
+            "width": 0.385,
+            "height": 0.165
+          },
+          "extractedText": "porary methods. Their approach can incorporate pretrained\ndiscriminative models, and they show that it is capable of\nperforming text-to-image generation when applied to a cap-\ntioning model pretrained on MS-COCO. More recently, Cho\net al. (2020) also propose a method that involves optimiz-\ning the input to a pretrained cross-modal masked language\nmodel. While significant increases in visual fidelity have oc-\ncurred as a result of the work since Mansimov et al. (2015),\nsamples can still suffer from severe artifacts such as object\ndistortion, illogical object placement, or unnatural blending\nof foreground and background elements.",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p1-b11"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.502,
+            "y": 0.748,
+            "width": 0.385,
+            "height": 0.105
+          },
+          "extractedText": "Recent advances fueled by large-scale generative models\nsuggest a possible route for further improvements. Specifi-\ncally, when compute, model size, and data are scaled care-\nfully, autoregressive transformers (Vaswani et al., 2017)\nhave achieved impressive results in several domains such as\ntext (Radford et al., 2019), images (Chen et al., 2020), and\naudio (Dhariwal et al., 2020).",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p1-b12"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.502,
+            "y": 0.862,
+            "width": 0.385,
+            "height": 0.044
+          },
+          "extractedText": "By comparison, text-to-image generation has typically been\nevaluated on relatively small datasets such as MS-COCO\nand CUB-200 (Welinder et al., 2010). Could dataset size and",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p1-b13"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.09,
+            "y": 0.84,
+            "width": 0.386,
+            "height": 0.027
+          },
+          "extractedText": "¹OpenAI, San Francisco, California, United States. Correspon-\ndence to: Aditya Ramesh <_@adityaramesh.com>.",
+          "latex": null,
+          "uncertain": true,
+          "uncertaintyReason": "The small character immediately before @ in the correspondence address appears to be an underscore but is not fully clear.",
+          "id": "paper-p1-b14"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.09,
+            "y": 0.867,
+            "width": 0.386,
+            "height": 0.039
+          },
+          "extractedText": "Proceedings of the 37ᵗʰ International Conference on Ma-\nchine Learning, Online, PMLR 139, 2020. Copyright 2020 by the\nauthor(s).",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p1-b15"
+        }
+      ],
+      "warnings": [
+        "Small lettering within the figure is partly unreadable.",
+        "The final paragraph continues beyond this page; only visible text is transcribed."
+      ],
+      "model": "gpt-6-astra",
+      "provider": "codex-app-server",
+      "generatedAt": "2026-09-14T12:30:14.169Z",
+      "usage": {
+        "inputTokens": 22023,
+        "outputTokens": 2298,
+        "reasoningTokens": 74,
+        "cachedInputTokens": 0,
+        "totalTokens": 24321
+      }
+    },
+    {
+      "pageNumber": 2,
+      "sourcePageNumber": 2,
+      "blocks": [
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.373,
+            "y": 0.059,
+            "width": 0.23,
+            "height": 0.012
+          },
+          "extractedText": "Zero-Shot Text-to-Image Generation",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p2-b1"
+        },
+        {
+          "type": "figure",
+          "bbox": {
+            "x": 0.121,
+            "y": 0.097,
+            "width": 0.177,
+            "height": 0.136
+          },
+          "extractedText": "",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p2-b2"
+        },
+        {
+          "type": "caption",
+          "bbox": {
+            "x": 0.117,
+            "y": 0.242,
+            "width": 0.181,
+            "height": 0.036
+          },
+          "extractedText": "(a) a tapir made of accordion.\na tapir with the texture of an\naccordion.",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p2-b3"
+        },
+        {
+          "type": "figure",
+          "bbox": {
+            "x": 0.309,
+            "y": 0.097,
+            "width": 0.177,
+            "height": 0.136
+          },
+          "extractedText": "",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p2-b4"
+        },
+        {
+          "type": "caption",
+          "bbox": {
+            "x": 0.305,
+            "y": 0.242,
+            "width": 0.18,
+            "height": 0.036
+          },
+          "extractedText": "(b) an illustration of a baby\nhedgehog in a christmas\nsweater walking a dog",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p2-b5"
+        },
+        {
+          "type": "figure",
+          "bbox": {
+            "x": 0.497,
+            "y": 0.097,
+            "width": 0.177,
+            "height": 0.136
+          },
+          "extractedText": "BACKPROP\nBACKPROP\nBACKROP\nBACKPRO[illegible]",
+          "latex": null,
+          "uncertain": true,
+          "uncertaintyReason": "Generated neon lettering is distorted; the lower-right sign is clipped and its final characters are unreadable.",
+          "id": "paper-p2-b6"
+        },
+        {
+          "type": "caption",
+          "bbox": {
+            "x": 0.493,
+            "y": 0.242,
+            "width": 0.182,
+            "height": 0.048
+          },
+          "extractedText": "(c) a neon sign that reads\n“backprop”. a neon sign that\nreads “backprop”. backprop\nneon sign",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p2-b7"
+        },
+        {
+          "type": "figure",
+          "bbox": {
+            "x": 0.685,
+            "y": 0.097,
+            "width": 0.178,
+            "height": 0.136
+          },
+          "extractedText": "",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p2-b8"
+        },
+        {
+          "type": "caption",
+          "bbox": {
+            "x": 0.681,
+            "y": 0.242,
+            "width": 0.183,
+            "height": 0.023
+          },
+          "extractedText": "(d) the exact same cat on the\ntop as a sketch on the bottom",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p2-b9"
+        },
+        {
+          "type": "caption",
+          "bbox": {
+            "x": 0.09,
+            "y": 0.305,
+            "width": 0.796,
+            "height": 0.025
+          },
+          "extractedText": "Figure 2. With varying degrees of reliability, our model appears to be able to combine distinct concepts in plausible ways, create\nanthropomorphized versions of animals, render text, and perform some types of image-to-image translation.",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p2-b10"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.09,
+            "y": 0.358,
+            "width": 0.386,
+            "height": 0.088
+          },
+          "extractedText": "model size be the limiting factor of current approaches? In\nthis work, we demonstrate that training a 12-billion param-\neter autoregressive transformer on 250 million image-text\npairs collected from the internet results in a flexible, high\nfidelity generative model of images controllable through\nnatural language.",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p2-b11"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.09,
+            "y": 0.456,
+            "width": 0.386,
+            "height": 0.133
+          },
+          "extractedText": "The resulting system achieves high quality image generation\non the popular MS-COCO dataset zero-shot, without using\nany of the training labels. It is preferred over prior work\ntrained on the dataset by human evaluators 90% of the time.\nWe also find that it is able to perform complex tasks such\nas image-to-image translation at a rudimentary level. This\npreviously required custom approaches (Isola et al., 2017),\nrather emerging as a capability of a single, large generative\nmodel.",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p2-b12"
+        },
+        {
+          "type": "heading",
+          "bbox": {
+            "x": 0.09,
+            "y": 0.61,
+            "width": 0.085,
+            "height": 0.015
+          },
+          "extractedText": "2. Method",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p2-b13"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.09,
+            "y": 0.637,
+            "width": 0.388,
+            "height": 0.148
+          },
+          "extractedText": "Our goal is to train a transformer (Vaswani et al., 2017) to\nautoregressively model the text and image tokens as a single\nstream of data. However, using pixels directly as image\ntokens would require an inordinate amount of memory for\nhigh-resolution images. Likelihood objectives tend to pri-\noritize modeling short-range dependencies between pixels\n(Salimans et al., 2017), so much of the modeling capac-\nity would be spent capturing high-frequency details instead\nof the low-frequency structure that makes objects visually\nrecognizable to us.",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p2-b14"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.09,
+            "y": 0.796,
+            "width": 0.386,
+            "height": 0.027
+          },
+          "extractedText": "We address these issues by using a two-stage training proce-\ndure, similar to (Oord et al., 2017; Razavi et al., 2019):",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p2-b15"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.108,
+            "y": 0.833,
+            "width": 0.368,
+            "height": 0.043
+          },
+          "extractedText": "• Stage 1. We train a discrete variational autoen-\ncoder (dVAE)¹ to compress each 256×256 RGB image\ninto a 32 × 32 grid of image tokens, each element of",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p2-b16"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.11,
+            "y": 0.886,
+            "width": 0.291,
+            "height": 0.014
+          },
+          "extractedText": "¹https://github.com/openai/DALL-E",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p2-b17"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.534,
+            "y": 0.358,
+            "width": 0.354,
+            "height": 0.057
+          },
+          "extractedText": "which can assume 8192 possible values. This reduces\nthe context size of the transformer by a factor of 192\nwithout a large degradation in visual quality (see Fig-\nure 1).",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p2-b18"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.52,
+            "y": 0.418,
+            "width": 0.367,
+            "height": 0.058
+          },
+          "extractedText": "• Stage 2. We concatenate up to 256 BPE-encoded text\ntokens with the 32 × 32 = 1024 image tokens, and\ntrain an autoregressive transformer to model the joint\ndistribution over the text and image tokens.",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p2-b19"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.502,
+            "y": 0.487,
+            "width": 0.386,
+            "height": 0.102
+          },
+          "extractedText": "The overall procedure can be viewed as maximizing the\nevidence lower bound (ELB) (Kingma & Welling, 2013;\nRezende et al., 2014) on the joint likelihood of the model\ndistribution over images x, captions y, and the tokens z\nfor the encoded RGB image. We model this distribution\nusing the factorization pθ,ψ(x, y, z) = pθ(x | y, z)pψ(y, z),\nwhich yields the lower bound",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p2-b20"
+        },
+        {
+          "type": "equation",
+          "bbox": {
+            "x": 0.52,
+            "y": 0.604,
+            "width": 0.367,
+            "height": 0.047
+          },
+          "extractedText": "ln pθ,ψ(x, y) ≥ 𝔼z∼qφ(z | x) (ln pθ(x | y, z) −\nβ DKL(qφ(y, z | x), pψ(y, z))),  (1)",
+          "latex": "\\ln p_{\\theta,\\psi}(x,y) \\geq \\mathbb{E}_{z\\sim q_\\phi(z\\mid x)}\\left(\\ln p_\\theta(x\\mid y,z)-\\beta D_{\\mathrm{KL}}\\bigl(q_\\phi(y,z\\mid x),p_\\psi(y,z)\\bigr)\\right),\\tag{1}",
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p2-b21"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.502,
+            "y": 0.662,
+            "width": 0.047,
+            "height": 0.012
+          },
+          "extractedText": "where:",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p2-b22"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.52,
+            "y": 0.684,
+            "width": 0.366,
+            "height": 0.043
+          },
+          "extractedText": "• qφ denotes the distribution over the 32 × 32 image\ntokens generated by the dVAE encoder given the RGB\nimage x²;",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p2-b23"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.52,
+            "y": 0.73,
+            "width": 0.367,
+            "height": 0.042
+          },
+          "extractedText": "• pθ denotes the distribution over the RGB images gen-\nerated by the dVAE decoder given the image tokens;\nand",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p2-b24"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.52,
+            "y": 0.775,
+            "width": 0.366,
+            "height": 0.027
+          },
+          "extractedText": "• pψ denotes the joint distribution over the text and image\ntokens modeled by the transformer.",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p2-b25"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.502,
+            "y": 0.812,
+            "width": 0.387,
+            "height": 0.059
+          },
+          "extractedText": "Note that the bound only holds for β = 1, while in practice\nwe find it helpful to use larger values (Higgins et al., 2016).\nThe following subsections describe both stages in further\ndetail.³",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p2-b26"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.522,
+            "y": 0.879,
+            "width": 0.36,
+            "height": 0.013
+          },
+          "extractedText": "²We assume that y is conditionally independent of x given z.",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p2-b27"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.522,
+            "y": 0.893,
+            "width": 0.365,
+            "height": 0.013
+          },
+          "extractedText": "³In preliminary experiments on ImageNet (Deng et al., 2009),",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p2-b28"
+        }
+      ],
+      "warnings": [
+        "The opening prose and final footnote continue beyond this page; only visible text is transcribed.",
+        "Some generated lettering within Figure 2(c) is distorted or clipped."
+      ],
+      "model": "gpt-6-astra",
+      "provider": "codex-app-server",
+      "generatedAt": "2026-09-14T12:31:41.119Z",
+      "usage": {
+        "inputTokens": 22021,
+        "outputTokens": 2632,
+        "reasoningTokens": 75,
+        "cachedInputTokens": 0,
+        "totalTokens": 24653
+      }
+    },
+    {
+      "pageNumber": 3,
+      "sourcePageNumber": 5,
+      "blocks": [
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.373,
+            "y": 0.059,
+            "width": 0.23,
+            "height": 0.012
+          },
+          "extractedText": "Zero-Shot Text-to-Image Generation",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p3-b1"
+        },
+        {
+          "type": "figure",
+          "bbox": {
+            "x": 0.11,
+            "y": 0.088,
+            "width": 0.335,
+            "height": 0.259
+          },
+          "extractedText": "Node 1\nNode N\ngpu1\ngpu2\ngpu3\ngpu4\ngpu5\ngpu6\ngpu7\ngpu8\nall-gather, reduce-scatter\nall-reduce\n...\nall-reduce\n...\nall-reduce\n...\nall-reduce\n...\nall-reduce\n...\nall-reduce\n...\nall-reduce\n...\nall-reduce\n...\ngpu1\ngpu2\ngpu3\ngpu4\ngpu5\ngpu6\ngpu7\ngpu8\nall-gather, reduce-scatter",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p3-b2"
+        },
+        {
+          "type": "caption",
+          "bbox": {
+            "x": 0.09,
+            "y": 0.374,
+            "width": 0.386,
+            "height": 0.178
+          },
+          "extractedText": "Figure 5. Communication patterns used for distributed training. Each parameter array in the model is sharded among the eight GPUs on each machine. During forward propagation, we prefetch the parameter shards for the next resblock (using all-gather) while computing the activations for the current resblock. To conserve memory, the parameter shards from the other GPUs are immediately discarded. Similarly, during backpropagation, we prefetch the parameter shards for the previous resblock while computing the activations and gradients for the current resblock. After all GPUs have computed the gradient with respect to an all-gathered parameter, the reduce-scatter operation leaves each GPU with only one slice – i.e., the gradient for its parameter shard, averaged over the eight GPUs.",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p3-b3"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.09,
+            "y": 0.596,
+            "width": 0.384,
+            "height": 0.028
+          },
+          "extractedText": "no appreciable bearing on the results. We provide further details about the data collection process in Appendix C.",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p3-b4"
+        },
+        {
+          "type": "heading",
+          "bbox": {
+            "x": 0.09,
+            "y": 0.642,
+            "width": 0.211,
+            "height": 0.014
+          },
+          "extractedText": "2.4. Mixed-Precision Training",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p3-b5"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.09,
+            "y": 0.667,
+            "width": 0.386,
+            "height": 0.104
+          },
+          "extractedText": "To save GPU memory and increase throughput, most parameters, Adam moments, and activations are stored in 16-bit precision. We also use activation checkpointing and recompute the activations within the resblocks during the backward pass. Getting the model to train in 16-bit precision past one billion parameters, without diverging, was the most challenging part of this project.",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p3-b6"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.09,
+            "y": 0.78,
+            "width": 0.386,
+            "height": 0.073
+          },
+          "extractedText": "We believe the root cause of this instability to be underflow in the 16-bit gradients. Appendix D presents a set of guidelines we developed to avoid underflow when training large-scale generative models. Here, we describe one of these guidelines: per-resblock gradient scaling.",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p3-b7"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.09,
+            "y": 0.863,
+            "width": 0.385,
+            "height": 0.043
+          },
+          "extractedText": "Similar to prior work (Liu et al., 2020), we found that the norms of the activation gradients from the resblocks decrease monotonically as we move from the earlier resblocks",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p3-b8"
+        },
+        {
+          "type": "table",
+          "bbox": {
+            "x": 0.507,
+            "y": 0.085,
+            "width": 0.373,
+            "height": 0.057
+          },
+          "extractedText": "Effective Parameter Count\tCompression Rank\tCompression Rate\n2.8 · 10⁹ (d_model = 1920)\t512\t≈ 83%\n5.6 · 10⁹ (d_model = 2688)\t640\t≈ 85%\n12.0 · 10⁹ (d_model = 3968)\t896\t≈ 86%",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p3-b9"
+        },
+        {
+          "type": "caption",
+          "bbox": {
+            "x": 0.502,
+            "y": 0.153,
+            "width": 0.385,
+            "height": 0.082
+          },
+          "extractedText": "Table 1. We show the relationship between model size and the minimum compression rank for the gradients (up to a multiple of 128) necessary to avoid a gap in the training loss during the first 10% of training. These results suggest that in our setting, we can achieve a compression rate of about 85%, independent of model size.",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p3-b10"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.502,
+            "y": 0.266,
+            "width": 0.386,
+            "height": 0.09
+          },
+          "extractedText": "to the later ones.⁸ As the model is made deeper and wider, the true exponents of the activation gradients for later resblocks can fall below the minimum exponent of the 16-bit format. Consequently, they get rounded to zero, a phenomenon called underflow. We found that eliminating underflow allowed for stable training to convergence.",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p3-b11"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.502,
+            "y": 0.365,
+            "width": 0.385,
+            "height": 0.119
+          },
+          "extractedText": "Standard loss scaling (Micikevicius et al., 2017) is able to avoid underflow when the range spanned by the smallest and largest activation gradients (in absolute value) fits within the exponent range of the 16-bit format. On NVIDIA V100 GPUs, this exponent range is specified by five bits. While this is sufficient for training vanilla language models of the same size, we found the range to be too small for the text-to-image model.",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p3-b12"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.502,
+            "y": 0.494,
+            "width": 0.386,
+            "height": 0.119
+          },
+          "extractedText": "Our fix, which is shown in Figure 4, involves using a separate “gradient scale” for each resblock in the model. This can be seen as a practical alternative to a more general framework for mixed-precision training called Flexpoint (Köster et al., 2017), with the advantage that specialized GPU kernels are not required. We found that Sun et al. (2020) had independently developed similar procedure for training convolutional networks in 4-bit precision.",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p3-b13"
+        },
+        {
+          "type": "heading",
+          "bbox": {
+            "x": 0.502,
+            "y": 0.63,
+            "width": 0.205,
+            "height": 0.015
+          },
+          "extractedText": "2.5. Distributed Optimization",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p3-b14"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.502,
+            "y": 0.654,
+            "width": 0.386,
+            "height": 0.119
+          },
+          "extractedText": "Our 12-billion parameter model consumes about 24 GB of memory when stored in 16-bit precision, which exceeds the memory of a 16 GB NVIDIA V100 GPU. We address this using parameter sharding (Rajbhandari et al., 2019). As shown in Figure 5, parameter sharding allows us to almost completely hide the latency of the intra-machine communication by overlapping it with compute-intensive operations.",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p3-b15"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.502,
+            "y": 0.783,
+            "width": 0.386,
+            "height": 0.074
+          },
+          "extractedText": "On the cluster used to train the model, the bandwidth between machines is much lower than the bandwidth among GPUs on the same machine. This makes the cost of the operation used to average the gradient among the machines (all-reduce) the main bottleneck during training. We were",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p3-b16"
+        },
+        {
+          "type": "text",
+          "bbox": {
+            "x": 0.502,
+            "y": 0.867,
+            "width": 0.385,
+            "height": 0.039
+          },
+          "extractedText": "⁸It is possible that better initialization schemes (Liu et al., 2020) might be able to avoid this, but we did not have success with alternative schemes in our experiments.",
+          "latex": null,
+          "uncertain": false,
+          "uncertaintyReason": "",
+          "id": "paper-p3-b17"
+        }
+      ],
+      "warnings": [
+        "The running header is recorded as text, not as the paper title. Some prose continues from or onto other pages; only visible text is transcribed. No distinct displayed equation is visible."
+      ],
+      "model": "gpt-6-astra",
+      "provider": "codex-app-server",
+      "generatedAt": "2026-09-14T12:32:48.560Z",
+      "usage": {
+        "inputTokens": 22022,
+        "outputTokens": 2016,
+        "reasoningTokens": 16,
+        "cachedInputTokens": 0,
+        "totalTokens": 24038
+      }
+    }
+  ],
+  "provenance": {
+    "kind": "live-model-output",
+    "model": "gpt-6-astra",
+    "provider": "codex-app-server",
+    "reasoningEffort": "medium",
+    "binary": "/Applications/ChatGPT.app/Contents/Resources/codex",
+    "promptSha256": "9a94c22527d46178dbd2b53f6239039c91a72330fa07d9a97d547b047b2c02ab",
+    "instruction": "Extract this real OpenAI research paper page into accurate layout blocks, faithfully transcribing prose, captions, table values, and any displayed mathematical equation. Keep original English text and mathematical symbols. Do not summarize.",
+    "imageSource": "Original PDF rendered by Poppler at 180 DPI; the model receives only that page image, without extracted PDF text. The viewer uses the identical raster in an SVG wrapper to preserve embedded math glyphs.",
+    "imageSha256": [
+      "729008583c6e66b6d4390ebaf31ac52ae910495e98dd361575bb8fdc4c24a571",
+      "733445ca15181c3e4d8b61658e60b9dfddf6f776f67ff823c6472aa1a2938ade",
+      "8a6f47e7f68d8c4673e95138e9d1b2ae1193de91f8cae7cae6c80251582e19d5"
+    ],
+    "converter": "poppler-pdf-raster 180-dpi",
+    "generatedAt": "2026-09-14T12:32:48.560Z",
+    "complete": true,
+    "limitations": [
+      "This is model-based visual OCR, not a verified ground-truth transcription. Small symbols, table structure, and page boundaries require human review.",
+      "Only the three stated original pages are included. No claim is made about OCR coverage of the full paper.",
+      "Stored demo results are actual prior GPT-6 Astra outputs. Opening the demo makes no new model request; rerunning a page consumes provider usage."
+    ],
+    "totalTokens": 73012
+  }
+}

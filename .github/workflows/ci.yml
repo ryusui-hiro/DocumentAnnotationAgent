@@ -1,0 +1,209 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check dependency advisories
+        run: npm audit --audit-level=high
+
+      - name: Run security helper tests
+        run: npm test
+
+      - name: Type check
+        run: npm run lint
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Prepare bundled Linux runtime
+        run: npm run prepare:desktop-runtime
+
+      - name: Check bundled API startup and shutdown
+        run: npm run test:desktop-runtime
+
+  desktop-bundles:
+    name: desktop bundle (${{ matrix.platform }})
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-22.04
+            bundle: deb
+          - platform: windows-2022
+            bundle: nsis
+          - platform: ubuntu-24.04-arm
+            bundle: deb
+          - platform: windows-11-vs2026-arm
+            bundle: nsis
+          - platform: macos-15-intel
+            bundle: dmg
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            wget \
+            xdg-utils
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build and bundle the desktop app
+        run: npm run tauri:build -- --bundles ${{ matrix.bundle }} --ci
+
+      - name: Verify Debian package
+        if: runner.os == 'Linux'
+        run: test -n "$(find src-tauri/target/release/bundle/deb -maxdepth 1 -type f -name '*.deb' -print -quit)"
+
+      - name: Upload x86_64 Debian package for installed-app E2E
+        if: matrix.platform == 'ubuntu-22.04'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: annotation-studio-linux-deb
+          path: src-tauri/target/release/bundle/deb/*.deb
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Verify Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem -Path src-tauri/target/release/bundle/nsis -Filter '*.exe' -File | Select-Object -First 1
+          if (-not $installer) { throw 'Tauri did not produce an NSIS installer.' }
+          Write-Host "Verified $($installer.FullName)"
+
+      - name: Verify macOS disk image
+        if: runner.os == 'macOS'
+        run: test -n "$(find src-tauri/target/release/bundle/dmg -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+
+  browser-e2e:
+    name: provider-free browser E2E
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Chromium headless shell
+        run: npx playwright-cli install-browser chromium --with-deps --only-shell
+
+      - name: Run provider-free browser workflow
+        run: npm run test:browser-e2e
+
+  desktop-package-acceptance:
+    name: installed Tauri package (Linux/WebDriver)
+    runs-on: ubuntu-22.04
+    needs: desktop-bundles
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - name: Install Linux runtime and WebDriver dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential \
+            file \
+            libayatana-appindicator3-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            webkit2gtk-driver \
+            xvfb \
+            xdg-utils
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Install official Tauri WebDriver
+        run: cargo install tauri-driver --locked
+
+      - name: Download the normal production Debian package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: annotation-studio-linux-deb
+          path: ${{ runner.temp }}/annotation-studio-linux-deb
+
+      - name: Install and exercise the packaged app
+        run: |
+          deb="$(find "${RUNNER_TEMP}/annotation-studio-linux-deb" -maxdepth 1 -type f -name '*.deb' -print -quit)"
+          test -n "$deb"
+          package_name="$(dpkg-deb -f "$deb" Package)"
+          sudo dpkg -i "$deb"
+          test -n "$(dpkg -L "$package_name" | grep -E '^/usr/bin/annotation-studio$')"
+          xvfb-run -a npm run test:installed-desktop-e2e -- "$deb"

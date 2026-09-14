@@ -1,0 +1,13 @@
+{
+  "source": "Actual English Codex App Server / GPT-6 Astra recording; see docs/live-paper-recording.md",
+  "sourceSha256": "8cf41829d3286ec41a826162f31a37a75161f8c08c13358d214431b0f28866ff",
+  "sourceStartSeconds": 115,
+  "sourceDurationSeconds": 111,
+  "playbackSpeed": 4,
+  "width": 960,
+  "height": 600,
+  "fps": 7,
+  "bytes": 6913470,
+  "fullAppViewport": true,
+  "scope": "Only the actual live annotation phase; setup and upload omitted."
+}
