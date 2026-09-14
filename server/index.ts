@@ -40,6 +40,8 @@ const upload = multer({
   limits: { fileSize: maxUploadMb * 1024 * 1024, files: 1 },
 });
 const demoFileRateLimit = rateLimit({ windowMs: 60_000, limit: 30, standardHeaders: 'draft-8', legacyHeaders: false });
+const importRateLimit = rateLimit({ windowMs: 60_000, limit: 240, standardHeaders: 'draft-8', legacyHeaders: false, message: { error: 'Too many document imports. Retry shortly.' } });
+const aiRequestRateLimit = rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: 'draft-8', legacyHeaders: false, message: { error: 'Too many AI requests. Retry shortly.' } });
 const pagePreviewRateLimit = rateLimit({ windowMs: 60_000, limit: 240, standardHeaders: 'draft-8', legacyHeaders: false });
 const frontendRateLimit = rateLimit({ windowMs: 60_000, limit: 600, standardHeaders: 'draft-8', legacyHeaders: false });
 
@@ -543,7 +545,7 @@ app.get('/api/demo/paper-ocr', demoFileRateLimit, async (_request, response, nex
 });
 
 const pageAnnotationRuns = new PageAnnotationConcurrency(3);
-app.post('/api/ai/paper-ocr', async (request, response, next) => {
+app.post('/api/ai/paper-ocr', aiRequestRateLimit, async (request, response, next) => {
   if (!request.body || typeof request.body !== 'object' || Array.isArray(request.body)) { response.status(400).json({ error: 'An OCR request body is required.' }); return; }
   let releasePageRun: (() => void) | undefined;
   try {
@@ -584,7 +586,7 @@ app.post('/api/ai/paper-ocr', async (request, response, next) => {
   } finally { releasePageRun?.(); }
 });
 
-app.post('/api/ai/intent-stream', async (request, response, next) => {
+app.post('/api/ai/intent-stream', aiRequestRateLimit, async (request, response, next) => {
   if (!request.body || typeof request.body !== 'object' || Array.isArray(request.body)) { response.status(400).json({ error: 'An annotation request body is required.' }); return; }
   let releasePageRun: (() => void) | undefined;
   let streaming = false;
@@ -772,7 +774,7 @@ app.get('/api/codex/models', async (_request, response) => {
   }
 });
 
-app.post('/api/convert', upload.single('file'), async (request, response, next) => {
+app.post('/api/convert', importRateLimit, upload.single('file'), async (request, response, next) => {
   try {
     if (!request.file) {
       response.status(400).json({ error: '変換するファイルを選択してください。' });
@@ -1068,7 +1070,7 @@ function safeCodexAppServerError(error: unknown) {
   return 'Codex App Serverで処理できませんでした。実行ファイル、サインイン状態、選択モデルを確認してください。';
 }
 
-app.post('/api/ai/test', async (request, response, next) => {
+app.post('/api/ai/test', aiRequestRateLimit, async (request, response, next) => {
   try {
     const { settings, model, effort } = readAIRequest(request.body as Record<string, unknown>);
     if (settings.provider === 'codex-app-server') {

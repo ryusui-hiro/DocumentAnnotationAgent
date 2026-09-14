@@ -435,6 +435,27 @@ async (page) => {
   ];
   const outcomes = [];
 
+  // React updates the page number before the SVG fetch and Blob image decode.
+  // Waiting for the controls alone can observe an empty/previous overlay tree.
+  const changeToRenderedPage = async (action, fileName, pageNumber, documentId) => {
+    const previousSource = await page.evaluate(() => document.querySelector('.document-page-image')?.getAttribute('src') ?? null);
+    const svgResponse = page.waitForResponse((response) => {
+      const match = response.url().match(/\/api\/documents\/([^/?#]+)\/pages\/(\d+)\.svg(?:[?#]|$)/u);
+      return match && Number(match[2]) === pageNumber && (!documentId || match[1] === documentId);
+    }, { timeout: 30_000 });
+    await action();
+    const response = await svgResponse;
+    check(response.ok(), `the ${fileName} page-${pageNumber} preview returned HTTP ${response.status()}`);
+    check(await response.finished() === null, `the ${fileName} page-${pageNumber} SVG did not finish downloading`);
+    await page.waitForFunction(({ fileName, pageNumber, previousSource }) => {
+      const image = document.querySelector('.document-page-image');
+      return document.querySelector('.page-controls strong')?.textContent === String(pageNumber)
+        && image instanceof HTMLImageElement && image.alt === `${fileName} の ${pageNumber} ページ`
+        && image.getAttribute('src') !== previousSource && image.complete && image.naturalWidth > 0;
+    }, { fileName, pageNumber, previousSource }, { timeout: 30_000 });
+    return response.url().match(/\/api\/documents\/([^/?#]+)\//u)[1];
+  };
+
   const waitForReadyDocument = async () => {
     await page.getByRole('heading', { name: '見つけたいことを、ひとこと。', exact: true }).waitFor({ state: 'visible' });
     await page.locator('#ai-prompt').waitFor({ state: 'visible' });
@@ -496,7 +517,7 @@ async (page) => {
   const waitUntil = async (predicate, message, timeoutMs = 20_000) => {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      if (predicate()) return;
+      if (await predicate()) return;
       await page.waitForTimeout(50);
     }
     const activity = await page.locator('section[aria-label="Agent Activity"]').innerText().catch(() => '(activity unavailable)');
@@ -505,7 +526,7 @@ async (page) => {
 
   const contractDemoAction = page.getByTestId('open-contract-demo');
   await contractDemoAction.waitFor({ state: 'visible' });
-  await contractDemoAction.click();
+  const contractDocumentId = await changeToRenderedPage(() => contractDemoAction.click(), 'fictional-termination-contract.pdf', 2);
   await page.getByRole('heading', { name: 'fictional-termination-contract.pdf', exact: true }).waitFor({ state: 'visible' });
   await page.getByTestId('termination-demo-notice').waitFor({ state: 'visible' });
   check((await page.getByTestId('termination-demo-notice').innerText()).includes('AI未実行'), 'the fictional review sample did not disclose that no model ran');
@@ -521,8 +542,7 @@ async (page) => {
   check((await ambiguousCandidate.innerText()).includes('no advance notice period'), 'the review candidate omitted the missing-notice reason');
   await page.screenshot({ path: `${visualEvidenceDirectory}/termination-contract-review-1440x1000.png`, fullPage: false });
 
-  await page.getByRole('button', { name: '前のページ' }).click();
-  await page.waitForFunction(() => document.querySelector('.page-controls strong')?.textContent === '1');
+  await changeToRenderedPage(() => page.getByRole('button', { name: '前のページ' }).click(), 'fictional-termination-contract.pdf', 1, contractDocumentId);
   const firstPageHighlightEvidence = await page.locator('.annotation-box').evaluateAll((items) => items.map((item) => item.getAttribute('aria-label')));
   check(firstPageHighlightEvidence.some((label) => label?.includes('HIGH RISK') && label.includes('8.2')), `the one-sided page-1 termination clause did not receive its visible preset highlight: ${JSON.stringify(firstPageHighlightEvidence)}`);
 
@@ -548,7 +568,7 @@ async (page) => {
   check(contractText.includes('not legal advice'), 'the fictional PDF omitted its disclaimer');
   check(!contractText.includes('PRESET LABEL') && !contractText.includes('HUMAN REVIEW: AMBIGUOUS') && !contractText.includes('AMBIGUITY NOTE'), 'scripted classifications leaked into the source contract instead of staying in the app review layer');
 
-  await ambiguousCandidate.getByRole('button', { name: 'P.2' }).click();
+  await changeToRenderedPage(() => ambiguousCandidate.getByRole('button', { name: 'P.2' }).click(), 'fictional-termination-contract.pdf', 2, contractDocumentId);
   check((await page.locator('.page-controls').innerText()).includes('2 / 2'), 'the ambiguous candidate did not navigate the PDF viewer to page 2');
   await page.locator('.export-menu-toggle').click();
   const archiveDownload = page.waitForEvent('download');
@@ -568,7 +588,7 @@ async (page) => {
   console.log('Contract review demo passed: optional fictional PDF, six termination clauses, one scripted ambiguous review candidate, human approval, and persistent no-model disclosure.');
 
   await page.getByTestId('open-llm-demo-menu').click();
-  await page.getByTestId('open-live-contract-demo').click();
+  await changeToRenderedPage(() => page.getByTestId('open-live-contract-demo').click(), 'fictional-termination-contract-live.pdf', 1);
   await page.getByRole('heading', { name: 'fictional-termination-contract-live.pdf', exact: true }).waitFor({ state: 'visible' });
   await page.getByTestId('termination-demo-notice').waitFor({ state: 'visible' });
   check((await page.getByTestId('termination-demo-notice').innerText()).includes('まだモデル未実行'), 'the live contract demo should disclose that the model has not run');
@@ -1229,7 +1249,7 @@ async (page) => {
     { mode: 'pptx', path: officePptxFixturePath, fileName: 'office-roadmap.pptx', menuLabel: '注釈付きPowerPointを保存', expectedDownload: 'office-roadmap-annotated.pptx' },
   ]) {
     const officeConversion = page.waitForResponse((response) => response.url().includes('/api/convert'), { timeout: 20_000 });
-    await page.locator('.document-toolbar input[type="file"]').first().setInputFiles(office.path);
+    await changeToRenderedPage(() => page.locator('.document-toolbar input[type="file"]').first().setInputFiles(office.path), office.fileName, 1);
     const officeResponse = await officeConversion;
     const officeText = await officeResponse.text();
     check(officeResponse.ok(), `${office.fileName} upload failed with HTTP ${officeResponse.status()}: ${officeText.slice(0, 500)}`);
@@ -1265,7 +1285,7 @@ async (page) => {
   check(navigationSettings?.provider === 'openai-compatible' && navigationSettings.endpoint === 'https://mock-provider.invalid/v1', `the navigation E2E provider setup was not retained: ${JSON.stringify(navigationSettings)}`);
   check((await page.locator('.rail-settings').innerText()).includes('AI接続中'), 'the saved mock provider endpoint did not configure the navigation test session');
   const navigationConversion = page.waitForResponse((response) => response.url().includes('/api/convert'), { timeout: 20_000 });
-  await page.locator('.document-toolbar input[type="file"]').first().setInputFiles(navigationPdfFixturePath);
+  await changeToRenderedPage(() => page.locator('.document-toolbar input[type="file"]').first().setInputFiles(navigationPdfFixturePath), 'agent-navigation.pdf', 1);
   const navigationResponse = await navigationConversion;
   check(navigationResponse.ok(), `the multi-page navigation fixture failed to load with HTTP ${navigationResponse.status()}`);
   const navigationDocument = JSON.parse(await navigationResponse.text());
@@ -1310,7 +1330,8 @@ async (page) => {
   await page.waitForFunction(() => {
     const image = document.querySelector('.document-page-image');
     const viewer = document.querySelector('.page-scroll-area');
-    return image?.getAttribute('alt')?.includes('2 ページ')
+    return image instanceof HTMLImageElement && image.complete && image.naturalWidth > 0
+      && image.getAttribute('alt') === 'agent-navigation.pdf の 2 ページ'
       && viewer?.classList.contains('is-agent-viewport')
       && viewer.scrollTop > 0;
   }, undefined, { timeout: 15_000 });

@@ -26,7 +26,7 @@ test('browser Word import preserves text, tabs and breaks while escaping source 
     assert.equal(result.document.pageCount, result.svgs.length);
     assert.match(result.svgs[0], /日本語 &amp; &lt;script&gt;alert\(1\)&lt;\/script&gt;    After tab/);
     assert.match(result.svgs[0], />Next line<\/text>/);
-    assert.doesNotMatch(result.svgs[0], /<script>|Deleted text|example\.invalid/);
+    assert.doesNotMatch(result.svgs[0], /<script\b|Deleted text|example\.invalid/i);
     assert.match(result.document.warnings.join(' '), /Original pagination/);
     assert.ok(result.sourceBuffer.byteLength);
     assert.equal(fetches, 0);
@@ -81,7 +81,7 @@ test('text previews preserve all Unicode content across bounded pages without so
   const pages = staticTextPages('long document', words);
   assert.ok(pages.length > 1);
   const combined = pages.map((page) => page.svg).join('');
-  for (const word of words) assert.ok(combined.includes(word.replace('&', '&amp;').replace('<unsafe>', '&lt;unsafe&gt;')));
+  for (const word of words) assert.ok(combined.includes(word.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')));
   assert.doesNotMatch(combined, /<unsafe>/);
   assert.throws(() => staticTextPages('huge', Array(5000).fill('text')), /exceeds 120 pages/);
 });
