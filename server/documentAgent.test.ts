@@ -6,7 +6,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import sharp from 'sharp';
-import { configureDocumentExportStoreForTests, configurePendingAgentRunStoreForTests, getPendingAgentRunInfo, isExplicitExportRequest, restorePendingAgentRun, resumeDocumentAgentRun, runDocumentAgent } from './documentAgent';
+import { configureDocumentExportStoreForTests, configurePendingAgentRunStoreForTests, getPendingAgentRunInfo, isExplicitExportRequest, pendingAgentRunMatchesProviderIdentity, restorePendingAgentRun, resumeDocumentAgentRun, runDocumentAgent } from './documentAgent';
 import { SpreadsheetDocumentAdapter } from './spreadsheetAdapter';
 import { PagedDocumentAdapter } from './documentAdapter';
 import { createPrivateRecordStore } from './privateRecordStore';
@@ -669,25 +669,26 @@ test('restores an encrypted pending RunState with rebound provider settings and 
     guidelines: '', correction: '', humanDecisions: '', pageText: 'A statement with an unclear qualification.',
     imageDataUrl: 'data:image/png;base64,AA==', pageNumber: 1, totalPages: 1, mode: 'assist',
     documentId: 'versioned-document-session', sourceHash: 'a'.repeat(64),
-    providerConfigFingerprint: 'original-live-client',
+    providerCredentialIdentity: 'original-live-client',
   }, model);
   assert.equal(paused.status, 'interrupted');
   assert.ok(paused.approvalRunId);
   assert.equal((await getPendingAgentRunInfo(paused.approvalRunId!))?.sourceHash, 'a'.repeat(64));
-  assert.equal((await getPendingAgentRunInfo(paused.approvalRunId!))?.liveProviderConfigFingerprint, 'original-live-client');
+  assert.equal(pendingAgentRunMatchesProviderIdentity(paused.approvalRunId!, 'original-live-client'), true);
   const persistedRun = await pendingRunStore.get<Record<string, unknown>>('pending-agent-runs', paused.approvalRunId!);
   assert.ok(persistedRun);
-  assert.equal('providerConfigFingerprint' in persistedRun, false, 'the in-memory credential fingerprint must never be persisted');
+  assert.equal('providerCredentialIdentity' in persistedRun, false, 'the in-memory credential identity must never be persisted');
+  assert.equal(JSON.stringify(persistedRun).includes('original-live-client'), false, 'the provider identity string is not present anywhere in the encrypted pending-run payload');
   assert.equal(persistedRun.annotatorDelegationCount, 1);
   assert.deepEqual(persistedRun.annotatorDelegatedPages, [1]);
   assert.equal(persistedRun.readerDelegationCount, 1);
   assert.deepEqual(persistedRun.readerDelegatedPages, [1]);
 
   const restored = await restorePendingAgentRun({
-    runId: paused.approvalRunId!, providerName: 'openai-api', providerConfigFingerprint: 'current-live-client', forceRestore: true, testModel: model,
+    runId: paused.approvalRunId!, providerName: 'openai-api', providerCredentialIdentity: 'current-live-client', forceRestore: true, testModel: model,
   });
   assert.equal(restored, true);
-  assert.equal((await getPendingAgentRunInfo(paused.approvalRunId!))?.liveProviderConfigFingerprint, 'current-live-client');
+  assert.equal(pendingAgentRunMatchesProviderIdentity(paused.approvalRunId!, 'current-live-client'), true);
   const resumed = await resumeDocumentAgentRun({ runId: paused.approvalRunId!, approvalId: paused.approvalId!, approved: true });
   model.assertComplete();
   assert.equal(resumed.status, 'complete');

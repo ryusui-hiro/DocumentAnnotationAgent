@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, extname, join, resolve } from 'node:path';
@@ -13,7 +13,7 @@ import { previewRasterImage, rasterImageExtensions } from './imagePreview';
 import { createAnnotationTaskPlan } from './taskPlanner';
 import { parseTaskPlan } from '../src/taskPlan';
 import { annotateWithCodexAppServer, draftCorrectionRuleWithCodexAppServer, listCodexModels, planTaskWithCodexAppServer, proposeWorkbookChangesWithCodexAppServer, validateAnnotationsWithCodexAppServer } from './codexAppServer';
-import { getPendingAgentDocumentIds, getPendingAgentRunInfo, hasLivePendingAgentRun, prunePersistedPendingAgentRuns, restorePendingAgentRun, resumeDocumentAgentRun, runDocumentAgent, type ExistingAnnotation } from './documentAgent';
+import { getPendingAgentDocumentIds, getPendingAgentRunInfo, hasLivePendingAgentRun, pendingAgentRunMatchesProviderIdentity, prunePersistedPendingAgentRuns, restorePendingAgentRun, resumeDocumentAgentRun, runDocumentAgent, type ExistingAnnotation } from './documentAgent';
 import { runAnnotationValidator, sanitizeValidatorFindings, type ValidatorAnnotation } from './annotationValidator';
 import { createCorrectionRuleDraft, parseCorrectionRuleDraft, type CorrectionRuleInput } from './correctionRulePlanner';
 import { SpreadsheetDocumentAdapter } from './spreadsheetAdapter';
@@ -32,7 +32,6 @@ const documentExtensions = new Set(['.pdf', '.docx', '.pptx', '.xlsx']);
 const allowedExtensions = new Set([...documentExtensions, ...rasterImageExtensions]);
 const maxDocumentSessions = 20;
 const documentSessionTtlMs = 30 * 60 * 1000;
-const providerFingerprintSecret = randomBytes(32);
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: maxUploadMb * 1024 * 1024, files: 1 },
@@ -235,17 +234,16 @@ function configuredModel(model: ModelId, settings?: AISettings): { client: OpenA
   };
 }
 
-function providerCredentialFingerprint(settings: AISettings, config: { deployment: string; provider: ProviderId }, model: ModelId) {
+function providerCredentialIdentity(settings: AISettings, config: { deployment: string; provider: ProviderId }, model: ModelId) {
   const mode = config.provider;
   const apiKey = settings.apiKey?.trim() || (mode === 'azure-openai' ? process.env.AZURE_OPENAI_API_KEY : process.env.OPENAI_API_KEY) || '';
   const endpoint = settings.endpoint?.trim()
     || (mode === 'azure-openai' ? process.env.AZURE_OPENAI_ENDPOINT : process.env.OPENAI_BASE_URL)
     || (mode === 'openai-api' ? 'https://api.openai.com/v1' : '');
   const normalized = normalizeEndpoint(endpoint, mode);
-  // The HMAC key is random and process-local, so this fingerprint is not
-  // useful for offline API-key guessing and is never persisted. It lets a live
-  // run detect whether its credentials changed before a safe rebind.
-  return createHmac('sha256', providerFingerprintSecret).update([mode, model, config.deployment, normalized, apiKey].join('\0')).digest('hex');
+  // This exact identity stays only in a WeakMap for the live run. Pending-run
+  // snapshots and API responses never contain it; after restart we always rebind.
+  return JSON.stringify([mode, model, config.deployment, normalized, apiKey]);
 }
 
 function sourceHash(buffer: Buffer) {
@@ -1492,7 +1490,7 @@ app.post('/api/ai/annotate', async (request, response, next) => {
       model: config.deployment,
       modelId: model,
       providerName: config.provider,
-      providerConfigFingerprint: providerCredentialFingerprint(settings, config, model),
+      providerCredentialIdentity: providerCredentialIdentity(settings, config, model),
       reasoningEffort: effort,
       instruction: instruction.trim(),
       taskPlan: taskPlan?.trim() ?? '',
@@ -1649,7 +1647,7 @@ app.post('/api/ai/approve', async (request, response, next) => {
       response.status(409).json({ error: '承認待ちRunのモデル設定と一致しません。Run開始時のプロバイダー、モデル、deploymentを選んでください。' });
       return;
     }
-    const currentFingerprint = providerCredentialFingerprint(mergedSettings, config, model);
+    const currentIdentity = providerCredentialIdentity(mergedSettings, config, model);
     let session: DocumentSession | undefined;
     if (info.documentId) {
       session = documentSessions.get(info.documentId);
@@ -1663,17 +1661,18 @@ app.post('/api/ai/approve', async (request, response, next) => {
       lockedWorkbookSessionId = session.id;
     }
     const spreadsheet = session ? await getSpreadsheet(session) : undefined;
-    const shouldRebind = !liveRun || info.liveProviderConfigFingerprint !== currentFingerprint;
+    const providerIdentityMatches = pendingAgentRunMatchesProviderIdentity(body.runId, currentIdentity);
+    const shouldRebind = !liveRun || !providerIdentityMatches;
     if (shouldRebind) {
       const rebound = await rebindPendingAgentRun({
         runId: body.runId,
         client: config.client,
         providerName: config.provider,
-        providerConfigFingerprint: currentFingerprint,
+        providerCredentialIdentity: currentIdentity,
         ...(session ? { documentAdapters: [session.pageAdapter, ...(spreadsheet ? [spreadsheet] : [])] } : {}),
         ...(spreadsheet ? { spreadsheet } : {}),
       });
-      if (!rebound && (!liveRun || info.liveProviderConfigFingerprint !== currentFingerprint)) {
+      if (!rebound && (!liveRun || !providerIdentityMatches)) {
         response.status(liveRun ? 503 : 410).json({ error: liveRun
           ? '承認待ちRunの保存に失敗し、現在の認証情報で再接続できません。文書を再読み込みしてAgentを再実行してください。'
           : '承認対象のRun状態を復元できませんでした。文書を開き直してAgentを再実行してください。' });

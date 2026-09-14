@@ -6,7 +6,7 @@ import { preview } from 'document-svg';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { configurePendingAgentRunStoreForTests, getPendingAgentRunInfo, restorePendingAgentRun, resumeDocumentAgentRun, runDocumentAgent } from './documentAgent';
+import { configurePendingAgentRunStoreForTests, pendingAgentRunMatchesProviderIdentity, restorePendingAgentRun, resumeDocumentAgentRun, runDocumentAgent } from './documentAgent';
 import { privateRecordStore, createPrivateRecordStore } from './privateRecordStore';
 import { PagedDocumentAdapter } from './documentAdapter';
 
@@ -71,7 +71,7 @@ test('the same interrupted RunState resumes with replacement credentials without
       model: 'gpt-6-astra',
       modelId: 'gpt-6-astra',
       providerName: 'openai-compatible',
-      providerConfigFingerprint: 'original-live-config',
+      providerCredentialIdentity: 'original-live-config',
       reasoningEffort: 'medium',
       instruction: 'Find a termination clause and ask me to review it.',
       taskPlan: '', guidelines: '', correction: '', humanDecisions: '',
@@ -85,7 +85,8 @@ test('the same interrupted RunState resumes with replacement credentials without
     approvalRunId = paused.approvalRunId;
     assert.equal(authHeaders.length, 5);
     assert.ok(authHeaders.every((header) => header === 'Bearer original-test-key'));
-    assert.equal((await getPendingAgentRunInfo(approvalRunId))?.liveProviderConfigFingerprint, 'original-live-config');
+    assert.equal(pendingAgentRunMatchesProviderIdentity(approvalRunId, 'original-live-config'), true);
+    assert.equal(pendingAgentRunMatchesProviderIdentity(approvalRunId, 'replacement-live-config'), false);
 
     const storedRun = await store.get<Record<string, unknown>>('pending-agent-runs', approvalRunId);
     assert.ok(storedRun);
@@ -98,11 +99,11 @@ test('the same interrupted RunState resumes with replacement credentials without
       runId: approvalRunId,
       client: replacementClient,
       providerName: 'openai-compatible',
-      providerConfigFingerprint: 'replacement-live-config',
+      providerCredentialIdentity: 'replacement-live-config',
       forceRestore: true,
       documentAdapters: [documentAdapter],
     }), true);
-    assert.equal((await getPendingAgentRunInfo(approvalRunId))?.liveProviderConfigFingerprint, 'replacement-live-config');
+    assert.equal(pendingAgentRunMatchesProviderIdentity(approvalRunId, 'replacement-live-config'), true);
 
     const resumed = await resumeDocumentAgentRun({ runId: approvalRunId, approvalId: paused.approvalId, approved: true });
     assert.equal(resumed.status, 'complete');

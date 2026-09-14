@@ -1,5 +1,5 @@
 import { Agent, OpenAIProvider, Runner, RunState, tool, type AgentInputItem, type Model, type RunToolApprovalItem } from '@openai/agents';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 import type OpenAI from 'openai';
 import sharp from 'sharp';
@@ -128,7 +128,6 @@ type PendingAgentRun = {
   pageNumber: number;
   maxTurns: number;
   createdAt: number;
-  providerConfigFingerprint?: string;
   configuration: PendingAgentRunConfiguration;
 };
 
@@ -190,6 +189,7 @@ type PendingAgentRunSnapshot = {
 };
 
 const pendingAgentRuns = new Map<string, PendingAgentRun>();
+const liveProviderCredentialIdentities = new WeakMap<PendingAgentRun, string>();
 const pendingAgentRunTtlMs = 30 * 60 * 1000;
 const maxPendingAgentRuns = 12;
 let pendingRunRecordStore = privateRecordStore;
@@ -251,7 +251,6 @@ export async function getPendingAgentRunInfo(runId: string) {
     modelId: inMemory.configuration.modelId,
     providerName: inMemory.configuration.providerName,
     reasoningEffort: inMemory.configuration.reasoningEffort,
-    ...(inMemory.providerConfigFingerprint ? { liveProviderConfigFingerprint: inMemory.providerConfigFingerprint } : {}),
     ...(inMemory.configuration.documentId ? { documentId: inMemory.configuration.documentId } : {}),
     ...(inMemory.configuration.sourceHash ? { sourceHash: inMemory.configuration.sourceHash } : {}),
     ...(inMemory.configuration.inspectionCheckpointKey ? { inspectionCheckpointKey: inMemory.configuration.inspectionCheckpointKey } : {}),
@@ -268,7 +267,6 @@ export async function getPendingAgentRunInfo(runId: string) {
     modelId: snapshot.configuration.modelId,
     providerName: snapshot.configuration.providerName,
     reasoningEffort: snapshot.configuration.reasoningEffort,
-    liveProviderConfigFingerprint: undefined,
     ...(snapshot.configuration.documentId ? { documentId: snapshot.configuration.documentId } : {}),
     ...(snapshot.configuration.sourceHash ? { sourceHash: snapshot.configuration.sourceHash } : {}),
     ...(snapshot.configuration.inspectionCheckpointKey ? { inspectionCheckpointKey: snapshot.configuration.inspectionCheckpointKey } : {}),
@@ -278,6 +276,15 @@ export async function getPendingAgentRunInfo(runId: string) {
 
 export function hasLivePendingAgentRun(runId: string) {
   return pendingAgentRuns.has(runId);
+}
+
+export function pendingAgentRunMatchesProviderIdentity(runId: string, identity: string) {
+  const pending = pendingAgentRuns.get(runId);
+  const previous = pending && liveProviderCredentialIdentities.get(pending);
+  if (!previous) return false;
+  const previousBytes = Buffer.from(previous, 'utf8');
+  const currentBytes = Buffer.from(identity, 'utf8');
+  return previousBytes.length === currentBytes.length && timingSafeEqual(previousBytes, currentBytes);
 }
 
 export async function prunePersistedPendingAgentRuns() {
@@ -314,7 +321,7 @@ export async function restorePendingAgentRun(args: {
   runId: string;
   client?: OpenAI;
   providerName: string;
-  providerConfigFingerprint?: string;
+  providerCredentialIdentity?: string;
   documentAdapters?: DocumentAdapter[];
   spreadsheet?: SpreadsheetDocumentAdapter;
   forceRestore?: boolean;
@@ -338,7 +345,7 @@ export async function restorePendingAgentRun(args: {
     ...snapshot.configuration,
     ...(args.client ? { client: args.client } : {}),
     providerName: args.providerName,
-    ...(args.providerConfigFingerprint ? { providerConfigFingerprint: args.providerConfigFingerprint } : {}),
+    ...(args.providerCredentialIdentity ? { providerCredentialIdentity: args.providerCredentialIdentity } : {}),
     ...(args.documentAdapters ? { documentAdapters: args.documentAdapters } : {}),
     ...(args.spreadsheet ? { spreadsheet: args.spreadsheet } : {}),
     restoreSnapshot: snapshot,
@@ -835,7 +842,7 @@ export async function runDocumentAgent(args: {
   model: string;
   modelId?: string;
   providerName?: string;
-  providerConfigFingerprint?: string;
+  providerCredentialIdentity?: string;
   reasoningEffort: string;
   instruction: string;
   taskPlan?: string;
@@ -1941,9 +1948,9 @@ export async function runDocumentAgent(args: {
         pageNumber: navigation.currentPage,
         maxTurns,
         createdAt: restoreSnapshot.createdAt,
-        ...(args.providerConfigFingerprint ? { providerConfigFingerprint: args.providerConfigFingerprint } : {}),
         configuration: restoreSnapshot.configuration,
       };
+      if (args.providerCredentialIdentity) liveProviderCredentialIdentities.set(pending, args.providerCredentialIdentity);
       pendingAgentRuns.set(pending.runId, pending);
       keepProviderOpen = Boolean(provider);
       return { status: 'restored' as const, annotations, toolEvents: toolActivity, spreadsheetChanges, annotationOperations, exports: [] as PreparedDocumentExport[] };
@@ -2030,9 +2037,9 @@ export async function runDocumentAgent(args: {
         pageNumber: navigation.currentPage,
         maxTurns,
         createdAt: Date.now(),
-        ...(args.providerConfigFingerprint ? { providerConfigFingerprint: args.providerConfigFingerprint } : {}),
         configuration,
       };
+      if (args.providerCredentialIdentity) liveProviderCredentialIdentities.set(pending, args.providerCredentialIdentity);
       pendingAgentRuns.set(runId, pending);
       try { await persistPendingAgentRun(pending); } catch { /* Preserve interactive approval when durable storage is unavailable. */ }
       keepProviderOpen = Boolean(provider);
